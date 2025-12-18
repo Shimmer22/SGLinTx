@@ -1,0 +1,33 @@
+[package]
+name = "joydev-sys"
+version = "0.2.1"
+authors = ["Jan Śmiałkowski <gm666q@gm666q.space>"]
+edition = "2018"
+workspace = ".."
+description = "Linux joydev definitions from `linux/joystick.h`."
+repository = "https://gitlab.com/gm666q/joydev-rs"
+readme = "README.md"
+keywords = ["api", "ffi", "input", "linux"]
+categories = ["external-ffi-bindings", "no-std", "os::unix-apis"]
+license = "GPL-2.0-only"
+
+[badges]
+gitlab = { repository = "gm666q/joydev-rs", branch = "master" }
+maintenance = { status = "passively-maintained" }
+
+[features]
+default = []
+extra_traits = ["libc/extra_traits"]
+
+[dependencies]
+input-event-codes = "^0.2.0"
+nix = "^0.17.0"
+
+[dependencies.libc]
+version = "^0.2.66"
+default-features = false
+
+[package.metadata.docs.rs]
+default-target = "x86_64-unknown-linux-gnu"
+features = ["extra_traits"]
+targets = ["aarch64-unknown-linux-gnu", "armv7-unknown-linux-gnueabihf", "i686-unknown-linux-gnu", "powerpc64le-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]

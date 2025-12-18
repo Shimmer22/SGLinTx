@@ -1,0 +1,3 @@
+[target.riscv64gc-unknown-linux-musl]
+# 使用包含 binutils 2.42 的自定义镜像
+image = "lintx-riscv64-cross:latest"
