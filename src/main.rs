@@ -9,6 +9,7 @@ mod elrs_tx;
 mod joy_dev;
 mod joysticks_test;
 mod gampad;
+mod crsf_rc_in;
 mod stm32_serial;
 
 
