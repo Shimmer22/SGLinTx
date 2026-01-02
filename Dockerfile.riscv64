@@ -1,0 +1,29 @@
+# 基于 rust-musl-cross 镜像，但更新 binutils 以支持新的 RISC-V 扩展
+FROM ghcr.io/rust-cross/rust-musl-cross:riscv64gc-musl
+
+# 安装编译 binutils 所需的依赖
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    texinfo \
+    bison \
+    flex \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# 下载并编译 binutils 2.42 (支持新的 RISC-V 扩展)
+WORKDIR /tmp
+RUN wget https://ftp.gnu.org/gnu/binutils/binutils-2.42.tar.xz \
+    && tar xf binutils-2.42.tar.xz \
+    && cd binutils-2.42 \
+    && mkdir build && cd build \
+    && ../configure \
+        --target=riscv64-unknown-linux-musl \
+        --prefix=/usr/local/musl \
+        --disable-nls \
+        --disable-werror \
+    && make -j$(nproc) \
+    && make install \
+    && cd /tmp \
+    && rm -rf binutils-2.42 binutils-2.42.tar.xz
+
+WORKDIR /

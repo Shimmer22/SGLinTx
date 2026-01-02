@@ -1,0 +1,29 @@
+[[channel_infos]]
+name = "Thrust"
+index = 1
+min = 5
+max = 4095
+rev = false
+
+[[channel_infos]]
+name = "Direction"
+index = 0
+min = 5
+max = 4095
+rev = false
+
+[[channel_infos]]
+name = "Aileron"
+index = 2
+min = 5
+max = 4095
+rev = false
+
+[[channel_infos]]
+name = "Elevator"
+index = 3
+min = 5
+max = 4095
+rev = false
+
+channel_indexs = [1, 0, 2, 3]
