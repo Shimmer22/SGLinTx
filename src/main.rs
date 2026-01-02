@@ -11,6 +11,7 @@ mod joysticks_test;
 mod gampad;
 mod crsf_rc_in;
 mod stm32_serial;
+mod mock_joystick;
 
 
 pub const CALIBRATE_FILENAME: &str = "joystick.toml";

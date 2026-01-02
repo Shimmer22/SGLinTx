@@ -68,7 +68,51 @@ LinTx 采用客户端-服务器架构（基于 `rpos` 库）。主程序通常�
   ./LinTx -- adc
   ```
 
-#### 5. `mixer` (混控器)
+#### 5. `mock_joystick` (模拟摇杆数据生成器)
+**用于测试目的**：无需物理硬件（不占用IIC/UART），模拟生成摇杆数据用于测试CRSF发送等功能。
+
+- **参数**:
+  - `--config <配置文件路径>`: (可选) 配置文件路径，默认 `mock_config.toml`。
+- **模式**:
+  - **static**: 发送固定的通道值（如居中的摇杆位置）
+  - **sine**: 发送正弦波振荡的通道值（用于测试平滑过渡）
+  - **step**: 发送离散的阶跃值（用于测试响应）
+- **配置文件示例** (`mock_config.toml`):
+  ```toml
+  mode = "static"  # "static", "sine", "step"
+  update_rate_hz = 50
+
+  [static_config]
+  channels = [992, 992, 0, 992]  # CRSF居中值
+
+  [sine_config]
+  base = [992, 992, 0, 992]
+  amplitude = [200, 150, 0, 100]
+  frequency_hz = [1.0, 0.5, 0.0, 2.0]
+
+  [step_config]
+  values = [
+      [0, 0, 0, 0],
+      [992, 992, 0, 992],
+      [1984, 1984, 1984, 1984]
+  ]
+  step_duration_ms = 2000
+  ```
+- **示例**:
+  ```bash
+  # 使用默认配置
+  ./LinTx -- mock_joystick
+  
+  # 使用自定义配置
+  ./LinTx -- mock_joystick --config my_mock.toml
+  
+  # 配合ELRS发射模块测试CRSF发送能力
+  ./LinTx --server &
+  ./LinTx -- mock_joystick &
+  ./LinTx -- elrs_tx /dev/ttyS1
+  ```
+
+#### 6. `mixer` (混控器)
 处理输入数据并进行混控逻辑（依赖 `joystick.toml` 配置文件）。
 - **参数**: 无。
 - **示例**:

@@ -1,0 +1,41 @@
+# Mock Joystick Configuration
+# This file configures the mock joystick data generator for testing
+
+# Mode: "static", "sine", or "step"
+mode = "static"
+
+# Update rate in Hz (how often to send data)
+update_rate_hz = 50
+
+# Static mode configuration
+# Provides constant channel values
+[static_config]
+# Channel values: [Throttle, Rudder, Aileron, Elevator]
+# CRSF range: 0-1984, centered at 992
+channels = [992, 992, 0, 992]
+
+# Sine wave mode configuration 
+# Oscillates channels smoothly using sine waves
+[sine_config]
+# Base values (center point of oscillation)
+base = [992, 992, 0, 992]
+
+# Amplitude of oscillation for each channel
+amplitude = [200, 150, 0, 100]
+
+# Frequency in Hz for each channel
+frequency_hz = [1.0, 0.5, 0.0, 2.0]
+
+# Step mode configuration
+# Cycles through discrete value sets
+[step_config]
+# List of value sets to cycle through
+# Each inner array is [Throttle, Rudder, Aileron, Elevator]
+values = [
+    [0, 0, 0, 0],          # Min values
+    [992, 992, 0, 992],    # Center values  
+    [1984, 1984, 1984, 1984]  # Max values
+]
+
+# Duration to hold each step in milliseconds
+step_duration_ms = 2000
