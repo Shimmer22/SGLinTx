@@ -14,19 +14,19 @@ struct Cli {
 
 /// USB HID Gamepad Report Format (6 bytes):
 /// Byte 0: 8 buttons (bit flags)
-/// Byte 1: X axis (Direction, -127~127)
-/// Byte 2: Y axis (Elevator, -127~127)
-/// Byte 3: Z axis (Aileron, -127~127)
-/// Byte 4: Rx axis (spare, -127~127)
-/// Byte 5: Rz axis (Thrust/Throttle, 0~255)
+/// Byte 1: X axis (Direction, -127~127, 回中)
+/// Byte 2: Y axis (Aileron, -127~127, 回中)
+/// Byte 3: Z axis (Elevator, -127~127, 回中)
+/// Byte 4: Rz axis (spare, -127~127, 回中)
+/// Byte 5: Slider (Thrust/Throttle, 0~255, 不回中)
 #[repr(C, packed)]
 struct HidGamepadReport {
-    buttons: u8,   // 8 button bits
-    axis_x: i8,    // Direction (左右)
-    axis_y: i8,    // Elevator (升降)
-    axis_z: i8,    // Aileron (副翼)
-    axis_rx: i8,   // Spare (备用)
-    axis_rz: u8,   // Thrust (油门, 0~255)
+    buttons: u8,       // 8 button bits
+    axis_x: i8,        // Direction (左右)
+    axis_y: i8,        // Aileron (副翼)
+    axis_z: i8,        // Elevator (升降)
+    axis_rz: i8,       // Spare (备用)
+    slider: u8,        // Thrust/Throttle (油门, 0~255)
 }
 
 impl HidGamepadReport {
@@ -36,8 +36,8 @@ impl HidGamepadReport {
             axis_x: 0,
             axis_y: 0,
             axis_z: 0,
-            axis_rx: 0,
-            axis_rz: 127,  // 默认中间位置
+            axis_rz: 0,
+            slider: 0,  // 油门默认最低
         }
     }
 
@@ -47,8 +47,8 @@ impl HidGamepadReport {
             self.axis_x as u8,
             self.axis_y as u8,
             self.axis_z as u8,
-            self.axis_rx as u8,
-            self.axis_rz,
+            self.axis_rz as u8,
+            self.slider,
         ]
     }
 }
@@ -122,10 +122,10 @@ pub fn usb_gamepad_main(argc: u32, argv: *const &str) {
         // 映射 mixer 输出到 HID 轴
         // MixerOutMsg 字段: thrust, direction, aileron, elevator
         report.axis_x = mixer_to_hid_axis(msg.direction);  // X轴 = 左右方向
-        report.axis_y = mixer_to_hid_axis(msg.elevator);   // Y轴 = 升降
-        report.axis_z = mixer_to_hid_axis(msg.aileron);    // Z轴 = 副翼
-        report.axis_rx = 0;  // 备用轴，暂时不用
-        report.axis_rz = mixer_to_hid_throttle(msg.thrust);  // Rz轴 = 油门 (0~255)
+        report.axis_y = mixer_to_hid_axis(msg.aileron);    // Y轴 = 副翼
+        report.axis_z = mixer_to_hid_axis(msg.elevator);   // Z轴 = 升降
+        report.axis_rz = 0;  // 备用轴，暂时不用
+        report.slider = mixer_to_hid_throttle(msg.thrust); // Slider = 油门 (0~255)
 
         // 暂时没有按键数据，保持为0
         report.buttons = 0;
@@ -138,8 +138,8 @@ pub fn usb_gamepad_main(argc: u32, argv: *const &str) {
         
         // 打印调试信息（每100次打印一次）
         if counter % 100 == 0 {
-            thread_logln!("HID sent {} reports. Latest: Dir={}, Elev={}, Ail={}, Thr={}", 
-                counter, report.axis_x, report.axis_y, report.axis_z, report.axis_rz);
+            thread_logln!("HID sent {} reports. Latest: Dir={}, Ail={}, Elev={}, Thr={}", 
+                counter, report.axis_x, report.axis_y, report.axis_z, report.slider);
         }
     }
 }
