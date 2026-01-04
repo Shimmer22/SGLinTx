@@ -15,12 +15,12 @@ LOG_FILE="/tmp/hid_setup.log"
 #   Byte 0: 8 buttons (bit flags)
 #   Byte 1: X axis (Left Stick X = Rudder, -127~127)
 #   Byte 2: Y axis (Left Stick Y = Throttle, -127~127)
-#   Byte 3: Z axis (Right Stick X = Aileron, -127~127)
-#   Byte 4: Rz axis (Right Stick Y = Elevator, -127~127)
-#   Byte 5: Slider (Reserved, -127~127)
+#   Byte 3: Rx axis (Right Stick X = Aileron, -127~127)
+#   Byte 4: Ry axis (Right Stick Y = Elevator, -127~127)
+#   Byte 5: Reserved (padding byte)
 HID_REPORT_LENGTH=6
-HID_REPORT_DESC="05 01 09 05 A1 01 05 09 19 01 29 08 15 00 25 01 75 01 95 08 81 02 05 01 09 30 09 31 09 32 09 35 09 36 15 81 25 7F 75 08 95 05 81 02 C0"
-
+# Usages: X(30), Y(31), Rx(33), Ry(34) for proper dual-stick mapping
+HID_REPORT_DESC="05 01 09 05 A1 01 05 09 19 01 29 08 15 00 25 01 75 01 95 08 81 02 05 01 09 30 09 31 09 32 09 33 15 81 25 7F 75 08 95 04 81 02 75 08 95 01 81 01 C0"
 log() {
     echo "$1"
     echo "$(date '+%H:%M:%S') $1" >> "$LOG_FILE"

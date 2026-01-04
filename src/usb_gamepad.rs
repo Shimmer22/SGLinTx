@@ -19,11 +19,11 @@ struct Cli {
 ///   Byte 2: Y axis = Throttle (CH3 in AETR, -127~127, 不回中)
 /// 
 /// 右摇杆 (Aileron + Elevator):  
-///   Byte 3: Z axis = Aileron/Roll (CH1 in AETR, -127~127, 回中)
-///   Byte 4: Rz axis = Elevator/Pitch (CH2 in AETR, -127~127, 回中)
+///   Byte 3: Rx axis = Aileron/Roll (CH1 in AETR, -127~127, 回中)
+///   Byte 4: Ry axis = Elevator/Pitch (CH2 in AETR, -127~127, 回中)
 /// 
 /// Byte 0: 8 buttons (bit flags)
-/// Byte 5: Slider (reserved, 0~255)
+/// Byte 5: Reserved (padding)
 /// 
 /// AETR 通道顺序: CH1=Aileron, CH2=Elevator, CH3=Throttle, CH4=Rudder
 #[repr(C, packed)]
@@ -33,7 +33,7 @@ struct HidGamepadReport {
     left_y: i8,        // 左摇杆Y = Throttle (油门)
     right_x: i8,       // 右摇杆X = Aileron (副翼)
     right_y: i8,       // 右摇杆Y = Elevator (升降)
-    slider: u8,        // 备用 Slider
+    _reserved: u8,     // 填充字节
 }
 
 impl HidGamepadReport {
@@ -44,7 +44,7 @@ impl HidGamepadReport {
             left_y: -127,  // Throttle 最低 (对应 -127)
             right_x: 0,    // Aileron 中位
             right_y: 0,    // Elevator 中位
-            slider: 0,
+            _reserved: 0,
         }
     }
 
@@ -55,7 +55,7 @@ impl HidGamepadReport {
             self.left_y as u8,
             self.right_x as u8,
             self.right_y as u8,
-            self.slider,
+            self._reserved,
         ]
     }
 }
@@ -140,7 +140,7 @@ pub fn usb_gamepad_main(argc: u32, argv: *const &str) {
         report.left_y = mixer_throttle_to_hid_axis(msg.thrust); // 左摇杆Y = Throttle
         report.right_x = mixer_to_hid_axis(msg.aileron);        // 右摇杆X = Aileron
         report.right_y = mixer_to_hid_axis(msg.elevator);       // 右摇杆Y = Elevator
-        report.slider = 0;  // 备用
+        report._reserved = 0;  // 填充字节
 
         // 暂时没有按键数据，保持为0
         report.buttons = 0;

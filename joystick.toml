@@ -5,25 +5,25 @@ name = "Thrust"
 index = 1
 min = 0
 max = 4095
-rev = true
+rev = false
 
 [[channel_infos]]
 name = "Direction"
 index = 0
 min = 0
 max = 4095
-rev = false
+rev = true
 
 [[channel_infos]]
 name = "Aileron"
 index = 2
 min = 0
 max = 4095
-rev = false
+rev = true
 
 [[channel_infos]]
 name = "Elevator"
 index = 3
 min = 0
 max = 4095
-rev = true
+rev = false
