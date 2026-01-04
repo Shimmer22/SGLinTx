@@ -11,15 +11,15 @@ set -e
 G0_DIR="/sys/kernel/config/usb_gadget/g0"
 LOG_FILE="/tmp/hid_setup.log"
 
-# HID Report Descriptor (6 bytes):
+# HID Report Descriptor (6 bytes) - PS4/PS5 风格:
 #   Byte 0: 8 buttons (bit flags)
-#   Byte 1: X axis (Direction, -127~127, 回中)
-#   Byte 2: Y axis (Aileron, -127~127, 回中)
-#   Byte 3: Z axis (Elevator, -127~127, 回中)
-#   Byte 4: Rz axis (spare, -127~127, 回中)
-#   Byte 5: Slider (Throttle, 0~255, 不回中)
+#   Byte 1: X axis (Left Stick X = Rudder, -127~127)
+#   Byte 2: Y axis (Left Stick Y = Throttle, -127~127)
+#   Byte 3: Z axis (Right Stick X = Aileron, -127~127)
+#   Byte 4: Rz axis (Right Stick Y = Elevator, -127~127)
+#   Byte 5: Slider (Reserved, -127~127)
 HID_REPORT_LENGTH=6
-HID_REPORT_DESC="05 01 09 05 A1 01 05 09 19 01 29 08 15 00 25 01 75 01 95 08 81 02 05 01 09 30 09 31 09 32 09 35 15 81 25 7F 75 08 95 04 81 02 09 36 15 00 26 FF 00 75 08 95 01 81 02 C0"
+HID_REPORT_DESC="05 01 09 05 A1 01 05 09 19 01 29 08 15 00 25 01 75 01 95 08 81 02 05 01 09 30 09 31 09 32 09 35 09 36 15 81 25 7F 75 08 95 05 81 02 C0"
 
 log() {
     echo "$1"

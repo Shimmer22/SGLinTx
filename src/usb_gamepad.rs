@@ -8,46 +8,53 @@ use crate::{mixer::MixerOutMsg, client_process_args};
 #[command(name="usb_gamepad", about = "USB HID Gamepad output driver", long_about = None)]
 struct Cli {
     /// HID device path
-    #[arg(short, long, default_value = "/dev/hidg1")]
+    #[arg(short, long, default_value = "/dev/hidg0")]
     device: String,
 }
 
-/// USB HID Gamepad Report Format (6 bytes):
+/// USB HID Gamepad Report Format (6 bytes) - PS4/PS5 风格布局:
+/// 
+/// 左摇杆 (Throttle + Rudder):
+///   Byte 1: X axis = Rudder/Direction (CH4 in AETR, -127~127, 回中)
+///   Byte 2: Y axis = Throttle (CH3 in AETR, -127~127, 不回中)
+/// 
+/// 右摇杆 (Aileron + Elevator):  
+///   Byte 3: Z axis = Aileron/Roll (CH1 in AETR, -127~127, 回中)
+///   Byte 4: Rz axis = Elevator/Pitch (CH2 in AETR, -127~127, 回中)
+/// 
 /// Byte 0: 8 buttons (bit flags)
-/// Byte 1: X axis (Direction, -127~127, 回中)
-/// Byte 2: Y axis (Aileron, -127~127, 回中)
-/// Byte 3: Z axis (Elevator, -127~127, 回中)
-/// Byte 4: Rz axis (spare, -127~127, 回中)
-/// Byte 5: Slider (Thrust/Throttle, 0~255, 不回中)
+/// Byte 5: Slider (reserved, 0~255)
+/// 
+/// AETR 通道顺序: CH1=Aileron, CH2=Elevator, CH3=Throttle, CH4=Rudder
 #[repr(C, packed)]
 struct HidGamepadReport {
     buttons: u8,       // 8 button bits
-    axis_x: i8,        // Direction (左右)
-    axis_y: i8,        // Aileron (副翼)
-    axis_z: i8,        // Elevator (升降)
-    axis_rz: i8,       // Spare (备用)
-    slider: u8,        // Thrust/Throttle (油门, 0~255)
+    left_x: i8,        // 左摇杆X = Rudder/Direction (方向舵)
+    left_y: i8,        // 左摇杆Y = Throttle (油门)
+    right_x: i8,       // 右摇杆X = Aileron (副翼)
+    right_y: i8,       // 右摇杆Y = Elevator (升降)
+    slider: u8,        // 备用 Slider
 }
 
 impl HidGamepadReport {
     fn new() -> Self {
         Self {
             buttons: 0,
-            axis_x: 0,
-            axis_y: 0,
-            axis_z: 0,
-            axis_rz: 0,
-            slider: 0,  // 油门默认最低
+            left_x: 0,     // Rudder 中位
+            left_y: -127,  // Throttle 最低 (对应 -127)
+            right_x: 0,    // Aileron 中位
+            right_y: 0,    // Elevator 中位
+            slider: 0,
         }
     }
 
     fn to_bytes(&self) -> [u8; 6] {
         [
             self.buttons,
-            self.axis_x as u8,
-            self.axis_y as u8,
-            self.axis_z as u8,
-            self.axis_rz as u8,
+            self.left_x as u8,
+            self.left_y as u8,
+            self.right_x as u8,
+            self.right_y as u8,
             self.slider,
         ]
     }
@@ -62,13 +69,13 @@ fn mixer_to_hid_axis(mixer_value: u16) -> i8 {
     hid_value.clamp(-127, 127) as i8
 }
 
-/// Convert mixer value (0~10000) to HID throttle value (0~255)
-/// Mixer 输出范围: 0 ~ 10000
-/// HID 油门范围: 0 ~ 255 (单向，不回中)
-fn mixer_to_hid_throttle(mixer_value: u16) -> u8 {
-    let normalized = mixer_value as f32 / 10000.0;  // 0.0 ~ 1.0
-    let hid_value = (normalized * 255.0) as u32;
-    hid_value.clamp(0, 255) as u8
+/// Convert mixer throttle (0~10000) to HID axis (-127~127)
+/// Mixer 油门: 0 = 最低, 10000 = 最高
+/// HID 轴: -127 = 最低, 127 = 最高
+fn mixer_throttle_to_hid_axis(mixer_value: u16) -> i8 {
+    let normalized = (mixer_value as i32 - 5000) as f32 / 5000.0; // -1.0 ~ +1.0
+    let hid_value = (normalized * 127.0) as i32;
+    hid_value.clamp(-127, 127) as i8
 }
 
 pub fn usb_gamepad_main(argc: u32, argv: *const &str) {
@@ -119,13 +126,21 @@ pub fn usb_gamepad_main(argc: u32, argv: *const &str) {
         
         let mut report = HidGamepadReport::new();
 
-        // 映射 mixer 输出到 HID 轴
-        // MixerOutMsg 字段: thrust, direction, aileron, elevator
-        report.axis_x = mixer_to_hid_axis(msg.direction);  // X轴 = 左右方向
-        report.axis_y = mixer_to_hid_axis(msg.aileron);    // Y轴 = 副翼
-        report.axis_z = mixer_to_hid_axis(msg.elevator);   // Z轴 = 升降
-        report.axis_rz = 0;  // 备用轴，暂时不用
-        report.slider = mixer_to_hid_throttle(msg.thrust); // Slider = 油门 (0~255)
+        // PS4/PS5 风格 AETR 映射:
+        // 左摇杆: X=Rudder/Direction, Y=Throttle
+        // 右摇杆: X=Aileron, Y=Elevator
+        // 
+        // MixerOutMsg 字段对应航模通道:
+        //   direction = Rudder (CH4 in AETR)
+        //   thrust    = Throttle (CH3 in AETR)
+        //   aileron   = Aileron/Roll (CH1 in AETR)
+        //   elevator  = Elevator/Pitch (CH2 in AETR)
+        
+        report.left_x = mixer_to_hid_axis(msg.direction);       // 左摇杆X = Rudder
+        report.left_y = mixer_throttle_to_hid_axis(msg.thrust); // 左摇杆Y = Throttle
+        report.right_x = mixer_to_hid_axis(msg.aileron);        // 右摇杆X = Aileron
+        report.right_y = mixer_to_hid_axis(msg.elevator);       // 右摇杆Y = Elevator
+        report.slider = 0;  // 备用
 
         // 暂时没有按键数据，保持为0
         report.buttons = 0;
@@ -138,8 +153,8 @@ pub fn usb_gamepad_main(argc: u32, argv: *const &str) {
         
         // 打印调试信息（每100次打印一次）
         if counter % 100 == 0 {
-            thread_logln!("HID sent {} reports. Latest: Dir={}, Ail={}, Elev={}, Thr={}", 
-                counter, report.axis_x, report.axis_y, report.axis_z, report.slider);
+            thread_logln!("HID[{}]: LX={} LY={} RX={} RY={}", 
+                counter, report.left_x, report.left_y, report.right_x, report.right_y);
         }
     }
 }
