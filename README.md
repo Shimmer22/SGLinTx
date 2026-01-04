@@ -120,5 +120,34 @@ LinTx 采用客户端-服务器架构（基于 `rpos` 库）。主程序通常�
   ./LinTx -- mixer
   ```
 
+#### 7. `usb_gamepad` (USB HID 手柄输出)
+将混控后的数据输出到 USB HID 手柄设备，使从机模拟成 PC 可识别的游戏手柄。
+- **前置条件**: 需先运行 `gamepad_composite.sh` 配置 USB Gadget。
+- **参数**:
+  - `--device <设备路径>`: (可选) HID 设备路径，默认 `/dev/hidg0`。
+- **示例**:
+  ```bash
+  # 1. 配置 USB 复合设备（网络 + 手柄）
+  sh gamepad_composite.sh
+  
+  # 2. 启动完整流程：mock数据 -> mixer -> USB输出
+  ./LinTx --server &
+  ./LinTx -- mock_joystick &
+  ./LinTx -- mixer &
+  ./LinTx -- usb_gamepad
+  
+  # 或使用真实的 STM32 串口输入
+  ./LinTx -- stm32_serial /dev/ttyS0 &
+  ./LinTx -- mixer &
+  ./LinTx -- usb_gamepad
+  ```
+- **通道映射** (mixer输出 → HID轴):
+  - `thrust` (油门) → HID Rz轴
+  - `direction` (方向) → HID X轴
+  - `aileron` (副翼) → HID Z轴
+  - `elevator` (升降) → HID Y轴
+  - mixer 值域: 0~10000 (中心值 5000)
+  - HID 值域: -127~127 (中心值 0)
+
 ## 许可证
 本项目遵循 `MIT` 许可证（详见 `LICENSE` 文件）。
