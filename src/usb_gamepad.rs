@@ -12,23 +12,25 @@ struct Cli {
     device: String,
 }
 
-/// USB HID Gamepad Report Format (6 bytes) - PS4/PS5 风格布局:
+/// USB HID Gamepad Report Format (7 bytes) - PS4/PS5 风格布局:
+/// 
+/// Byte 0-1: 16 buttons (bit flags, 2 bytes)
 /// 
 /// 左摇杆 (Throttle + Rudder):
-///   Byte 1: X axis = Rudder/Direction (CH4 in AETR, -127~127, 回中)
-///   Byte 2: Y axis = Throttle (CH3 in AETR, -127~127, 不回中)
+///   Byte 2: X axis = Rudder/Direction (CH4 in AETR, -127~127, 回中)
+///   Byte 3: Y axis = Throttle (CH3 in AETR, -127~127, 不回中)
 /// 
 /// 右摇杆 (Aileron + Elevator):  
-///   Byte 3: Rx axis = Aileron/Roll (CH1 in AETR, -127~127, 回中)
-///   Byte 4: Ry axis = Elevator/Pitch (CH2 in AETR, -127~127, 回中)
+///   Byte 4: Rx axis = Aileron/Roll (CH1 in AETR, -127~127, 回中)
+///   Byte 5: Ry axis = Elevator/Pitch (CH2 in AETR, -127~127, 回中)
 /// 
-/// Byte 0: 8 buttons (bit flags)
-/// Byte 5: Reserved (padding)
+/// Byte 6: Reserved (padding)
 /// 
 /// AETR 通道顺序: CH1=Aileron, CH2=Elevator, CH3=Throttle, CH4=Rudder
 #[repr(C, packed)]
 struct HidGamepadReport {
-    buttons: u8,       // 8 button bits
+    buttons_lo: u8,    // Buttons 1-8
+    buttons_hi: u8,    // Buttons 9-16
     left_x: i8,        // 左摇杆X = Rudder/Direction (方向舵)
     left_y: i8,        // 左摇杆Y = Throttle (油门)
     right_x: i8,       // 右摇杆X = Aileron (副翼)
@@ -39,7 +41,8 @@ struct HidGamepadReport {
 impl HidGamepadReport {
     fn new() -> Self {
         Self {
-            buttons: 0,
+            buttons_lo: 0,
+            buttons_hi: 0,
             left_x: 0,     // Rudder 中位
             left_y: -127,  // Throttle 最低 (对应 -127)
             right_x: 0,    // Aileron 中位
@@ -48,9 +51,10 @@ impl HidGamepadReport {
         }
     }
 
-    fn to_bytes(&self) -> [u8; 6] {
+    fn to_bytes(&self) -> [u8; 7] {
         [
-            self.buttons,
+            self.buttons_lo,
+            self.buttons_hi,
             self.left_x as u8,
             self.left_y as u8,
             self.right_x as u8,
@@ -143,7 +147,8 @@ pub fn usb_gamepad_main(argc: u32, argv: *const &str) {
         report._reserved = 0;  // 填充字节
 
         // 暂时没有按键数据，保持为0
-        report.buttons = 0;
+        report.buttons_lo = 0;  // Buttons 1-8
+        report.buttons_hi = 0;  // Buttons 9-16
 
         // 发送 HID 报告
         let report_bytes = report.to_bytes();

@@ -11,16 +11,17 @@ set -e
 G0_DIR="/sys/kernel/config/usb_gadget/g0"
 LOG_FILE="/tmp/hid_setup.log"
 
-# HID Report Descriptor (6 bytes) - PS4/PS5 风格:
-#   Byte 0: 8 buttons (bit flags)
-#   Byte 1: X axis (Left Stick X = Rudder, -127~127)
-#   Byte 2: Y axis (Left Stick Y = Throttle, -127~127)
-#   Byte 3: Rx axis (Right Stick X = Aileron, -127~127)
-#   Byte 4: Ry axis (Right Stick Y = Elevator, -127~127)
-#   Byte 5: Reserved (padding byte)
-HID_REPORT_LENGTH=6
-# Usages: X(30), Y(31), Rx(33), Ry(34) for proper dual-stick mapping
-HID_REPORT_DESC="05 01 09 05 A1 01 05 09 19 01 29 08 15 00 25 01 75 01 95 08 81 02 05 01 09 30 09 31 09 32 09 33 15 81 25 7F 75 08 95 04 81 02 75 08 95 01 81 01 C0"
+# HID Report Descriptor (7 bytes) - PS4/PS5 风格:
+#   Byte 0-1: 16 buttons (bit flags, 2 bytes)
+#   Byte 2: X axis (Left Stick X = Rudder, -127~127)
+#   Byte 3: Y axis (Left Stick Y = Throttle, -127~127)
+#   Byte 4: Z axis (Right Stick X = Aileron, -127~127)
+#   Byte 5: Rx axis (Right Stick Y = Elevator, -127~127)
+#   Byte 6: Reserved (padding byte)
+HID_REPORT_LENGTH=7
+# 16 buttons (29 10 = Button Max 16), then X(30), Y(31), Z(32), Rx(33) axes (原始顺序)
+# 75 08 95 01 81 01 = 1 byte constant padding
+HID_REPORT_DESC="05 01 09 05 A1 01 05 09 19 01 29 10 15 00 25 01 75 01 95 10 81 02 05 01 09 30 09 31 09 32 09 33 15 81 25 7F 75 08 95 04 81 02 75 08 95 01 81 01 C0"
 log() {
     echo "$1"
     echo "$(date '+%H:%M:%S') $1" >> "$LOG_FILE"
