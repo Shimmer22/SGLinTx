@@ -188,12 +188,12 @@ LinTx -- <模块名称> [模块参数]
 ./LinTx -- system_state_mock --hz 5
 ```
 
-#### 9. `ui_demo` (LVGL 框架基础应用)
-这是新的 UI 框架入口（当前用终端后端演示，接口已按 LVGL 架构抽象）：
+#### 9. `ui_demo` (LVGL 应用入口)
+这是新的 UI 框架入口，`sdl` 后端已使用真实 LVGL 对象树渲染：
 
-- `--backend sdl`：PC SDL 窗口后端（支持 `--width/--height`）
+- `--backend sdl`：PC SDL 窗口后端（真实 LVGL 渲染，支持 `--width/--height`）
 - `--backend pc`：PC 终端后端
-- `--backend fb --fb-device /dev/fb0`：板卡 framebuffer 后端（后续可接 MIPI 屏）
+- `--backend fb --fb-device /dev/fb0`：板卡 framebuffer 后端（当前仍为占位后端）
 
 示例：
 ```bash
@@ -222,12 +222,13 @@ cargo run --features sdl_ui --target x86_64-unknown-linux-gnu -- -- ui_demo --ba
 - `←/→` 在边界时切换前后页面
 - `Enter` 进入应用页，`Esc` 返回，`Q` 退出
 
-## LVGL 架构设计（当前已落地基础骨架）
-当前代码新增 `src/ui/` 分层，便于与现有 `rpos` 架构融合并支持扩展：
+## LVGL 架构设计（已接入真实 LVGL）
+当前 `src/ui/` 分层与 `rpos` 架构融合方式如下：
 
 - `ui/backend.rs`
   - `LvglBackend` trait：统一 PC 与 fb 后端接口
-  - `BackendKind::PcApi | Fbdev`
+  - `BackendKind::PcApi | PcSdl | Fbdev`
+  - `PcSdl` 路径：`lvgl::Display::register` + LVGL 控件树 + `tick_inc/task_handler`
 - `ui/catalog.rs`
   - 应用模板定义：`AppSpec`（标题、图标文本、主题色）
   - 页面模板定义：`PageSpec`（行列布局、应用列表）
@@ -238,10 +239,13 @@ cargo run --features sdl_ui --target x86_64-unknown-linux-gnu -- -- ui_demo --ba
 - `messages.rs`
   - 统一消息定义：`adc_raw`、`system_status`、`system_config`
 
-后续接入真实 LVGL 时建议：
-- PC 端：在 `PcApi` 后端接 `lvgl + SDL/Win32` 刷新
+后续扩展建议：
 - SG2002 板卡：在 `Fbdev` 后端接 `/dev/fb0`，显示驱动走 MIPI/fb
-- 业务模块通过 `rpos::msg` 持续推送状态和配置，UI 只消费消息，不直接耦合驱动
+- 输入设备：将 SDL 键盘映射迁移到 LVGL indev 驱动，统一输入抽象
+- 业务模块持续通过 `rpos::msg` 推送状态和配置，UI 只消费消息，不直接耦合驱动
+
+## 已知问题
+- 见 `docs/KNOWN_ISSUES.md`
 
 ## 许可证
 本项目遵循 `MIT` 许可证（详见 `LICENSE` 文件）。

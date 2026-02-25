@@ -14,6 +14,8 @@ serde ={ version = "1.0.197", features = ["derive"] }
 serialport = {version = "4.3.0",default-features = false}
 crc = "3.0"
 crsf = "2.0.1"
+lvgl = { version = "0.6.2", default-features = false, features = ["alloc", "embedded_graphics", "use-vendored-config"], optional = true }
+lvgl-sys = { version = "0.6.2", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ads1x1x = { git = "https://github.com/eldruin/ads1x1x-rs.git" }
@@ -24,7 +26,7 @@ joydev = { version = "0.3.1", optional = true }
 [features]
 default = []
 joydev_input = ["dep:joydev"]
-sdl_ui = ["dep:sdl2"]
+sdl_ui = ["dep:sdl2", "dep:lvgl", "dep:lvgl-sys"]
 
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 sdl2 = { version = "0.37.0", features = ["bundled"], optional = true }
@@ -37,3 +39,4 @@ build-data = "0"
 
 [patch.crates-io]
 joydev-sys = { path = "third_party/joydev-sys" }
+lvgl-sys = { path = "third_party/lvgl-sys" }

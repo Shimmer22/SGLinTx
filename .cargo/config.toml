@@ -1,5 +1,6 @@
 [build]
-target = ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+# 默认开发目标改为桌面 Linux，避免在 WSL/PC 侧误触发交叉工具链。
+target = "x86_64-unknown-linux-gnu"
 
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
