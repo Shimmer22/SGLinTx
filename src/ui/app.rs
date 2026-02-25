@@ -6,8 +6,9 @@ use crate::messages::{SystemConfigMsg, SystemStatusMsg};
 
 use super::{
     backend::LvglBackend,
+    catalog::{app_at, page, PAGE_SPECS},
     input::UiInputEvent,
-    model::{AppId, UiFrame, UiPage},
+    model::{UiFrame, UiPage},
 };
 
 pub struct UiApp {
@@ -21,17 +22,75 @@ impl UiApp {
         }
     }
 
-    fn app_index(app: AppId) -> usize {
-        match app {
-            AppId::System => 0,
-            AppId::Control => 1,
-            AppId::Models => 2,
-            AppId::Cloud => 3,
+    fn normalize_selection(&mut self) {
+        let p = page(self.frame.launcher_page);
+        if self.frame.selected_row >= p.rows {
+            self.frame.selected_row = p.rows.saturating_sub(1);
+        }
+        if self.frame.selected_col >= p.cols {
+            self.frame.selected_col = p.cols.saturating_sub(1);
+        }
+        while app_at(
+            self.frame.launcher_page,
+            self.frame.selected_row,
+            self.frame.selected_col,
+        )
+        .is_none()
+            && self.frame.selected_col > 0
+        {
+            self.frame.selected_col -= 1;
         }
     }
 
-    fn app_from_index(idx: usize) -> AppId {
-        AppId::ALL[idx % AppId::ALL.len()]
+    fn move_selection_vertical(&mut self, dr: isize) {
+        let p = page(self.frame.launcher_page);
+        let nr = self.frame.selected_row as isize + dr;
+        if nr < 0 {
+            return;
+        }
+        let nr = nr as usize;
+        if nr >= p.rows {
+            return;
+        }
+
+        if app_at(self.frame.launcher_page, nr, self.frame.selected_col).is_some() {
+            self.frame.selected_row = nr;
+        }
+    }
+
+    fn move_left(&mut self) {
+        if self.frame.selected_col > 0 {
+            self.frame.selected_col -= 1;
+            return;
+        }
+
+        if self.frame.launcher_page > 0 {
+            self.frame.launcher_page -= 1;
+            let p = page(self.frame.launcher_page);
+            self.frame.selected_col = p.cols.saturating_sub(1);
+            self.normalize_selection();
+        }
+    }
+
+    fn move_right(&mut self) {
+        let p = page(self.frame.launcher_page);
+        if self.frame.selected_col + 1 < p.cols
+            && app_at(
+                self.frame.launcher_page,
+                self.frame.selected_row,
+                self.frame.selected_col + 1,
+            )
+            .is_some()
+        {
+            self.frame.selected_col += 1;
+            return;
+        }
+
+        if self.frame.launcher_page + 1 < PAGE_SPECS.len() {
+            self.frame.launcher_page += 1;
+            self.frame.selected_col = 0;
+            self.normalize_selection();
+        }
     }
 
     fn apply_event(&mut self, event: UiInputEvent) -> bool {
@@ -40,20 +99,46 @@ impl UiApp {
             UiInputEvent::Back => self.frame.page = UiPage::Launcher,
             UiInputEvent::Open => {
                 if self.frame.page == UiPage::Launcher {
-                    self.frame.page = UiPage::App(self.frame.selected_app);
+                    if let Some(app) = app_at(
+                        self.frame.launcher_page,
+                        self.frame.selected_row,
+                        self.frame.selected_col,
+                    ) {
+                        self.frame.page = UiPage::App(app);
+                    }
                 }
             }
-            UiInputEvent::Next => {
+            UiInputEvent::Left => {
                 if self.frame.page == UiPage::Launcher {
-                    let idx = Self::app_index(self.frame.selected_app);
-                    self.frame.selected_app = Self::app_from_index(idx + 1);
+                    self.move_left();
                 }
             }
-            UiInputEvent::Prev => {
+            UiInputEvent::Right => {
                 if self.frame.page == UiPage::Launcher {
-                    let idx = Self::app_index(self.frame.selected_app);
-                    let prev = (idx + AppId::ALL.len() - 1) % AppId::ALL.len();
-                    self.frame.selected_app = Self::app_from_index(prev);
+                    self.move_right();
+                }
+            }
+            UiInputEvent::Up => {
+                if self.frame.page == UiPage::Launcher {
+                    self.move_selection_vertical(-1);
+                }
+            }
+            UiInputEvent::Down => {
+                if self.frame.page == UiPage::Launcher {
+                    self.move_selection_vertical(1);
+                }
+            }
+            UiInputEvent::PagePrev => {
+                if self.frame.page == UiPage::Launcher && self.frame.launcher_page > 0 {
+                    self.frame.launcher_page -= 1;
+                    self.normalize_selection();
+                }
+            }
+            UiInputEvent::PageNext => {
+                if self.frame.page == UiPage::Launcher && self.frame.launcher_page + 1 < PAGE_SPECS.len()
+                {
+                    self.frame.launcher_page += 1;
+                    self.normalize_selection();
                 }
             }
         }

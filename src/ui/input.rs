@@ -1,8 +1,12 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiInputEvent {
-    Next,
-    Prev,
+    Left,
+    Right,
+    Up,
+    Down,
     Open,
     Back,
+    PagePrev,
+    PageNext,
     Quit,
 }

@@ -210,10 +210,17 @@ LinTx -- <模块名称> [模块参数]
 
 WSL2 测试建议：
 ```bash
-cargo run --features sdl_ui -- --server
-cargo run --features sdl_ui -- -- system_state_mock --hz 5
-cargo run --features sdl_ui -- -- ui_demo --backend sdl --width 800 --height 480 --fps 30
+cargo run --features sdl_ui --target x86_64-unknown-linux-gnu -- --server
+# detach: 客户端退出后，后台模块继续运行（避免 UI 退出导致后台任务结束）
+cargo run --features sdl_ui --target x86_64-unknown-linux-gnu -- --detach -- system_state_mock --hz 5
+cargo run --features sdl_ui --target x86_64-unknown-linux-gnu -- -- ui_demo --backend sdl --width 800 --height 480 --fps 30
 ```
+
+键盘操作（Launcher）：
+- 主页面（第1页）是 `1x4` 横排应用：仅 `←/→` 有效
+- 后续页面可扩展为 `2x4`：`↑/↓` 只在当前列移动，不跨列、不环绕
+- `←/→` 在边界时切换前后页面
+- `Enter` 进入应用页，`Esc` 返回，`Q` 退出
 
 ## LVGL 架构设计（当前已落地基础骨架）
 当前代码新增 `src/ui/` 分层，便于与现有 `rpos` 架构融合并支持扩展：
@@ -221,10 +228,13 @@ cargo run --features sdl_ui -- -- ui_demo --backend sdl --width 800 --height 480
 - `ui/backend.rs`
   - `LvglBackend` trait：统一 PC 与 fb 后端接口
   - `BackendKind::PcApi | Fbdev`
+- `ui/catalog.rs`
+  - 应用模板定义：`AppSpec`（标题、图标文本、主题色）
+  - 页面模板定义：`PageSpec`（行列布局、应用列表）
 - `ui/model.rs`
-  - `UiFrame`：统一 UI 数据模型（状态页 + 配置页）
+  - `UiFrame`：统一 UI 数据模型（状态栏、launcher分页、选框位置）
 - `ui/app.rs`
-  - 主循环：订阅消息、切屏、渲染
+  - 主循环：订阅消息、按键事件、相对移动规则、应用进入/返回
 - `messages.rs`
   - 统一消息定义：`adc_raw`、`system_status`、`system_config`
 

@@ -32,6 +32,9 @@ struct Cli {
     #[arg(long)]
     server: bool,
 
+    #[arg(long, help = "Run client command detached from this terminal/client")]
+    detach: bool,
+
     /// commands send by clients.
     #[arg(value_name = "client commands")]
     other: Option<Vec<String>>,
@@ -90,7 +93,13 @@ fn run_unix_client_server() {
         server_init(SOCKET_PATH).unwrap();
     } else {
         let mut client = Client::new(SOCKET_PATH).unwrap();
-        client.send_str(cli.other.unwrap().join(" ").as_str());
+        let cmd = cli.other.unwrap().join(" ");
+        if cli.detach {
+            let detached = format!("__DETACH__ {cmd}");
+            client.send_str(detached.as_str());
+            return;
+        }
+        client.send_str(cmd.as_str());
         client.block_read();
     }
 }
