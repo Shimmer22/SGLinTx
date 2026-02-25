@@ -1,16 +1,11 @@
 
 use rpos::thread_logln;
-use std::{io::Write};
 
 use linux_embedded_hal::I2cdev;
 use nb::block;
 
 use ads1x1x::{channel, Ads1x1x, SlaveAddr};
-
-#[derive(Debug,Clone,Copy,Default)]
-pub struct AdcRawMsg{
-    pub value:[i16;4]
-}
+use crate::messages::AdcRawMsg;
 
 fn adc_main(_argc: u32, _argv: *const &str) {
     let dev = I2cdev::new("/dev/i2c-0").unwrap();
@@ -40,6 +35,5 @@ fn adc_main(_argc: u32, _argv: *const &str) {
 
 #[rpos::ctor::ctor]
 fn register() {
-    rpos::msg::add_message::<AdcRawMsg>("adc_raw");
     rpos::module::Module::register("adc", adc_main);
 }

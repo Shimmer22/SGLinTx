@@ -2,7 +2,7 @@ use std::{fs, io::Read};
 
 use rpos::thread_logln;
 
-use crate::adc::AdcRawMsg;
+use crate::messages::AdcRawMsg;
 use crate::calibrate::{
     CalibrationData,
     JoystickChannel::{self, *},

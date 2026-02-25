@@ -3,7 +3,7 @@ use std::f32::consts::PI;
 use clap::Parser;
 use rpos::{msg::get_new_tx_of_message, thread_logln};
 use serde::Deserialize;
-use crate::{adc::AdcRawMsg, client_process_args};
+use crate::{messages::AdcRawMsg, client_process_args};
 
 #[derive(Parser)]
 #[command(name="mock_joystick", about = "Mock joystick data generator for testing", long_about = None)]

@@ -2,7 +2,7 @@ use std::time::Duration;
 use clap::Parser;
 use crc::{Crc, CRC_8_DVB_S2};
 use rpos::{msg::get_new_tx_of_message, thread_logln};
-use crate::{adc::AdcRawMsg, client_process_args};
+use crate::{messages::AdcRawMsg, client_process_args};
 
 #[derive(Parser)]
 #[command(name="stm32_serial", about = "Read data from STM32 via Serial (CRSF-like)", long_about = None)]

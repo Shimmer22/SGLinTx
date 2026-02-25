@@ -5,7 +5,7 @@ use rpos::{
     thread_logln
 };
 
-use crate::{adc::AdcRawMsg, CALIBRATE_FILENAME};
+use crate::{messages::AdcRawMsg, CALIBRATE_FILENAME};
 
 pub trait EnumIter
 where

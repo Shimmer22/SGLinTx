@@ -1,7 +1,10 @@
 # LinTx 项目说明
 
 ## 项目简介
-LinTx 是一个基于 Rust 的嵌入式应用，目标平台为 **RISC-V 64 位**（`riscv64gc-unknown-linux-musl`），适配 **Buildroot / BusyBox** 环境，可在 **SG2002**（C906 核心）芯片上运行。
+LinTx 是一个基于 Rust 的模块化遥控系统应用，当前同时支持：
+- 板卡目标：**RISC-V 64 位**（`riscv64gc-unknown-linux-musl`，Buildroot/BusyBox，SG2002）
+- 桌面目标：**x86_64 Linux**
+- 桌面目标：**x86_64 Windows**（`x86_64-pc-windows-gnu`）
 
 ## 关键特性
 - 使用 **musl** 静态链接，二进制体积小，运行时依赖最少。
@@ -13,19 +16,42 @@ LinTx 是一个基于 Rust 的嵌入式应用，目标平台为 **RISC-V 64 位*
 # 1. 清理旧的构建产物
 cargo clean
 
-# 2. 使用 cross 编译（已配置自定义镜像）
+# 2. 编译当前主机（x86_64 Linux）
+cargo check
+
+# 3. 编译 Windows 目标（首次需要安装 target）
+rustup target add x86_64-pc-windows-gnu
+cargo check --target x86_64-pc-windows-gnu
+
+# 4. 使用 cross 编译 RISC-V（已配置自定义镜像）
 cross build --target riscv64gc-unknown-linux-musl --release
 ```
 编译完成后，二进制位于 `target/riscv64gc-unknown-linux-musl/release/LinTx`。
+
+### 可选功能
+- `joydev_input`：启用 Linux `joydev` 输入模块
+```bash
+cargo check --features joydev_input
+```
+- `sdl_ui`：启用 PC SDL 窗口 UI 后端（WSL2/桌面调试建议开启）
+```bash
+cargo check --features sdl_ui
+```
 
 ## 如何使用
 
 LinTx 采用客户端-服务器架构（基于 `rpos` 库）。主程序通常作为服务器后台运行，通过命令行参数启动具体的子模块。
 
-### 基本用法
+### 基本用法（Linux）
 ```bash
 # 格式
 ./LinTx -- <模块名称> [模块参数]
+```
+
+### 基本用法（Windows）
+Windows 下使用本地模式（不依赖 Unix socket server）：
+```bash
+LinTx -- <模块名称> [模块参数]
 ```
 
 ### 可用模块及参数
@@ -148,6 +174,64 @@ LinTx 采用客户端-服务器架构（基于 `rpos` 库）。主程序通常�
   - `elevator` (升降) → HID Y轴
   - mixer 值域: 0~10000 (中心值 5000)
   - HID 值域: -127~127 (中心值 0)
+
+#### 8. `system_state_mock` (系统状态/配置模拟源)
+用于向 UI 发送基础系统数据：
+- 遥控电量
+- 飞行器电量
+- 信号强度
+- 系统时间
+- 背光、声音配置
+
+示例：
+```bash
+./LinTx -- system_state_mock --hz 5
+```
+
+#### 9. `ui_demo` (LVGL 框架基础应用)
+这是新的 UI 框架入口（当前用终端后端演示，接口已按 LVGL 架构抽象）：
+
+- `--backend sdl`：PC SDL 窗口后端（支持 `--width/--height`）
+- `--backend pc`：PC 终端后端
+- `--backend fb --fb-device /dev/fb0`：板卡 framebuffer 后端（后续可接 MIPI 屏）
+
+示例：
+```bash
+# Linux: server/client 方式
+./LinTx --server &
+./LinTx -- system_state_mock --hz 5 &
+./LinTx -- ui_demo --backend sdl --width 800 --height 480 --fps 30
+
+# 板卡场景（示例）
+./LinTx --server &
+./LinTx -- system_state_mock --hz 5 &
+./LinTx -- ui_demo --backend fb --fb-device /dev/fb0
+```
+
+WSL2 测试建议：
+```bash
+cargo run --features sdl_ui -- --server
+cargo run --features sdl_ui -- -- system_state_mock --hz 5
+cargo run --features sdl_ui -- -- ui_demo --backend sdl --width 800 --height 480 --fps 30
+```
+
+## LVGL 架构设计（当前已落地基础骨架）
+当前代码新增 `src/ui/` 分层，便于与现有 `rpos` 架构融合并支持扩展：
+
+- `ui/backend.rs`
+  - `LvglBackend` trait：统一 PC 与 fb 后端接口
+  - `BackendKind::PcApi | Fbdev`
+- `ui/model.rs`
+  - `UiFrame`：统一 UI 数据模型（状态页 + 配置页）
+- `ui/app.rs`
+  - 主循环：订阅消息、切屏、渲染
+- `messages.rs`
+  - 统一消息定义：`adc_raw`、`system_status`、`system_config`
+
+后续接入真实 LVGL 时建议：
+- PC 端：在 `PcApi` 后端接 `lvgl + SDL/Win32` 刷新
+- SG2002 板卡：在 `Fbdev` 后端接 `/dev/fb0`，显示驱动走 MIPI/fb
+- 业务模块通过 `rpos::msg` 持续推送状态和配置，UI 只消费消息，不直接耦合驱动
 
 ## 许可证
 本项目遵循 `MIT` 许可证（详见 `LICENSE` 文件）。
