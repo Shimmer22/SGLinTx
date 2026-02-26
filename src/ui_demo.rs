@@ -28,16 +28,27 @@ struct Cli {
 }
 
 fn ui_demo_main(argc: u32, argv: *const &str) {
+    crate::ui::debug_log(&format!("ui_demo_main argc={argc}"));
     let args = match client_process_args::<Cli>(argc, argv) {
         Some(a) => a,
-        None => return,
+        None => {
+            crate::ui::debug_log("ui_demo args parse failed");
+            return;
+        }
     };
+    crate::ui::debug_log(&format!(
+        "ui_demo args backend={} fb_device={} fps={} size={}x{}",
+        args.backend, args.fb_device, args.fps, args.width, args.height
+    ));
 
     let backend_kind = BackendKind::parse(&args.backend, &args.fb_device, args.width, args.height);
     let mut backend = new_backend(backend_kind);
+    crate::ui::debug_log("ui backend created");
 
     let mut app = UiApp::new();
+    crate::ui::debug_log("ui app entering run loop");
     app.run(backend.as_mut(), args.fps);
+    crate::ui::debug_log("ui app exited run loop");
 }
 
 #[rpos::ctor::ctor]

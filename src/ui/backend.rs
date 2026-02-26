@@ -99,8 +99,12 @@ impl LvglBackend for TerminalBackend {
 
 pub fn new_backend(kind: BackendKind) -> Box<dyn LvglBackend> {
     match kind {
-        BackendKind::PcApi => Box::new(TerminalBackend::new("pc-api".to_string())),
+        BackendKind::PcApi => {
+            super::debug_log("new_backend -> PcApi");
+            Box::new(TerminalBackend::new("pc-api".to_string()))
+        }
         BackendKind::PcSdl { width, height } => {
+            super::debug_log(&format!("new_backend -> PcSdl {width}x{height}"));
             #[cfg(feature = "sdl_ui")]
             {
                 return Box::new(SdlBackend::new(width, height));
@@ -112,6 +116,7 @@ pub fn new_backend(kind: BackendKind) -> Box<dyn LvglBackend> {
             }
         }
         BackendKind::Fbdev { device } => {
+            super::debug_log(&format!("new_backend -> Fbdev device={device}"));
             Box::new(TerminalBackend::new(format!("fbdev:{}", device)))
         }
     }
@@ -148,6 +153,13 @@ struct SdlBackend {
 }
 
 #[cfg(feature = "sdl_ui")]
+#[derive(Clone, Copy, Debug)]
+enum SdlRenderMode {
+    Software,
+    Accelerated,
+}
+
+#[cfg(feature = "sdl_ui")]
 impl SdlBackend {
     fn to_coord(v: i32) -> lvgl_sys::lv_coord_t {
         v.clamp(i16::MIN as i32, i16::MAX as i32) as lvgl_sys::lv_coord_t
@@ -164,6 +176,35 @@ impl SdlBackend {
             display: None,
             ui: None,
             last_tick: std::time::Instant::now(),
+        }
+    }
+
+    fn is_wsl() -> bool {
+        if std::env::var_os("WSL_DISTRO_NAME").is_some() || std::env::var_os("WSL_INTEROP").is_some()
+        {
+            return true;
+        }
+
+        std::fs::read_to_string("/proc/version")
+            .map(|v| v.to_ascii_lowercase().contains("microsoft"))
+            .unwrap_or(false)
+    }
+
+    fn select_render_mode() -> SdlRenderMode {
+        match std::env::var("LINTX_SDL_RENDERER")
+            .map(|v| v.to_ascii_lowercase())
+            .unwrap_or_else(|_| "auto".to_string())
+            .as_str()
+        {
+            "software" | "sw" => SdlRenderMode::Software,
+            "accelerated" | "gpu" => SdlRenderMode::Accelerated,
+            _ => {
+                if Self::is_wsl() {
+                    SdlRenderMode::Software
+                } else {
+                    SdlRenderMode::Accelerated
+                }
+            }
         }
     }
 
@@ -433,21 +474,61 @@ impl SdlBackend {
 #[cfg(feature = "sdl_ui")]
 impl LvglBackend for SdlBackend {
     fn init(&mut self) {
+        super::debug_log(&format!(
+            "SdlBackend::init begin size={}x{}",
+            self.width, self.height
+        ));
         let sdl_ctx = sdl2::init().expect("failed to init sdl");
+        super::debug_log("SdlBackend::init sdl2::init ok");
         let video = sdl_ctx.video().expect("failed to init sdl video");
-        let window = video
-            .window("LinTX LVGL", self.width, self.height)
-            .position_centered()
-            .resizable()
-            .build()
-            .expect("failed to create window");
-        let canvas = window
-            .into_canvas()
-            .accelerated()
-            .present_vsync()
-            .build()
-            .expect("failed to create canvas");
+        super::debug_log("SdlBackend::init sdl video ok");
+        let render_mode = Self::select_render_mode();
+        super::debug_log(&format!(
+            "SdlBackend::init renderer mode={:?} (override with LINTX_SDL_RENDERER=software|accelerated)",
+            render_mode
+        ));
+
+        let create_window = || {
+            video
+                .window("LinTX LVGL", self.width, self.height)
+                .position_centered()
+                .resizable()
+                .build()
+                .expect("failed to create window")
+        };
+
+        let window = create_window();
+        super::debug_log("SdlBackend::init window ok");
+        let canvas = match render_mode {
+            SdlRenderMode::Software => {
+                super::debug_log("SdlBackend::init creating software canvas");
+                window
+                    .into_canvas()
+                    .software()
+                    .build()
+                    .expect("failed to create software canvas")
+            }
+            SdlRenderMode::Accelerated => {
+                super::debug_log("SdlBackend::init creating accelerated canvas");
+                match window.into_canvas().accelerated().present_vsync().build() {
+                    Ok(c) => c,
+                    Err(err) => {
+                        super::debug_log(&format!(
+                            "SdlBackend::init accelerated canvas failed: {}; retry with software canvas",
+                            err
+                        ));
+                        create_window()
+                            .into_canvas()
+                            .software()
+                            .build()
+                            .expect("failed to create software canvas after accelerated fallback")
+                    }
+                }
+            }
+        };
+        super::debug_log("SdlBackend::init canvas ok");
         let event_pump = sdl_ctx.event_pump().expect("failed to get event pump");
+        super::debug_log("SdlBackend::init event pump ok");
 
         self.canvas = Some(canvas);
         self.event_pump = Some(event_pump);
@@ -461,10 +542,12 @@ impl LvglBackend for SdlBackend {
             Self::blit_refresh(&framebuffer, width, height, refresh);
         })
         .expect("failed to register lvgl display");
+        super::debug_log("SdlBackend::init lvgl display registered");
 
         self.display = Some(display);
         self.build_ui();
         self.last_tick = std::time::Instant::now();
+        super::debug_log("SdlBackend::init done");
     }
 
     fn poll_event(&mut self) -> Option<UiInputEvent> {
