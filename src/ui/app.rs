@@ -1,14 +1,20 @@
 use std::time::Duration;
 
-use rpos::msg::get_new_rx_of_message;
+use rpos::{
+    channel::Sender,
+    msg::{get_new_rx_of_message, get_new_tx_of_message},
+};
 
-use crate::messages::{SystemConfigMsg, SystemStatusMsg};
+use crate::{
+    messages::{AdcRawMsg, SystemConfigMsg, SystemStatusMsg},
+    mixer::MixerOutMsg,
+};
 
 use super::{
     backend::LvglBackend,
     catalog::{app_at, page, PAGE_SPECS},
     input::UiInputEvent,
-    model::{UiFrame, UiPage},
+    model::{AppId, UiFrame, UiPage},
 };
 
 pub struct UiApp {
@@ -93,7 +99,69 @@ impl UiApp {
         }
     }
 
-    fn apply_event(&mut self, event: UiInputEvent) -> bool {
+    fn publish_config(&self, config_tx: &Sender<SystemConfigMsg>) {
+        config_tx.send(self.frame.config);
+    }
+
+    fn apply_event_in_app(
+        &mut self,
+        app: AppId,
+        event: UiInputEvent,
+        config_tx: &Sender<SystemConfigMsg>,
+    ) {
+        match app {
+            AppId::System => match event {
+                UiInputEvent::Up => {
+                    self.frame.config.backlight_percent = self
+                        .frame
+                        .config
+                        .backlight_percent
+                        .saturating_add(5)
+                        .min(100);
+                    self.publish_config(config_tx);
+                }
+                UiInputEvent::Down => {
+                    self.frame.config.backlight_percent =
+                        self.frame.config.backlight_percent.saturating_sub(5);
+                    self.publish_config(config_tx);
+                }
+                UiInputEvent::Left => {
+                    self.frame.config.sound_percent =
+                        self.frame.config.sound_percent.saturating_sub(5);
+                    self.publish_config(config_tx);
+                }
+                UiInputEvent::Right => {
+                    self.frame.config.sound_percent =
+                        self.frame.config.sound_percent.saturating_add(5).min(100);
+                    self.publish_config(config_tx);
+                }
+                _ => {}
+            },
+            AppId::Models => match event {
+                UiInputEvent::Up => {
+                    self.frame.model_focus_idx = self.frame.model_focus_idx.saturating_sub(1);
+                }
+                UiInputEvent::Down => {
+                    self.frame.model_focus_idx = (self.frame.model_focus_idx + 1).min(3);
+                }
+                UiInputEvent::Open => {
+                    self.frame.model_active_idx = self.frame.model_focus_idx;
+                }
+                _ => {}
+            },
+            AppId::Cloud => {
+                if event == UiInputEvent::Open {
+                    self.frame.cloud_connected = !self.frame.cloud_connected;
+                    if self.frame.cloud_connected {
+                        self.frame.cloud_last_sync_secs = self.frame.status.unix_time_secs;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_event(&mut self, event: UiInputEvent, config_tx: &Sender<SystemConfigMsg>) -> bool {
         match event {
             UiInputEvent::Quit => return false,
             UiInputEvent::Back => self.frame.page = UiPage::Launcher,
@@ -106,26 +174,36 @@ impl UiApp {
                     ) {
                         self.frame.page = UiPage::App(app);
                     }
+                } else if let UiPage::App(app) = self.frame.page {
+                    self.apply_event_in_app(app, event, config_tx);
                 }
             }
             UiInputEvent::Left => {
                 if self.frame.page == UiPage::Launcher {
                     self.move_left();
+                } else if let UiPage::App(app) = self.frame.page {
+                    self.apply_event_in_app(app, event, config_tx);
                 }
             }
             UiInputEvent::Right => {
                 if self.frame.page == UiPage::Launcher {
                     self.move_right();
+                } else if let UiPage::App(app) = self.frame.page {
+                    self.apply_event_in_app(app, event, config_tx);
                 }
             }
             UiInputEvent::Up => {
                 if self.frame.page == UiPage::Launcher {
                     self.move_selection_vertical(-1);
+                } else if let UiPage::App(app) = self.frame.page {
+                    self.apply_event_in_app(app, event, config_tx);
                 }
             }
             UiInputEvent::Down => {
                 if self.frame.page == UiPage::Launcher {
                     self.move_selection_vertical(1);
+                } else if let UiPage::App(app) = self.frame.page {
+                    self.apply_event_in_app(app, event, config_tx);
                 }
             }
             UiInputEvent::PagePrev => {
@@ -150,6 +228,9 @@ impl UiApp {
         super::debug_log(&format!("UiApp::run start fps={fps}"));
         let mut status_rx = get_new_rx_of_message::<SystemStatusMsg>("system_status").unwrap();
         let mut config_rx = get_new_rx_of_message::<SystemConfigMsg>("system_config").unwrap();
+        let mut adc_raw_rx = get_new_rx_of_message::<AdcRawMsg>("adc_raw").unwrap();
+        let mut mixer_out_rx = get_new_rx_of_message::<MixerOutMsg>("mixer_out").unwrap();
+        let config_tx = get_new_tx_of_message::<SystemConfigMsg>("system_config").unwrap();
 
         let frame_time = Duration::from_millis((1000 / fps.max(1)) as u64);
         let mut frame_idx: u64 = 0;
@@ -181,11 +262,26 @@ impl UiApp {
                 }
             }
 
+            if let Some(adc_raw) = adc_raw_rx.try_read() {
+                self.frame.adc_raw = adc_raw;
+            }
+
+            if let Some(mixer_out) = mixer_out_rx.try_read() {
+                self.frame.mixer_out = mixer_out;
+            }
+
+            if self.frame.cloud_connected
+                && self.frame.status.unix_time_secs
+                    >= self.frame.cloud_last_sync_secs.saturating_add(5)
+            {
+                self.frame.cloud_last_sync_secs = self.frame.status.unix_time_secs;
+            }
+
             while let Some(evt) = backend.poll_event() {
                 if super::debug_enabled() {
                     super::debug_log(&format!("input event: {:?}", evt));
                 }
-                if !self.apply_event(evt) {
+                if !self.apply_event(evt, &config_tx) {
                     super::debug_log("apply_event requested quit");
                     backend.shutdown();
                     return;

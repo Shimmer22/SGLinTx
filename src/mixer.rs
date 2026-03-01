@@ -2,15 +2,15 @@ use std::{fs, io::Read};
 
 use rpos::thread_logln;
 
-use crate::messages::AdcRawMsg;
 use crate::calibrate::{
     CalibrationData,
     JoystickChannel::{self, *},
 };
+use crate::messages::AdcRawMsg;
 use crate::CALIBRATE_FILENAME;
 
-#[derive(Clone)]
-pub struct MixerOutMsg{
+#[derive(Debug, Clone)]
+pub struct MixerOutMsg {
     pub thrust: u16,
     pub direction: u16,
     pub aileron: u16,
@@ -76,12 +76,7 @@ mod tests {
         let mut rng = thread_rng();
         let mut get_random_channel_value = || rng.gen_range(300..1400) as i16;
         let mut adc_raw = AdcRawMsg {
-            value: [
-                500,
-                100,
-                1600,
-                get_random_channel_value(),
-            ],
+            value: [500, 100, 1600, get_random_channel_value()],
         };
         let mut cal_data = CalibrationData {
             channel_infos: [
@@ -118,19 +113,28 @@ mod tests {
             channel_indexs: [0; 4].to_vec(),
         };
 
-        assert_eq!(cal_mixout(JoystickChannel::Thrust, &adc_raw, &cal_data), ((500 - 200) as u32 *10000  / (1500 - 200) )as u16);
-        assert_eq!(cal_mixout(JoystickChannel::Direction, &adc_raw, &cal_data), ((200 - 200) as u32 *10000  / (1500 - 200) )as u16);
-        assert_eq!(cal_mixout(JoystickChannel::Aileron, &adc_raw, &cal_data), ((1500 - 200) as u32 *10000  / (1500 - 200) )as u16);
+        assert_eq!(
+            cal_mixout(JoystickChannel::Thrust, &adc_raw, &cal_data),
+            ((500 - 200) as u32 * 10000 / (1500 - 200)) as u16
+        );
+        assert_eq!(
+            cal_mixout(JoystickChannel::Direction, &adc_raw, &cal_data),
+            ((200 - 200) as u32 * 10000 / (1500 - 200)) as u16
+        );
+        assert_eq!(
+            cal_mixout(JoystickChannel::Aileron, &adc_raw, &cal_data),
+            ((1500 - 200) as u32 * 10000 / (1500 - 200)) as u16
+        );
 
-        for _ in 0..1000{
-            assert!(cal_mixout(JoystickChannel::Elevator, &adc_raw, &cal_data) <= 10000 );
+        for _ in 0..1000 {
+            assert!(cal_mixout(JoystickChannel::Elevator, &adc_raw, &cal_data) <= 10000);
             adc_raw.value[3] = get_random_channel_value();
         }
 
-
         cal_data.channel_infos[0].rev = true;
-        assert_eq!(cal_mixout(JoystickChannel::Thrust, &adc_raw, &cal_data), 10000 - ((500 - 200) as u32 *10000  / (1500 - 200) )as u16);
-
-
+        assert_eq!(
+            cal_mixout(JoystickChannel::Thrust, &adc_raw, &cal_data),
+            10000 - ((500 - 200) as u32 * 10000 / (1500 - 200)) as u16
+        );
     }
 }

@@ -222,6 +222,12 @@ cargo run --features sdl_ui --target x86_64-unknown-linux-gnu -- -- ui_demo --ba
 - `←/→` 在边界时切换前后页面
 - `Enter` 进入应用页，`Esc` 返回，`Q` 退出
 
+应用页交互（已实现）：
+- `SYSTEM`：`↑/↓` 调整背光，`←/→` 调整音量
+- `CONTROL`：实时查看 `adc_raw` 与 `mixer_out` 链路数据
+- `MODELS`：`↑/↓` 选择机型，`Enter` 应用当前机型
+- `CLOUD`：`Enter` 切换在线/离线并显示同步状态
+
 ## LVGL 架构设计（已接入真实 LVGL）
 当前 `src/ui/` 分层与 `rpos` 架构融合方式如下：
 
@@ -244,8 +250,20 @@ cargo run --features sdl_ui --target x86_64-unknown-linux-gnu -- -- ui_demo --ba
 - 输入设备：将 SDL 键盘映射迁移到 LVGL indev 驱动，统一输入抽象
 - 业务模块持续通过 `rpos::msg` 推送状态和配置，UI 只消费消息，不直接耦合驱动
 
-## 已知问题
-- 见 `docs/KNOWN_ISSUES.md`
+## WSL / UI 排障
+- 现象：`ui_demo --backend sdl` 启动后白屏  
+  处理：先完整重启 server 与 UI 相关进程，再启动三段流程（server -> system_state_mock -> ui_demo）。
+- 现象：UI 页面出现滚动条  
+  处理：请使用当前版本（应用页容器已默认关闭滚动与滚动条）。
+- 现象：文字显示方框  
+  处理：当前 UI 文案已默认使用 ASCII，避免字形缺失；如仍有方框，请确认 SDL/LVGL 字体配置一致。
+
+建议重启命令：
+```bash
+pkill -f "LinTx.*--server" || true
+pkill -f "LinTx.*ui_demo" || true
+pkill -f "LinTx.*system_state_mock" || true
+```
 
 ## 许可证
 本项目遵循 `MIT` 许可证（详见 `LICENSE` 文件）。

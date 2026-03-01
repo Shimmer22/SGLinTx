@@ -1,4 +1,7 @@
-use crate::messages::{SystemConfigMsg, SystemStatusMsg};
+use crate::{
+    messages::{AdcRawMsg, SystemConfigMsg, SystemStatusMsg},
+    mixer::MixerOutMsg,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppId {
@@ -18,7 +21,7 @@ pub enum UiPage {
     App(AppId),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct UiFrame {
     pub page: UiPage,
     pub launcher_page: usize,
@@ -26,6 +29,12 @@ pub struct UiFrame {
     pub selected_col: usize,
     pub status: SystemStatusMsg,
     pub config: SystemConfigMsg,
+    pub adc_raw: AdcRawMsg,
+    pub mixer_out: MixerOutMsg,
+    pub model_focus_idx: usize,
+    pub model_active_idx: usize,
+    pub cloud_connected: bool,
+    pub cloud_last_sync_secs: u64,
 }
 
 impl Default for UiFrame {
@@ -37,6 +46,17 @@ impl Default for UiFrame {
             selected_col: 0,
             status: SystemStatusMsg::default(),
             config: SystemConfigMsg::default(),
+            adc_raw: AdcRawMsg::default(),
+            mixer_out: MixerOutMsg {
+                thrust: 5000,
+                direction: 5000,
+                aileron: 5000,
+                elevator: 5000,
+            },
+            model_focus_idx: 0,
+            model_active_idx: 0,
+            cloud_connected: false,
+            cloud_last_sync_secs: 0,
         }
     }
 }
