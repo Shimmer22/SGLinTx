@@ -16,7 +16,6 @@ struct Cli {
     dev_name: String,
 }
 
-
 fn new_rc_channel_packet(channel_vals: &[u16; 16]) -> RawPacket {
     let chn = crsf::RcChannels(*channel_vals);
     let packet = crsf::Packet::RcChannels(chn);
@@ -38,8 +37,11 @@ fn gen_magic_packet() -> [u8; 8] {
 }
 
 #[inline]
-fn mxier_out_2_crsf(val:u16) -> u16{
-    (val as u32  * (crsf::RcChannels::CHANNEL_VALUE_MAX - crsf::RcChannels::CHANNEL_VALUE_MIN) as u32 / 10000 + crsf::RcChannels::CHANNEL_VALUE_MIN as u32) as u16
+fn mxier_out_2_crsf(val: u16) -> u16 {
+    (val as u32
+        * (crsf::RcChannels::CHANNEL_VALUE_MAX - crsf::RcChannels::CHANNEL_VALUE_MIN) as u32
+        / 10000
+        + crsf::RcChannels::CHANNEL_VALUE_MIN as u32) as u16
 }
 
 fn elrs_tx_main(argc: u32, argv: *const &str) {
@@ -64,7 +66,7 @@ fn elrs_tx_main(argc: u32, argv: *const &str) {
     thread_logln!("elrs_tx start!");
 
     SchedulePthread::new_simple(Box::new(move |_| {
-        let mut crsf_chn_values:[u16;16] = [0;16];
+        let mut crsf_chn_values: [u16; 16] = [0; 16];
         loop {
             let msg = rx.read();
             crsf_chn_values[0] = mxier_out_2_crsf(msg.aileron);

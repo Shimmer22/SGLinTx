@@ -4,7 +4,7 @@ use clap::Parser;
 use joydev::{event_codes::AbsoluteAxis, GenericEvent};
 use rpos::{msg::get_new_tx_of_message, thread_logln};
 
-use crate::{messages::AdcRawMsg, client_process_args};
+use crate::{client_process_args, messages::AdcRawMsg};
 
 #[derive(Parser)]
 #[command(name="joy_dev", about = "used for machine with joysticks(/dev/input/js*)", long_about = None)]
