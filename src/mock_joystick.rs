@@ -239,7 +239,6 @@ fn run_step_mode(config: &StepConfig, tx: &rpos::channel::Sender<AdcRawMsg>, int
         config.step_duration_ms
     );
 
-    let step_duration = Duration::from_millis(config.step_duration_ms);
     let steps_per_duration =
         (config.step_duration_ms as f32 / interval.as_millis() as f32).ceil() as usize;
 

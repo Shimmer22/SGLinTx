@@ -1,6 +1,6 @@
 use crate::{client_process_args, messages::AdcRawMsg};
 use clap::Parser;
-use crsf::{PacketAddress, PacketParser, PacketType, RcChannels};
+use crsf::{PacketParser, RcChannels};
 use rpos::{msg::get_new_tx_of_message, thread_logln};
 use std::time::Duration;
 

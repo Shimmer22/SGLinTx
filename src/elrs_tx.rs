@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use crc::{Crc, CRC_8_DVB_S2};
-use crsf::{PacketAddress, PacketType, RawPacket, RcChannels};
+use crsf::{PacketAddress, RawPacket};
 use rpos::{msg::get_new_rx_of_message, pthread_scheduler::SchedulePthread, thread_logln};
 
 use crate::{client_process_args, mixer::MixerOutMsg};

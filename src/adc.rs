@@ -28,9 +28,6 @@ fn adc_main(_argc: u32, _argv: *const &str) {
 
         adc_raw_tx.send(AdcRawMsg { value });
     }
-    // get I2C device back
-    #[warn(unreachable_code)]
-    let _dev = adc.destroy_ads1115();
 }
 
 #[rpos::ctor::ctor]
