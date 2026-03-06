@@ -42,6 +42,28 @@ cargo check --features sdl_ui
 
 LinTx 采用客户端-服务器架构（基于 `rpos` 库）。主程序通常作为服务器后台运行，通过命令行参数启动具体的子模块。
 
+### 使用 `just` 简化启动
+如果你既想保留模块化组合能力，又不想每次手敲很长的命令，可以使用仓库根目录的 `justfile`：
+
+```bash
+just help
+just check-sdl
+just server
+just mock
+just mixer
+just ui
+just demo-wsl
+just build-riscv
+just board-help
+```
+
+说明：
+- `just server` / `just ui` / `just mock` / `just mixer` 保持模块化，可单独组合。
+- `just demo-wsl` 适合 WSL/桌面调试：自动拉起 `server + system_state_mock + mixer + ui_demo`。
+- `just demo-mock` 额外拉起 `mock_joystick`，适合无硬件链路联调。
+- `just build-riscv` 仅负责交叉编译 SG2002 使用的 `riscv64gc-unknown-linux-musl` 二进制，不把桌面 SDL 调试逻辑耦合进去。
+- 如需自定义 socket 路径，可先设置 `LINTX_SOCKET_PATH`，例如 `export LINTX_SOCKET_PATH=/tmp/lintx-rpsocket`。
+
 ### 基本用法（Linux）
 ```bash
 # 格式
