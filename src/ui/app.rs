@@ -6,7 +6,8 @@ use rpos::{
 };
 
 use crate::{
-    messages::{AdcRawMsg, SystemConfigMsg, SystemStatusMsg},
+    config::store,
+    messages::{ActiveModelMsg, AdcRawMsg, SystemConfigMsg, SystemStatusMsg},
     mixer::MixerOutMsg,
 };
 
@@ -14,7 +15,7 @@ use super::{
     backend::LvglBackend,
     catalog::{app_at, page, PAGE_SPECS},
     input::UiInputEvent,
-    model::{AppId, UiFrame, UiPage},
+    model::{AppId, UiFrame, UiModelEntry, UiPage},
 };
 
 pub struct UiApp {
@@ -23,8 +24,70 @@ pub struct UiApp {
 
 impl UiApp {
     pub fn new() -> Self {
-        Self {
+        let mut app = Self {
             frame: UiFrame::default(),
+        };
+        app.reload_models();
+        app
+    }
+
+    fn reload_models(&mut self) {
+        if let Err(err) = store::ensure_default_layout() {
+            super::debug_log(&format!("ensure_default_layout failed: {err}"));
+            return;
+        }
+
+        let models = match store::list_models() {
+            Ok(models) => models,
+            Err(err) => {
+                super::debug_log(&format!("list_models failed: {err}"));
+                return;
+            }
+        };
+
+        self.frame.model_entries = models
+            .iter()
+            .map(|model| UiModelEntry {
+                id: model.id.clone(),
+                name: model.name.clone(),
+                protocol: model.output.protocol.display_name().to_string(),
+            })
+            .collect();
+
+        let active_model_id = store::load_radio_config()
+            .map(|radio| radio.active_model)
+            .unwrap_or_default();
+
+        self.frame.model_active_idx = self
+            .frame
+            .model_entries
+            .iter()
+            .position(|entry| entry.id == active_model_id)
+            .unwrap_or(0);
+
+        if self.frame.model_entries.is_empty() {
+            self.frame.model_focus_idx = 0;
+            self.frame.model_active_idx = 0;
+        } else {
+            self.frame.model_focus_idx = self
+                .frame
+                .model_focus_idx
+                .min(self.frame.model_entries.len().saturating_sub(1));
+            self.frame.model_active_idx = self
+                .frame
+                .model_active_idx
+                .min(self.frame.model_entries.len().saturating_sub(1));
+        }
+    }
+
+    fn publish_config(&self, config_tx: &Sender<SystemConfigMsg>) {
+        config_tx.send(self.frame.config);
+    }
+
+    fn publish_active_model(&self, active_model_tx: &Sender<ActiveModelMsg>) {
+        match store::load_active_model() {
+            Ok(model) => active_model_tx.send(ActiveModelMsg { model }),
+            Err(err) => super::debug_log(&format!("load_active_model failed: {err}")),
         }
     }
 
@@ -99,15 +162,12 @@ impl UiApp {
         }
     }
 
-    fn publish_config(&self, config_tx: &Sender<SystemConfigMsg>) {
-        config_tx.send(self.frame.config);
-    }
-
     fn apply_event_in_app(
         &mut self,
         app: AppId,
         event: UiInputEvent,
         config_tx: &Sender<SystemConfigMsg>,
+        active_model_tx: &Sender<ActiveModelMsg>,
     ) {
         match app {
             AppId::System => match event {
@@ -142,10 +202,21 @@ impl UiApp {
                     self.frame.model_focus_idx = self.frame.model_focus_idx.saturating_sub(1);
                 }
                 UiInputEvent::Down => {
-                    self.frame.model_focus_idx = (self.frame.model_focus_idx + 1).min(3);
+                    let max_idx = self.frame.model_entries.len().saturating_sub(1);
+                    self.frame.model_focus_idx = (self.frame.model_focus_idx + 1).min(max_idx);
                 }
                 UiInputEvent::Open => {
-                    self.frame.model_active_idx = self.frame.model_focus_idx;
+                    if let Some(entry) = self.frame.model_entries.get(self.frame.model_focus_idx) {
+                        match store::set_active_model(&entry.id) {
+                            Ok(_) => {
+                                self.frame.model_active_idx = self.frame.model_focus_idx;
+                                self.publish_active_model(active_model_tx);
+                            }
+                            Err(err) => {
+                                super::debug_log(&format!("set_active_model failed: {err}"));
+                            }
+                        }
+                    }
                 }
                 _ => {}
             },
@@ -161,7 +232,12 @@ impl UiApp {
         }
     }
 
-    fn apply_event(&mut self, event: UiInputEvent, config_tx: &Sender<SystemConfigMsg>) -> bool {
+    fn apply_event(
+        &mut self,
+        event: UiInputEvent,
+        config_tx: &Sender<SystemConfigMsg>,
+        active_model_tx: &Sender<ActiveModelMsg>,
+    ) -> bool {
         match event {
             UiInputEvent::Quit => return false,
             UiInputEvent::Back => self.frame.page = UiPage::Launcher,
@@ -175,35 +251,28 @@ impl UiApp {
                         self.frame.page = UiPage::App(app);
                     }
                 } else if let UiPage::App(app) = self.frame.page {
-                    self.apply_event_in_app(app, event, config_tx);
+                    self.apply_event_in_app(app, event, config_tx, active_model_tx);
                 }
             }
             UiInputEvent::Left => {
                 if self.frame.page == UiPage::Launcher {
                     self.move_left();
                 } else if let UiPage::App(app) = self.frame.page {
-                    self.apply_event_in_app(app, event, config_tx);
+                    self.apply_event_in_app(app, event, config_tx, active_model_tx);
                 }
             }
             UiInputEvent::Right => {
                 if self.frame.page == UiPage::Launcher {
                     self.move_right();
                 } else if let UiPage::App(app) = self.frame.page {
-                    self.apply_event_in_app(app, event, config_tx);
+                    self.apply_event_in_app(app, event, config_tx, active_model_tx);
                 }
             }
-            UiInputEvent::Up => {
+            UiInputEvent::Up | UiInputEvent::Down => {
                 if self.frame.page == UiPage::Launcher {
-                    self.move_selection_vertical(-1);
+                    self.move_selection_vertical(if event == UiInputEvent::Up { -1 } else { 1 });
                 } else if let UiPage::App(app) = self.frame.page {
-                    self.apply_event_in_app(app, event, config_tx);
-                }
-            }
-            UiInputEvent::Down => {
-                if self.frame.page == UiPage::Launcher {
-                    self.move_selection_vertical(1);
-                } else if let UiPage::App(app) = self.frame.page {
-                    self.apply_event_in_app(app, event, config_tx);
+                    self.apply_event_in_app(app, event, config_tx, active_model_tx);
                 }
             }
             UiInputEvent::PagePrev => {
@@ -231,6 +300,10 @@ impl UiApp {
         let mut adc_raw_rx = get_new_rx_of_message::<AdcRawMsg>("adc_raw").unwrap();
         let mut mixer_out_rx = get_new_rx_of_message::<MixerOutMsg>("mixer_out").unwrap();
         let config_tx = get_new_tx_of_message::<SystemConfigMsg>("system_config").unwrap();
+        let active_model_tx = get_new_tx_of_message::<ActiveModelMsg>("active_model").unwrap();
+
+        self.reload_models();
+        self.publish_active_model(&active_model_tx);
 
         let frame_time = Duration::from_millis((1000 / fps.max(1)) as u64);
         let mut frame_idx: u64 = 0;
@@ -241,25 +314,10 @@ impl UiApp {
         loop {
             if let Some(status) = status_rx.try_read() {
                 self.frame.status = status;
-                if super::debug_enabled() {
-                    super::debug_log(&format!(
-                        "status update: remote={} aircraft={} signal={} time={}",
-                        self.frame.status.remote_battery_percent,
-                        self.frame.status.aircraft_battery_percent,
-                        self.frame.status.signal_strength_percent,
-                        self.frame.status.unix_time_secs
-                    ));
-                }
             }
 
             if let Some(cfg) = config_rx.try_read() {
                 self.frame.config = cfg;
-                if super::debug_enabled() {
-                    super::debug_log(&format!(
-                        "config update: backlight={} sound={}",
-                        self.frame.config.backlight_percent, self.frame.config.sound_percent
-                    ));
-                }
             }
 
             if let Some(adc_raw) = adc_raw_rx.try_read() {
@@ -278,11 +336,7 @@ impl UiApp {
             }
 
             while let Some(evt) = backend.poll_event() {
-                if super::debug_enabled() {
-                    super::debug_log(&format!("input event: {:?}", evt));
-                }
-                if !self.apply_event(evt, &config_tx) {
-                    super::debug_log("apply_event requested quit");
+                if !self.apply_event(evt, &config_tx, &active_model_tx) {
                     backend.shutdown();
                     return;
                 }

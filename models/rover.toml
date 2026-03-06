@@ -1,0 +1,114 @@
+id = "rover"
+name = "Rover"
+
+[[input_mapping.channels]]
+role = "thrust"
+source = "adc"
+index = 0
+reversed = false
+
+[[input_mapping.channels]]
+role = "direction"
+source = "adc"
+index = 1
+reversed = false
+
+[[input_mapping.channels]]
+role = "aileron"
+source = "adc"
+index = 2
+reversed = false
+
+[[input_mapping.channels]]
+role = "elevator"
+source = "adc"
+index = 3
+reversed = false
+
+[[mixer.outputs]]
+role = "thrust"
+weight = 60
+offset = -150
+curve = "linear"
+
+[mixer.outputs.limits]
+min = -1000
+max = 1000
+subtrim = 0
+reversed = false
+
+[[mixer.outputs]]
+role = "direction"
+weight = 140
+offset = 0
+curve = "linear"
+
+[mixer.outputs.limits]
+min = -1000
+max = 1000
+subtrim = 0
+reversed = false
+
+[[mixer.outputs]]
+role = "aileron"
+weight = 100
+offset = 0
+curve = "linear"
+
+[mixer.outputs.limits]
+min = -1000
+max = 1000
+subtrim = 0
+reversed = false
+
+[[mixer.outputs]]
+role = "elevator"
+weight = 100
+offset = 0
+curve = "linear"
+
+[mixer.outputs.limits]
+min = -1000
+max = 1000
+subtrim = 0
+reversed = false
+
+[output]
+protocol = "usb_hid"
+channel_order = [
+    "aileron",
+    "elevator",
+    "thrust",
+    "direction",
+]
+failsafe = [
+    0,
+    0,
+    0,
+    0,
+]
+
+[telemetry]
+enabled = true
+
+[[telemetry.sensors]]
+key = "rssi"
+unit = "percent"
+enabled = true
+
+[[telemetry.sensors]]
+key = "link_quality"
+unit = "percent"
+enabled = true
+
+[[telemetry.sensors]]
+key = "remote_battery"
+unit = "percent"
+enabled = true
+
+[[profiles]]
+name = "ground"
+roll_rate = 60
+pitch_rate = 60
+yaw_rate = 90
+expo_percent = 0

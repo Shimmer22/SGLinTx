@@ -1,3 +1,5 @@
+use crate::config::ModelConfig;
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AdcRawMsg {
     pub value: [i16; 4],
@@ -37,9 +39,15 @@ impl Default for SystemConfigMsg {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ActiveModelMsg {
+    pub model: ModelConfig,
+}
+
 #[rpos::ctor::ctor]
 fn register() {
     rpos::msg::add_message::<AdcRawMsg>("adc_raw");
     rpos::msg::add_message::<SystemStatusMsg>("system_status");
     rpos::msg::add_message::<SystemConfigMsg>("system_config");
+    rpos::msg::add_message::<ActiveModelMsg>("active_model");
 }

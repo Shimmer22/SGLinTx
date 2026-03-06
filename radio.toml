@@ -1,0 +1,18 @@
+schema_version = 1
+active_model = "quad_x"
+
+[ui]
+backlight_percent = 70
+theme = "classic"
+
+[audio]
+sound_percent = 60
+mute = false
+
+[input]
+calibration_profile = "joystick.toml"
+source_priority = [
+    "adc",
+    "crsf",
+    "mock",
+]

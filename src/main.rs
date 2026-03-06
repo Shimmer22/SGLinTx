@@ -8,6 +8,7 @@ use std::io::ErrorKind;
 #[cfg(target_os = "linux")]
 mod adc;
 mod calibrate;
+mod config;
 mod crsf_rc_in;
 #[cfg(target_os = "linux")]
 mod elrs_tx;
@@ -56,6 +57,9 @@ pub fn client_process_args<T: clap::Parser>(argc: u32, argv: *const &str) -> Opt
 }
 
 fn main() {
+    if let Err(err) = crate::config::store::ensure_default_layout() {
+        eprintln!("[lintx] failed to initialize config layout: {}", err);
+    }
     #[cfg(target_os = "windows")]
     {
         run_windows_local_mode();

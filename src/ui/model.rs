@@ -21,6 +21,13 @@ pub enum UiPage {
     App(AppId),
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct UiModelEntry {
+    pub id: String,
+    pub name: String,
+    pub protocol: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct UiFrame {
     pub page: UiPage,
@@ -31,6 +38,7 @@ pub struct UiFrame {
     pub config: SystemConfigMsg,
     pub adc_raw: AdcRawMsg,
     pub mixer_out: MixerOutMsg,
+    pub model_entries: Vec<UiModelEntry>,
     pub model_focus_idx: usize,
     pub model_active_idx: usize,
     pub cloud_connected: bool,
@@ -53,6 +61,7 @@ impl Default for UiFrame {
                 aileron: 5000,
                 elevator: 5000,
             },
+            model_entries: Vec::new(),
             model_focus_idx: 0,
             model_active_idx: 0,
             cloud_connected: false,

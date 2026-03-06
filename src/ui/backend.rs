@@ -417,52 +417,56 @@ impl SdlBackend {
                 }
             }
             AppId::Models => {
-                let names = ["Quad X", "Fixed Wing", "Rover", "Boat"];
-                let protocols = ["CRSF 250Hz", "CRSF 150Hz", "PWM 100Hz", "PWM 50Hz"];
-                let focus = frame.model_focus_idx.min(3);
-                let active = frame.model_active_idx.min(3);
+                let model_count = frame.model_entries.len().max(1);
+                let focus = frame.model_focus_idx.min(model_count.saturating_sub(1));
+                let active = frame.model_active_idx.min(model_count.saturating_sub(1));
+                let focused_entry = frame.model_entries.get(focus);
+                let active_entry = frame.model_entries.get(active);
+                let metric_active = active_entry
+                    .map(|entry| format!("{} · {}", entry.name, entry.protocol))
+                    .unwrap_or_else(|| "No models".to_string());
+                let metric_focus = focused_entry
+                    .map(|entry| format!("{} · {}", entry.name, entry.protocol))
+                    .unwrap_or_else(|| "No models".to_string());
+                let mut list_lines: Vec<String> = frame
+                    .model_entries
+                    .iter()
+                    .enumerate()
+                    .take(4)
+                    .map(|(idx, entry)| {
+                        format!(
+                            "{} {} ({})",
+                            if idx == active { "[A]" } else { "   " },
+                            if idx == focus { format!("> {}", entry.name) } else { format!("  {}", entry.name) },
+                            entry.protocol
+                        )
+                    })
+                    .collect();
+                if list_lines.is_empty() {
+                    list_lines.push("No imported models found in ./models".to_string());
+                }
+                while list_lines.len() < 4 {
+                    list_lines.push("".to_string());
+                }
                 AppTemplateData {
                     accent: spec.accent,
                     badge: "MODELS".to_string(),
                     title: "Model Profile Manager".to_string(),
-                    subtitle: "Profile selection and activation".to_string(),
+                    subtitle: "Imported profiles from ./models".to_string(),
                     metric_titles: ["Active Profile".to_string(), "Focused Profile".to_string()],
-                    metric_values: [
-                        format!("{} · {}", names[active], protocols[active]),
-                        format!("{} · {}", names[focus], protocols[focus]),
-                    ],
+                    metric_values: [metric_active, metric_focus],
                     metric_progress: [
-                        Self::clamp_pct(((active + 1) * 25) as i32),
-                        Self::clamp_pct(((focus + 1) * 25) as i32),
+                        Self::clamp_pct(((active + 1) * 100 / model_count) as i32),
+                        Self::clamp_pct(((focus + 1) * 100 / model_count) as i32),
                     ],
                     list_title: "Profiles".to_string(),
                     list_lines: [
-                        format!(
-                            "{} {}",
-                            if active == 0 { "[A]" } else { "   " },
-                            if focus == 0 { "> Quad X" } else { "  Quad X" }
-                        ),
-                        format!(
-                            "{} {}",
-                            if active == 1 { "[A]" } else { "   " },
-                            if focus == 1 {
-                                "> Fixed Wing"
-                            } else {
-                                "  Fixed Wing"
-                            }
-                        ),
-                        format!(
-                            "{} {}",
-                            if active == 2 { "[A]" } else { "   " },
-                            if focus == 2 { "> Rover" } else { "  Rover" }
-                        ),
-                        format!(
-                            "{} {}",
-                            if active == 3 { "[A]" } else { "   " },
-                            if focus == 3 { "> Boat" } else { "  Boat" }
-                        ),
+                        list_lines[0].clone(),
+                        list_lines[1].clone(),
+                        list_lines[2].clone(),
+                        list_lines[3].clone(),
                     ],
-                    hint: "UP/DOWN: Focus Profile   ENTER: Apply   ESC: Back".to_string(),
+                    hint: "UP/DOWN: Focus Profile   ENTER: Apply   Files: ./models   ESC: Back".to_string(),
                 }
             }
             AppId::Cloud => {
