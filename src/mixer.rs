@@ -41,7 +41,12 @@ fn cal_mixout(channel: JoystickChannel, raw: &AdcRawMsg, cal_data: &CalibrationD
 }
 
 fn apply_output_profile(value: u16, model: &ModelConfig, role: ControlRole) -> u16 {
-    let Some(output) = model.mixer.outputs.iter().find(|output| output.role == role) else {
+    let Some(output) = model
+        .mixer
+        .outputs
+        .iter()
+        .find(|output| output.role == role)
+    else {
         return value;
     };
 
@@ -93,7 +98,9 @@ fn mixer_main(_argc: u32, _argv: *const &str) {
     let tx = rpos::msg::get_new_tx_of_message::<MixerOutMsg>("mixer_out").unwrap();
     let active_model = Arc::new(Mutex::new(load_initial_model()));
 
-    if let Some(active_model_rx) = rpos::msg::get_new_rx_of_message::<ActiveModelMsg>("active_model") {
+    if let Some(active_model_rx) =
+        rpos::msg::get_new_rx_of_message::<ActiveModelMsg>("active_model")
+    {
         let active_model_for_updates = active_model.clone();
         active_model_rx.register_callback("mixer_active_model", move |msg| {
             if let Ok(mut current_model) = active_model_for_updates.lock() {
@@ -105,13 +112,21 @@ fn mixer_main(_argc: u32, _argv: *const &str) {
     rx.register_callback("mixer_callback", move |x| {
         let current_model = active_model.lock().unwrap().clone();
         let mixer_out = MixerOutMsg {
-            thrust: apply_output_profile(cal_mixout(Thrust, x, &cal_data), &current_model, ControlRole::Thrust),
+            thrust: apply_output_profile(
+                cal_mixout(Thrust, x, &cal_data),
+                &current_model,
+                ControlRole::Thrust,
+            ),
             direction: apply_output_profile(
                 cal_mixout(Direction, x, &cal_data),
                 &current_model,
                 ControlRole::Direction,
             ),
-            aileron: apply_output_profile(cal_mixout(Aileron, x, &cal_data), &current_model, ControlRole::Aileron),
+            aileron: apply_output_profile(
+                cal_mixout(Aileron, x, &cal_data),
+                &current_model,
+                ControlRole::Aileron,
+            ),
             elevator: apply_output_profile(
                 cal_mixout(Elevator, x, &cal_data),
                 &current_model,

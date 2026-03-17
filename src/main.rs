@@ -11,12 +11,16 @@ mod calibrate;
 mod config;
 mod crsf_rc_in;
 #[cfg(target_os = "linux")]
+mod elrs_agent;
+#[cfg(target_os = "linux")]
 mod elrs_tx;
 #[cfg(target_os = "linux")]
 mod gampad;
 #[cfg(all(target_os = "linux", feature = "joydev_input"))]
 mod joy_dev;
 mod joysticks_test;
+#[cfg(all(target_os = "linux", feature = "lua"))]
+mod lua_run;
 mod messages;
 mod mixer;
 mod mock_joystick;

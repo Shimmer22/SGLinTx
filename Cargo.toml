@@ -14,6 +14,7 @@ serde ={ version = "1.0.197", features = ["derive"] }
 serialport = {version = "4.3.0",default-features = false}
 crc = "3.0"
 crsf = "2.0.1"
+mlua = { version = "0.10.3", features = ["lua54", "vendored"], optional = true }
 lvgl = { version = "0.6.2", default-features = false, features = ["alloc", "embedded_graphics", "use-vendored-config"], optional = true }
 lvgl-sys = { version = "0.6.2", optional = true }
 
@@ -30,6 +31,7 @@ joydev_input = ["dep:joydev"]
 lvgl_ui = ["dep:lvgl", "dep:lvgl-sys"]
 sdl_ui = ["lvgl_ui", "dep:sdl2"]
 used_linker = []
+lua = ["dep:mlua"]
 
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 sdl2 = { version = "0.37.0", features = ["bundled"], optional = true }

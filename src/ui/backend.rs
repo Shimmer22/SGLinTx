@@ -5,10 +5,7 @@ use std::{
     fs::OpenOptions,
     io,
     mem::MaybeUninit,
-    os::{
-        fd::AsRawFd,
-        unix::fs::FileExt,
-    },
+    os::{fd::AsRawFd, unix::fs::FileExt},
 };
 
 #[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
@@ -96,7 +93,10 @@ pub trait LvglBackend {
 
 pub enum BackendKind {
     PcApi,
-    PcSdl { width: u32, height: u32 },
+    PcSdl {
+        width: u32,
+        height: u32,
+    },
     Fbdev {
         device: String,
         width: u32,
@@ -147,6 +147,40 @@ fn signal_grade(v: u8) -> &'static str {
         20..=44 => "WEAK",
         _ => "LOST",
     }
+}
+
+fn elrs_list_lines(frame: &UiFrame) -> [String; 4] {
+    let total = frame.elrs.params.len();
+    if total == 0 {
+        return [
+            "No ELRS params available".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ];
+    }
+
+    let selected = frame.elrs.selected_idx.min(total.saturating_sub(1));
+    let start = selected.saturating_sub(1).min(total.saturating_sub(4));
+    let mut lines = Vec::with_capacity(4);
+    for idx in start..(start + 4).min(total) {
+        let entry = &frame.elrs.params[idx];
+        lines.push(format!(
+            "{} {}: {}",
+            if idx == selected { ">" } else { " " },
+            entry.label,
+            entry.value
+        ));
+    }
+    while lines.len() < 4 {
+        lines.push(String::new());
+    }
+    [
+        lines[0].clone(),
+        lines[1].clone(),
+        lines[2].clone(),
+        lines[3].clone(),
+    ]
 }
 
 fn format_app_detail(frame: &UiFrame, app: AppId) -> String {
@@ -208,6 +242,45 @@ fn format_app_detail(frame: &UiFrame, app: AppId) -> String {
                 frame.status.remote_battery_percent,
                 frame.status.aircraft_battery_percent,
                 signal_grade(frame.status.signal_strength_percent),
+            )
+        }
+        AppId::Scripts => {
+            let connected = if frame.elrs.connected {
+                "CONNECTED"
+            } else {
+                "OFFLINE"
+            };
+            let busy = if frame.elrs.busy { "BUSY" } else { "READY" };
+            let lines = elrs_list_lines(frame);
+            let editor = if frame.elrs.editor_active {
+                format!(
+                    "\nEdit: {} = {}\nCursor: {}\n",
+                    frame.elrs.editor_label,
+                    frame.elrs.editor_buffer,
+                    frame.elrs.editor_cursor.saturating_add(1)
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "Link: {} ({})\nModule: {}\nDevice: {}\nVersion: {}\nPath: {}\nStatus: {}\n{}\n{}\n{}\n{}\n{}\n\n{}\nEsc Back",
+                connected,
+                busy,
+                frame.elrs.module_name,
+                frame.elrs.device_name,
+                frame.elrs.version,
+                frame.elrs.path,
+                frame.elrs.status_text,
+                editor,
+                lines[0],
+                lines[1],
+                lines[2],
+                lines[3],
+                if frame.elrs.editor_active {
+                    "Up/Down: char  Left/Right: move  Enter: save  Esc: cancel"
+                } else {
+                    "Up/Down: select  Left/Right: adjust  Enter: open/apply  ]: refresh"
+                },
             )
         }
         _ => format!(
@@ -397,6 +470,8 @@ struct LinuxFramebuffer {
     green: LinuxFbBitfield,
     blue: LinuxFbBitfield,
     transp: LinuxFbBitfield,
+    rotate_degrees: u16,
+    swap_rb: bool,
 }
 
 #[cfg(feature = "sdl_ui")]
@@ -588,7 +663,11 @@ impl LvglUiCore {
                         format!(
                             "{} {} ({})",
                             if idx == active { "[A]" } else { "   " },
-                            if idx == focus { format!("> {}", entry.name) } else { format!("  {}", entry.name) },
+                            if idx == focus {
+                                format!("> {}", entry.name)
+                            } else {
+                                format!("  {}", entry.name)
+                            },
                             entry.protocol
                         )
                     })
@@ -617,7 +696,8 @@ impl LvglUiCore {
                         list_lines[2].clone(),
                         list_lines[3].clone(),
                     ],
-                    hint: "UP/DOWN: Focus Profile   ENTER: Apply   Files: ./models   ESC: Back".to_string(),
+                    hint: "UP/DOWN: Focus Profile   ENTER: Apply   Files: ./models   ESC: Back"
+                        .to_string(),
                 }
             }
             AppId::Cloud => {
@@ -662,6 +742,59 @@ impl LvglUiCore {
                         ),
                     ],
                     hint: "ENTER: Connect/Disconnect   ESC: Back".to_string(),
+                }
+            }
+            AppId::Scripts => {
+                let list_lines = elrs_list_lines(frame);
+                AppTemplateData {
+                    accent: spec.accent,
+                    badge: "ELRS".to_string(),
+                    title: "ExpressLRS Config".to_string(),
+                    subtitle: format!(
+                        "{} · {} · {}",
+                        if frame.elrs.connected {
+                            frame.elrs.module_name.as_str()
+                        } else {
+                            "Module not connected"
+                        },
+                        if frame.elrs.busy { "busy" } else { "ready" },
+                        frame.elrs.path,
+                    ),
+                    metric_titles: ["Packet / Telemetry".to_string(), "TX / WiFi".to_string()],
+                    metric_values: [
+                        format!(
+                            "{} · {}",
+                            frame.elrs.packet_rate, frame.elrs.telemetry_ratio
+                        ),
+                        format!(
+                            "{} · {}",
+                            frame.elrs.tx_power,
+                            if frame.elrs.wifi_running {
+                                "WiFi ON"
+                            } else {
+                                "WiFi OFF"
+                            }
+                        ),
+                    ],
+                    metric_progress: [
+                        if frame.elrs.connected { 100 } else { 0 },
+                        if frame.elrs.wifi_running { 100 } else { 35 },
+                    ],
+                    list_title: if frame.elrs.editor_active {
+                        format!(
+                            "Edit {} = {}",
+                            frame.elrs.editor_label, frame.elrs.editor_buffer
+                        )
+                    } else {
+                        format!("{} / {}", frame.elrs.device_name, frame.elrs.version)
+                    },
+                    list_lines,
+                    hint: if frame.elrs.editor_active {
+                        "UP/DOWN: Char   LEFT/RIGHT: Move   ENTER: Save   ESC: Cancel".to_string()
+                    } else {
+                        "UP/DOWN: Select   LEFT/RIGHT: Adjust   ENTER: Open/Apply   ]: Refresh   ESC: Back"
+                            .to_string()
+                    },
                 }
             }
             _ => AppTemplateData {
@@ -1405,11 +1538,15 @@ impl LvglBackend for SdlBackend {
         let width = self.core.width;
         let height = self.core.height;
 
-        let display =
-            lvgl::Display::register(draw_buf, self.core.width, self.core.height, move |refresh| {
+        let display = lvgl::Display::register(
+            draw_buf,
+            self.core.width,
+            self.core.height,
+            move |refresh| {
                 Self::blit_refresh(&framebuffer, width, height, refresh);
-            })
-            .expect("failed to register lvgl display");
+            },
+        )
+        .expect("failed to register lvgl display");
         super::debug_log("SdlBackend::init lvgl display registered");
 
         self.core.display = Some(display);
@@ -1545,6 +1682,12 @@ impl LinuxFramebuffer {
             green: vinfo.green,
             blue: vinfo.blue,
             transp: vinfo.transp,
+            rotate_degrees: std::env::var("LINTX_FB_ROTATE")
+                .ok()
+                .and_then(|v| v.parse::<u16>().ok())
+                .map(|v| v % 360)
+                .unwrap_or(0),
+            swap_rb: std::env::var_os("LINTX_FB_SWAP_RB").is_some(),
         })
     }
 
@@ -1552,7 +1695,10 @@ impl LinuxFramebuffer {
         while !buf.is_empty() {
             let written = self.file.write_at(buf, offset)?;
             if written == 0 {
-                return Err(io::Error::new(io::ErrorKind::WriteZero, "short framebuffer write"));
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "short framebuffer write",
+                ));
             }
             buf = &buf[written..];
             offset += written as u64;
@@ -1576,6 +1722,7 @@ impl LinuxFramebuffer {
         let r8 = (r5 << 3) | (r5 >> 2);
         let g8 = (g6 << 2) | (g6 >> 4);
         let b8 = (b5 << 3) | (b5 >> 2);
+        let (r8, b8) = if self.swap_rb { (b8, r8) } else { (r8, b8) };
 
         let mut pixel = 0u32;
         pixel |= Self::scale_channel(r8, self.red.length) << self.red.offset;
@@ -1587,7 +1734,25 @@ impl LinuxFramebuffer {
         pixel
     }
 
-    fn write_refresh<const N: usize>(&mut self, refresh: &lvgl::DisplayRefresh<N>) -> io::Result<()> {
+    fn map_coords(&self, x: i32, y: i32) -> Option<(u32, u32)> {
+        let phys_w = self.width as i32;
+        let phys_h = self.height as i32;
+        let (mapped_x, mapped_y) = match self.rotate_degrees {
+            90 => (phys_w - 1 - y, x),
+            180 => (phys_w - 1 - x, phys_h - 1 - y),
+            270 => (y, phys_h - 1 - x),
+            _ => (x, y),
+        };
+        if mapped_x < 0 || mapped_y < 0 || mapped_x >= phys_w || mapped_y >= phys_h {
+            return None;
+        }
+        Some((mapped_x as u32, mapped_y as u32))
+    }
+
+    fn write_refresh<const N: usize>(
+        &mut self,
+        refresh: &lvgl::DisplayRefresh<N>,
+    ) -> io::Result<()> {
         let area = &refresh.area;
         if area.x2 < area.x1 || area.y2 < area.y1 {
             return Ok(());
@@ -1595,36 +1760,32 @@ impl LinuxFramebuffer {
 
         let x1 = i32::from(area.x1).max(0);
         let y1 = i32::from(area.y1).max(0);
-        let x2 = i32::from(area.x2).min(self.width as i32 - 1);
-        let y2 = i32::from(area.y2).min(self.height as i32 - 1);
+        let x2 = i32::from(area.x2);
+        let y2 = i32::from(area.y2);
         if x2 < x1 || y2 < y1 {
             return Ok(());
         }
 
         let src_width = (i32::from(area.x2) - i32::from(area.x1) + 1) as usize;
-        let clipped_width = (x2 - x1 + 1) as usize;
-        let bytes_per_row = clipped_width * self.bytes_per_pixel;
         let area_x1 = i32::from(area.x1);
         let area_y1 = i32::from(area.y1);
-        let mut row_buf = vec![0u8; bytes_per_row];
-
         for y in y1..=y2 {
             let src_row = (y - area_y1) as usize;
-            let src_col = (x1 - area_x1) as usize;
-            let row_start = src_row * src_width + src_col;
-
-            for col in 0..clipped_width {
-                let color = refresh.colors[row_start + col];
+            for x in x1..=x2 {
+                let src_col = (x - area_x1) as usize;
+                let idx = src_row * src_width + src_col;
+                let color = refresh.colors[idx];
                 let raw: lvgl_sys::lv_color_t = color.into();
                 let pixel = self.pack_pixel(unsafe { raw.full });
-                let dst = col * self.bytes_per_pixel;
                 let bytes = pixel.to_ne_bytes();
-                row_buf[dst..dst + self.bytes_per_pixel].copy_from_slice(&bytes[..self.bytes_per_pixel]);
+                let Some((mapped_x, mapped_y)) = self.map_coords(x, y) else {
+                    continue;
+                };
+                let offset = ((u64::from(mapped_y) + u64::from(self.yoffset)) * self.stride as u64)
+                    + ((u64::from(mapped_x) + u64::from(self.xoffset))
+                        * self.bytes_per_pixel as u64);
+                self.write_all_at(&bytes[..self.bytes_per_pixel], offset)?;
             }
-
-            let offset = ((y as u64 + u64::from(self.yoffset)) * self.stride as u64)
-                + ((x1 as u64 + u64::from(self.xoffset)) * self.bytes_per_pixel as u64);
-            self.write_all_at(&row_buf, offset)?;
         }
 
         Ok(())
@@ -1634,11 +1795,17 @@ impl LinuxFramebuffer {
 #[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
 impl FbdevBackend {
     fn new(device: String, width: u32, height: u32) -> Self {
-        let framebuffer =
-            LinuxFramebuffer::open(&device).unwrap_or_else(|err| panic!("failed to open {device}: {err}"));
+        let framebuffer = LinuxFramebuffer::open(&device)
+            .unwrap_or_else(|err| panic!("failed to open {device}: {err}"));
         super::debug_log(&format!(
-            "FbdevBackend::new device={} actual={}x{} bpp={} stride={}",
-            device, framebuffer.width, framebuffer.height, framebuffer.bits_per_pixel, framebuffer.stride
+            "FbdevBackend::new device={} actual={}x{} bpp={} stride={} rotate={} swap_rb={}",
+            device,
+            framebuffer.width,
+            framebuffer.height,
+            framebuffer.bits_per_pixel,
+            framebuffer.stride,
+            framebuffer.rotate_degrees,
+            framebuffer.swap_rb
         ));
         Self {
             core: LvglUiCore::new(width, height),
@@ -1661,12 +1828,17 @@ impl LvglBackend for FbdevBackend {
 
         let draw_buf = lvgl::DrawBuffer::<LVGL_DRAW_BUF_PIXELS>::default();
         let fb_ptr: *mut LinuxFramebuffer = &mut self.framebuffer;
-        let display = lvgl::Display::register(draw_buf, self.core.width, self.core.height, move |refresh| {
-            let fb = unsafe { &mut *fb_ptr };
-            if let Err(err) = fb.write_refresh(refresh) {
-                super::debug_log(&format!("FbdevBackend::write_refresh failed: {err}"));
-            }
-        })
+        let display = lvgl::Display::register(
+            draw_buf,
+            self.core.width,
+            self.core.height,
+            move |refresh| {
+                let fb = unsafe { &mut *fb_ptr };
+                if let Err(err) = fb.write_refresh(refresh) {
+                    super::debug_log(&format!("FbdevBackend::write_refresh failed: {err}"));
+                }
+            },
+        )
         .expect("failed to register lvgl display");
 
         self.core.display = Some(display);

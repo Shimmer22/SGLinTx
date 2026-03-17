@@ -37,32 +37,34 @@ cargo check --features joydev_input
 ```bash
 cargo check --features sdl_ui
 ```
+- `lua`：启用 Lua 脚本运行时（串口/UART 与 CRSF 辅助 API）
+```bash
+cargo check --features lua
+```
 
 ## 如何使用
 
 LinTx 采用客户端-服务器架构（基于 `rpos` 库）。主程序通常作为服务器后台运行，通过命令行参数启动具体的子模块。
 
-### 使用 `just` 简化启动
-如果你既想保留模块化组合能力，又不想每次手敲很长的命令，可以使用仓库根目录的 `justfile`：
+### 板端启动脚本
+板端推荐使用 `scripts/board/` 下的 `sh` 脚本启动 GUI 和 ELRS 联调流程。
+
+部署完成后，在板子上执行：
 
 ```bash
-just help
-just check-sdl
-just server
-just mock
-just mixer
-just ui
-just demo-wsl
-just build-riscv
-just board-help
+cd /root/lintx
+sh ./scripts/board/test_gui_mock.sh
+sh ./scripts/board/test_gui_crsf.sh /dev/ttyS3 420000
+sh ./scripts/board/test_gui_crsf_debug.sh /dev/ttyS3 420000
+sh ./scripts/board/stop_lintx.sh
 ```
 
 说明：
-- `just server` / `just ui` / `just mock` / `just mixer` 保持模块化，可单独组合。
-- `just demo-wsl` 适合 WSL/桌面调试：自动拉起 `server + system_state_mock + mixer + ui_demo`。
-- `just demo-mock` 额外拉起 `mock_joystick`，适合无硬件链路联调。
-- `just build-riscv` 仅负责交叉编译 SG2002 使用的 `riscv64gc-unknown-linux-musl` 二进制，不把桌面 SDL 调试逻辑耦合进去。
-- 如需自定义 socket 路径，可先设置 `LINTX_SOCKET_PATH`，例如 `export LINTX_SOCKET_PATH=/tmp/lintx-rpsocket`。
+- `test_gui_mock.sh`：启动 `server + elrs_agent(mock) + ui_demo(fb)`。
+- `test_gui_crsf.sh`：启动真实 ELRS/CRSF GUI 联调流程。
+- `test_gui_crsf_debug.sh`：在真实流程上额外打开 `LINTX_ELRS_DEBUG=1`。
+- `stop_lintx.sh`：停止板上的 `LinTx` 进程并清理 socket。
+- 板端 framebuffer 默认参数已经固化在脚本里：`800x480` 逻辑界面、`LINTX_FB_ROTATE=270`、`LINTX_FB_SWAP_RB=1`。
 
 ### 基本用法（Linux）
 ```bash
@@ -106,6 +108,47 @@ LinTx -- <模块名称> [模块参数]
 - **示例**:
   ```bash
   ./LinTx -- elrs_tx /dev/ttyS1
+  ```
+
+#### 3.1 `lua_run` (Lua 脚本模块，需要 `--features lua`)
+用于运行 Lua 脚本，并在脚本里直接操作 UART/CRSF。
+
+- **参数**:
+  - `<脚本路径>`: (必选) Lua 文件路径。
+  - `[脚本参数...]`: (可选) 透传给脚本，全局变量 `ARGS` 可读取。
+- **全局 API**:
+  - `uart_open(path, baudrate)`：打开串口，返回 `port` 对象。
+  - `port:write(data)`：写入原始字节串。
+  - `port:write_hex("ee 06 2d ee ea 01 00 67")`：按十六进制文本写入。
+  - `port:read(max_len, timeout_ms)` / `port:read_hex(max_len, timeout_ms)`：读取串口数据。
+  - `crsf.encode(dest, frame_type, payload)`：封装通用 CRSF 帧。
+  - `crsf.rc_channels({...})`：封装 16 通道 RC Channels 帧。
+  - `bytes_from_hex(...)` / `hex(...)` / `sleep_ms(...)` / `log(...)`
+- **示例**:
+  ```bash
+  cargo run --features lua -- -- lua_run examples/elrs_magic.lua /dev/ttyS3
+  ```
+
+#### 3.2 `elrs_agent` (ELRS 配置状态服务)
+用于向 UI 提供 ELRS 模块状态、参数列表和交互命令。目前支持：
+- `--mode mock`：无硬件演示 UI 交互。
+- `--mode crsf`：通过 UART 发送 CRSF `PING_DEVICES` / `BIND`，解析 `DEVICE_INFO` / `ELRS info`，用于真实 ELRS 模块发现。
+
+- **参数**:
+  - `--mode <mock|crsf>`: 默认 `mock`。
+  - `--dev-name <设备路径>`: 展示/后续真实串口使用，默认 `/dev/ttyS3`。
+  - `--baudrate <波特率>`: 默认 `420000`。
+- **示例**:
+  ```bash
+  # 无硬件联调
+  ./LinTx --server &
+  ./LinTx -- elrs_agent --mode mock --dev-name /dev/ttyS3 &
+  ./LinTx -- ui_demo --backend sdl --width 800 --height 480 --fps 30
+
+  # 板上真实 ELRS/CRSF 模块
+  ./LinTx --server &
+  ./LinTx -- elrs_agent --mode crsf --dev-name /dev/ttyS3 --baudrate 420000 &
+  LINTX_FB_ROTATE=270 LINTX_FB_SWAP_RB=1 ./LinTx -- ui_demo --backend fb --fb-device /dev/fb0 --width 800 --height 480
   ```
 
 #### 4. `adc` (ADC 读取)
@@ -215,7 +258,7 @@ LinTx -- <模块名称> [模块参数]
 
 - `--backend sdl`：PC SDL 窗口后端（真实 LVGL 渲染，支持 `--width/--height`）
 - `--backend pc`：PC 终端后端
-- `--backend fb --fb-device /dev/fb0`：板卡 framebuffer 后端（当前仍为占位后端）
+- `--backend fb --fb-device /dev/fb0`：板卡 framebuffer 后端
 
 示例：
 ```bash
@@ -227,7 +270,7 @@ LinTx -- <模块名称> [模块参数]
 # 板卡场景（示例）
 ./LinTx --server &
 ./LinTx -- system_state_mock --hz 5 &
-./LinTx -- ui_demo --backend fb --fb-device /dev/fb0
+LINTX_FB_ROTATE=270 LINTX_FB_SWAP_RB=1 ./LinTx -- ui_demo --backend fb --fb-device /dev/fb0 --width 800 --height 480
 ```
 
 WSL2 测试建议：

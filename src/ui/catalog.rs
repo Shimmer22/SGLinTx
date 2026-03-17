@@ -55,8 +55,8 @@ pub const APP_SPECS: [AppSpec; 8] = [
     },
     AppSpec {
         id: AppId::Scripts,
-        title: "SCRIPT",
-        icon_text: "SCR",
+        title: "ELRS",
+        icon_text: "ELR",
         accent: (255, 216, 109),
     },
     AppSpec {

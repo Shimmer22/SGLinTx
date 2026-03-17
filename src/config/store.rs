@@ -206,7 +206,10 @@ fn sample_rover() -> ModelConfig {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::{LazyLock, Mutex}, time::{SystemTime, UNIX_EPOCH}};
+    use std::{
+        sync::{LazyLock, Mutex},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     static TEST_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 

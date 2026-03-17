@@ -7,7 +7,9 @@ use rpos::{
 
 use crate::{
     config::store,
-    messages::{ActiveModelMsg, AdcRawMsg, SystemConfigMsg, SystemStatusMsg},
+    messages::{
+        ActiveModelMsg, AdcRawMsg, ElrsCommandMsg, ElrsStateMsg, SystemConfigMsg, SystemStatusMsg,
+    },
     mixer::MixerOutMsg,
 };
 
@@ -168,6 +170,7 @@ impl UiApp {
         event: UiInputEvent,
         config_tx: &Sender<SystemConfigMsg>,
         active_model_tx: &Sender<ActiveModelMsg>,
+        elrs_cmd_tx: &Sender<ElrsCommandMsg>,
     ) {
         match app {
             AppId::System => match event {
@@ -228,6 +231,18 @@ impl UiApp {
                     }
                 }
             }
+            AppId::Scripts => match event {
+                UiInputEvent::Back | UiInputEvent::PagePrev => {
+                    elrs_cmd_tx.send(ElrsCommandMsg::Back)
+                }
+                UiInputEvent::Up => elrs_cmd_tx.send(ElrsCommandMsg::SelectPrev),
+                UiInputEvent::Down => elrs_cmd_tx.send(ElrsCommandMsg::SelectNext),
+                UiInputEvent::Left => elrs_cmd_tx.send(ElrsCommandMsg::ValueDec),
+                UiInputEvent::Right => elrs_cmd_tx.send(ElrsCommandMsg::ValueInc),
+                UiInputEvent::Open => elrs_cmd_tx.send(ElrsCommandMsg::Activate),
+                UiInputEvent::PageNext => elrs_cmd_tx.send(ElrsCommandMsg::Refresh),
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -237,10 +252,25 @@ impl UiApp {
         event: UiInputEvent,
         config_tx: &Sender<SystemConfigMsg>,
         active_model_tx: &Sender<ActiveModelMsg>,
+        elrs_cmd_tx: &Sender<ElrsCommandMsg>,
     ) -> bool {
         match event {
             UiInputEvent::Quit => return false,
-            UiInputEvent::Back => self.frame.page = UiPage::Launcher,
+            UiInputEvent::Back => {
+                if matches!(self.frame.page, UiPage::App(AppId::Scripts))
+                    && !self.frame.elrs.can_leave
+                {
+                    self.apply_event_in_app(
+                        AppId::Scripts,
+                        event,
+                        config_tx,
+                        active_model_tx,
+                        elrs_cmd_tx,
+                    );
+                } else {
+                    self.frame.page = UiPage::Launcher;
+                }
+            }
             UiInputEvent::Open => {
                 if self.frame.page == UiPage::Launcher {
                     if let Some(app) = app_at(
@@ -251,28 +281,28 @@ impl UiApp {
                         self.frame.page = UiPage::App(app);
                     }
                 } else if let UiPage::App(app) = self.frame.page {
-                    self.apply_event_in_app(app, event, config_tx, active_model_tx);
+                    self.apply_event_in_app(app, event, config_tx, active_model_tx, elrs_cmd_tx);
                 }
             }
             UiInputEvent::Left => {
                 if self.frame.page == UiPage::Launcher {
                     self.move_left();
                 } else if let UiPage::App(app) = self.frame.page {
-                    self.apply_event_in_app(app, event, config_tx, active_model_tx);
+                    self.apply_event_in_app(app, event, config_tx, active_model_tx, elrs_cmd_tx);
                 }
             }
             UiInputEvent::Right => {
                 if self.frame.page == UiPage::Launcher {
                     self.move_right();
                 } else if let UiPage::App(app) = self.frame.page {
-                    self.apply_event_in_app(app, event, config_tx, active_model_tx);
+                    self.apply_event_in_app(app, event, config_tx, active_model_tx, elrs_cmd_tx);
                 }
             }
             UiInputEvent::Up | UiInputEvent::Down => {
                 if self.frame.page == UiPage::Launcher {
                     self.move_selection_vertical(if event == UiInputEvent::Up { -1 } else { 1 });
                 } else if let UiPage::App(app) = self.frame.page {
-                    self.apply_event_in_app(app, event, config_tx, active_model_tx);
+                    self.apply_event_in_app(app, event, config_tx, active_model_tx, elrs_cmd_tx);
                 }
             }
             UiInputEvent::PagePrev => {
@@ -299,8 +329,13 @@ impl UiApp {
         let mut config_rx = get_new_rx_of_message::<SystemConfigMsg>("system_config").unwrap();
         let mut adc_raw_rx = get_new_rx_of_message::<AdcRawMsg>("adc_raw").unwrap();
         let mut mixer_out_rx = get_new_rx_of_message::<MixerOutMsg>("mixer_out").unwrap();
+        let mut elrs_rx = get_new_rx_of_message::<ElrsStateMsg>("elrs_state").unwrap();
         let config_tx = get_new_tx_of_message::<SystemConfigMsg>("system_config").unwrap();
         let active_model_tx = get_new_tx_of_message::<ActiveModelMsg>("active_model").unwrap();
+        let elrs_cmd_tx = get_new_tx_of_message::<ElrsCommandMsg>("elrs_cmd").unwrap();
+
+        let elrs_state_tx = get_new_tx_of_message::<ElrsStateMsg>("elrs_state").unwrap();
+        elrs_state_tx.send(ElrsStateMsg::default());
 
         self.reload_models();
         self.publish_active_model(&active_model_tx);
@@ -328,6 +363,10 @@ impl UiApp {
                 self.frame.mixer_out = mixer_out;
             }
 
+            if let Some(elrs) = elrs_rx.try_read() {
+                self.frame.elrs = elrs;
+            }
+
             if self.frame.cloud_connected
                 && self.frame.status.unix_time_secs
                     >= self.frame.cloud_last_sync_secs.saturating_add(5)
@@ -336,7 +375,7 @@ impl UiApp {
             }
 
             while let Some(evt) = backend.poll_event() {
-                if !self.apply_event(evt, &config_tx, &active_model_tx) {
+                if !self.apply_event(evt, &config_tx, &active_model_tx, &elrs_cmd_tx) {
                     backend.shutdown();
                     return;
                 }

@@ -1,5 +1,5 @@
 use crate::{
-    messages::{AdcRawMsg, SystemConfigMsg, SystemStatusMsg},
+    messages::{AdcRawMsg, ElrsStateMsg, SystemConfigMsg, SystemStatusMsg},
     mixer::MixerOutMsg,
 };
 
@@ -43,6 +43,7 @@ pub struct UiFrame {
     pub model_active_idx: usize,
     pub cloud_connected: bool,
     pub cloud_last_sync_secs: u64,
+    pub elrs: ElrsStateMsg,
 }
 
 impl Default for UiFrame {
@@ -66,6 +67,7 @@ impl Default for UiFrame {
             model_active_idx: 0,
             cloud_connected: false,
             cloud_last_sync_secs: 0,
+            elrs: ElrsStateMsg::default(),
         }
     }
 }
