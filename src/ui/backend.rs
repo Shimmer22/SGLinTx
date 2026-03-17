@@ -1,5 +1,86 @@
 use std::io::Write;
 
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+use std::{
+    fs::OpenOptions,
+    io,
+    mem::MaybeUninit,
+    os::{
+        fd::AsRawFd,
+        unix::fs::FileExt,
+    },
+};
+
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+const FBIOGET_VSCREENINFO: libc::c_ulong = 0x4600;
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+const FBIOGET_FSCREENINFO: libc::c_ulong = 0x4602;
+
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxFbBitfield {
+    offset: u32,
+    length: u32,
+    msb_right: u32,
+}
+
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxFbFixScreeninfo {
+    id: [libc::c_char; 16],
+    smem_start: libc::c_ulong,
+    smem_len: u32,
+    type_: u32,
+    type_aux: u32,
+    visual: u32,
+    xpanstep: u16,
+    ypanstep: u16,
+    ywrapstep: u16,
+    line_length: u32,
+    mmio_start: libc::c_ulong,
+    mmio_len: u32,
+    accel: u32,
+    capabilities: u16,
+    reserved: [u16; 2],
+}
+
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxFbVarScreeninfo {
+    xres: u32,
+    yres: u32,
+    xres_virtual: u32,
+    yres_virtual: u32,
+    xoffset: u32,
+    yoffset: u32,
+    bits_per_pixel: u32,
+    grayscale: u32,
+    red: LinuxFbBitfield,
+    green: LinuxFbBitfield,
+    blue: LinuxFbBitfield,
+    transp: LinuxFbBitfield,
+    nonstd: u32,
+    activate: u32,
+    height: u32,
+    width: u32,
+    accel_flags: u32,
+    pixclock: u32,
+    left_margin: u32,
+    right_margin: u32,
+    upper_margin: u32,
+    lower_margin: u32,
+    hsync_len: u32,
+    vsync_len: u32,
+    sync: u32,
+    vmode: u32,
+    rotate: u32,
+    colorspace: u32,
+    reserved: [u32; 4],
+}
+
 use super::{
     catalog::{app_at, app_spec, page, PAGE_SPECS},
     input::UiInputEvent,
@@ -16,7 +97,11 @@ pub trait LvglBackend {
 pub enum BackendKind {
     PcApi,
     PcSdl { width: u32, height: u32 },
-    Fbdev { device: String },
+    Fbdev {
+        device: String,
+        width: u32,
+        height: u32,
+    },
 }
 
 impl BackendKind {
@@ -25,6 +110,8 @@ impl BackendKind {
             "pc_sdl" | "sdl" => Self::PcSdl { width, height },
             "fb" | "fbdev" => Self::Fbdev {
                 device: fb_device.to_string(),
+                width,
+                height,
             },
             _ => Self::PcApi,
         }
@@ -208,19 +295,32 @@ pub fn new_backend(kind: BackendKind) -> Box<dyn LvglBackend> {
                 return Box::new(TerminalBackend::new(name));
             }
         }
-        BackendKind::Fbdev { device } => {
-            super::debug_log(&format!("new_backend -> Fbdev device={device}"));
-            Box::new(TerminalBackend::new(format!("fbdev:{}", device)))
+        BackendKind::Fbdev {
+            device,
+            width,
+            height,
+        } => {
+            super::debug_log(&format!(
+                "new_backend -> Fbdev device={device} size={width}x{height}"
+            ));
+            #[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+            {
+                return Box::new(FbdevBackend::new(device, width, height));
+            }
+            #[cfg(not(all(feature = "lvgl_ui", target_os = "linux")))]
+            {
+                return Box::new(TerminalBackend::new(format!("fbdev:{}", device)));
+            }
         }
     }
 }
 
-#[cfg(feature = "sdl_ui")]
+#[cfg(feature = "lvgl_ui")]
 const TOP_BAR_HEIGHT: i32 = 44;
-#[cfg(feature = "sdl_ui")]
+#[cfg(feature = "lvgl_ui")]
 const LVGL_DRAW_BUF_PIXELS: usize = 800 * 80;
 
-#[cfg(feature = "sdl_ui")]
+#[cfg(feature = "lvgl_ui")]
 struct LvglUiObjects {
     status_label: *mut lvgl_sys::lv_obj_t,
     clock_label: *mut lvgl_sys::lv_obj_t,
@@ -245,7 +345,7 @@ struct LvglUiObjects {
     app_title_labels: [*mut lvgl_sys::lv_obj_t; 8],
 }
 
-#[cfg(feature = "sdl_ui")]
+#[cfg(feature = "lvgl_ui")]
 struct AppTemplateData {
     accent: (u8, u8, u8),
     badge: String,
@@ -259,17 +359,44 @@ struct AppTemplateData {
     hint: String,
 }
 
-#[cfg(feature = "sdl_ui")]
-struct SdlBackend {
+#[cfg(feature = "lvgl_ui")]
+struct LvglUiCore {
     width: u32,
     height: u32,
+    display: Option<lvgl::Display>,
+    ui: Option<LvglUiObjects>,
+    last_tick: std::time::Instant,
+}
+
+#[cfg(feature = "sdl_ui")]
+struct SdlBackend {
+    core: LvglUiCore,
     sdl_ctx: Option<sdl2::Sdl>,
     canvas: Option<sdl2::render::Canvas<sdl2::video::Window>>,
     event_pump: Option<sdl2::EventPump>,
     framebuffer: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
-    display: Option<lvgl::Display>,
-    ui: Option<LvglUiObjects>,
-    last_tick: std::time::Instant,
+}
+
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+struct FbdevBackend {
+    core: LvglUiCore,
+    framebuffer: LinuxFramebuffer,
+}
+
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+struct LinuxFramebuffer {
+    file: std::fs::File,
+    width: u32,
+    height: u32,
+    stride: usize,
+    bits_per_pixel: u32,
+    bytes_per_pixel: usize,
+    xoffset: u32,
+    yoffset: u32,
+    red: LinuxFbBitfield,
+    green: LinuxFbBitfield,
+    blue: LinuxFbBitfield,
+    transp: LinuxFbBitfield,
 }
 
 #[cfg(feature = "sdl_ui")]
@@ -279,24 +406,72 @@ enum SdlRenderMode {
     Accelerated,
 }
 
-#[cfg(feature = "sdl_ui")]
-impl SdlBackend {
+#[cfg(feature = "lvgl_ui")]
+impl LvglUiCore {
     fn to_coord(v: i32) -> lvgl_sys::lv_coord_t {
         v.clamp(i16::MIN as i32, i16::MAX as i32) as lvgl_sys::lv_coord_t
     }
 
     fn new(width: u32, height: u32) -> Self {
-        let fb_size = width as usize * height as usize * 3;
         Self {
             width,
             height,
+            display: None,
+            ui: None,
+            last_tick: std::time::Instant::now(),
+        }
+    }
+
+    fn set_label_text(label: *mut lvgl_sys::lv_obj_t, text: &str) {
+        let sanitized = text.replace('\0', " ");
+        if let Ok(c_text) = std::ffi::CString::new(sanitized) {
+            unsafe {
+                lvgl_sys::lv_label_set_text(label, c_text.as_ptr());
+            }
+        }
+    }
+
+    fn clamp_pct(v: i32) -> u8 {
+        v.clamp(0, 100) as u8
+    }
+
+    fn set_latest_display_default() {
+        unsafe {
+            let mut last = std::ptr::null_mut();
+            let mut cur = lvgl_sys::lv_disp_get_next(std::ptr::null_mut());
+            while !cur.is_null() {
+                last = cur;
+                cur = lvgl_sys::lv_disp_get_next(cur);
+            }
+            if !last.is_null() {
+                lvgl_sys::lv_disp_set_default(last);
+            }
+        }
+    }
+
+    fn start_frame(&mut self) {
+        let now = std::time::Instant::now();
+        let tick_ms = now
+            .saturating_duration_since(self.last_tick)
+            .as_millis()
+            .clamp(1, 1000) as u32;
+        self.last_tick = now;
+
+        lvgl::tick_inc(std::time::Duration::from_millis(tick_ms as u64));
+        lvgl::task_handler();
+    }
+}
+
+#[cfg(feature = "sdl_ui")]
+impl SdlBackend {
+    fn new(width: u32, height: u32) -> Self {
+        let fb_size = width as usize * height as usize * 3;
+        Self {
+            core: LvglUiCore::new(width, height),
             sdl_ctx: None,
             canvas: None,
             event_pump: None,
             framebuffer: std::rc::Rc::new(std::cell::RefCell::new(vec![0; fb_size])),
-            display: None,
-            ui: None,
-            last_tick: std::time::Instant::now(),
         }
     }
 
@@ -329,34 +504,10 @@ impl SdlBackend {
             }
         }
     }
+}
 
-    fn set_label_text(label: *mut lvgl_sys::lv_obj_t, text: &str) {
-        let sanitized = text.replace('\0', " ");
-        if let Ok(c_text) = std::ffi::CString::new(sanitized) {
-            unsafe {
-                lvgl_sys::lv_label_set_text(label, c_text.as_ptr());
-            }
-        }
-    }
-
-    fn clamp_pct(v: i32) -> u8 {
-        v.clamp(0, 100) as u8
-    }
-
-    fn set_latest_display_default() {
-        unsafe {
-            let mut last = std::ptr::null_mut();
-            let mut cur = lvgl_sys::lv_disp_get_next(std::ptr::null_mut());
-            while !cur.is_null() {
-                last = cur;
-                cur = lvgl_sys::lv_disp_get_next(cur);
-            }
-            if !last.is_null() {
-                lvgl_sys::lv_disp_set_default(last);
-            }
-        }
-    }
-
+#[cfg(feature = "lvgl_ui")]
+impl LvglUiCore {
     fn app_template_data(&self, frame: &UiFrame, app: AppId) -> AppTemplateData {
         let spec = app_spec(app);
         match app {
@@ -1120,7 +1271,10 @@ impl SdlBackend {
             }
         }
     }
+}
 
+#[cfg(feature = "sdl_ui")]
+impl SdlBackend {
     fn blit_refresh<const N: usize>(
         framebuffer: &std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
         width: u32,
@@ -1182,7 +1336,7 @@ impl LvglBackend for SdlBackend {
     fn init(&mut self) {
         super::debug_log(&format!(
             "SdlBackend::init begin size={}x{}",
-            self.width, self.height
+            self.core.width, self.core.height
         ));
         unsafe {
             // UI thread can be force-cancelled by server on client disconnect.
@@ -1202,7 +1356,7 @@ impl LvglBackend for SdlBackend {
 
         let create_window = || {
             video
-                .window("LinTX LVGL", self.width, self.height)
+                .window("LinTX LVGL", self.core.width, self.core.height)
                 .position_centered()
                 .resizable()
                 .build()
@@ -1248,19 +1402,20 @@ impl LvglBackend for SdlBackend {
 
         let draw_buf = lvgl::DrawBuffer::<LVGL_DRAW_BUF_PIXELS>::default();
         let framebuffer = std::rc::Rc::clone(&self.framebuffer);
-        let width = self.width;
-        let height = self.height;
+        let width = self.core.width;
+        let height = self.core.height;
 
-        let display = lvgl::Display::register(draw_buf, self.width, self.height, move |refresh| {
-            Self::blit_refresh(&framebuffer, width, height, refresh);
-        })
-        .expect("failed to register lvgl display");
+        let display =
+            lvgl::Display::register(draw_buf, self.core.width, self.core.height, move |refresh| {
+                Self::blit_refresh(&framebuffer, width, height, refresh);
+            })
+            .expect("failed to register lvgl display");
         super::debug_log("SdlBackend::init lvgl display registered");
 
-        self.display = Some(display);
-        Self::set_latest_display_default();
-        self.build_ui();
-        self.last_tick = std::time::Instant::now();
+        self.core.display = Some(display);
+        LvglUiCore::set_latest_display_default();
+        self.core.build_ui();
+        self.core.last_tick = std::time::Instant::now();
         super::debug_log("SdlBackend::init done");
     }
 
@@ -1315,17 +1470,8 @@ impl LvglBackend for SdlBackend {
     }
 
     fn render(&mut self, frame: &UiFrame) {
-        self.sync_ui(frame);
-
-        let now = std::time::Instant::now();
-        let tick_ms = now
-            .saturating_duration_since(self.last_tick)
-            .as_millis()
-            .clamp(1, 1000) as u32;
-        self.last_tick = now;
-
-        lvgl::tick_inc(std::time::Duration::from_millis(tick_ms as u64));
-        lvgl::task_handler();
+        self.core.sync_ui(frame);
+        self.core.start_frame();
 
         let Some(canvas) = self.canvas.as_mut() else {
             return;
@@ -1335,28 +1481,212 @@ impl LvglBackend for SdlBackend {
 
         let texture_creator = canvas.texture_creator();
         let mut texture = texture_creator
-            .create_texture_streaming(PixelFormatEnum::RGB24, self.width, self.height)
+            .create_texture_streaming(PixelFormatEnum::RGB24, self.core.width, self.core.height)
             .expect("failed to create texture");
 
         {
             let fb = self.framebuffer.borrow();
             texture
-                .update(None, &fb, self.width as usize * 3)
+                .update(None, &fb, self.core.width as usize * 3)
                 .expect("failed to upload frame");
         }
 
-        let (ow, oh) = canvas.output_size().unwrap_or((self.width, self.height));
+        let (ow, oh) = canvas
+            .output_size()
+            .unwrap_or((self.core.width, self.core.height));
         canvas.clear();
         let _ = canvas.copy(&texture, None, Rect::new(0, 0, ow, oh));
         canvas.present();
     }
 
     fn shutdown(&mut self) {
-        self.ui = None;
-        self.display = None;
+        self.core.ui = None;
+        self.core.display = None;
         self.event_pump = None;
         self.canvas = None;
         self.sdl_ctx = None;
         self.framebuffer.borrow_mut().fill(0);
+    }
+}
+
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+impl LinuxFramebuffer {
+    fn open(path: &str) -> io::Result<Self> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let fd = file.as_raw_fd();
+
+        let mut finfo = MaybeUninit::<LinuxFbFixScreeninfo>::zeroed();
+        let mut vinfo = MaybeUninit::<LinuxFbVarScreeninfo>::zeroed();
+
+        let fix_ret = unsafe { libc::ioctl(fd, FBIOGET_FSCREENINFO as _, finfo.as_mut_ptr()) };
+        if fix_ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let var_ret = unsafe { libc::ioctl(fd, FBIOGET_VSCREENINFO as _, vinfo.as_mut_ptr()) };
+        if var_ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let finfo = unsafe { finfo.assume_init() };
+        let vinfo = unsafe { vinfo.assume_init() };
+        let bytes_per_pixel = vinfo.bits_per_pixel.div_ceil(8) as usize;
+
+        Ok(Self {
+            file,
+            width: vinfo.xres,
+            height: vinfo.yres,
+            stride: finfo.line_length as usize,
+            bits_per_pixel: vinfo.bits_per_pixel,
+            bytes_per_pixel,
+            xoffset: vinfo.xoffset,
+            yoffset: vinfo.yoffset,
+            red: vinfo.red,
+            green: vinfo.green,
+            blue: vinfo.blue,
+            transp: vinfo.transp,
+        })
+    }
+
+    fn write_all_at(&self, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+        while !buf.is_empty() {
+            let written = self.file.write_at(buf, offset)?;
+            if written == 0 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "short framebuffer write"));
+            }
+            buf = &buf[written..];
+            offset += written as u64;
+        }
+        Ok(())
+    }
+
+    fn scale_channel(value: u8, length: u32) -> u32 {
+        if length == 0 {
+            return 0;
+        }
+        let max = (1u32 << length.min(16)) - 1;
+        ((u32::from(value) * max) + 127) / 255
+    }
+
+    fn pack_pixel(&self, rgb565: u16) -> u32 {
+        let r5 = ((rgb565 >> 11) & 0x1F) as u8;
+        let g6 = ((rgb565 >> 5) & 0x3F) as u8;
+        let b5 = (rgb565 & 0x1F) as u8;
+
+        let r8 = (r5 << 3) | (r5 >> 2);
+        let g8 = (g6 << 2) | (g6 >> 4);
+        let b8 = (b5 << 3) | (b5 >> 2);
+
+        let mut pixel = 0u32;
+        pixel |= Self::scale_channel(r8, self.red.length) << self.red.offset;
+        pixel |= Self::scale_channel(g8, self.green.length) << self.green.offset;
+        pixel |= Self::scale_channel(b8, self.blue.length) << self.blue.offset;
+        if self.transp.length > 0 {
+            pixel |= ((1u32 << self.transp.length.min(16)) - 1) << self.transp.offset;
+        }
+        pixel
+    }
+
+    fn write_refresh<const N: usize>(&mut self, refresh: &lvgl::DisplayRefresh<N>) -> io::Result<()> {
+        let area = &refresh.area;
+        if area.x2 < area.x1 || area.y2 < area.y1 {
+            return Ok(());
+        }
+
+        let x1 = i32::from(area.x1).max(0);
+        let y1 = i32::from(area.y1).max(0);
+        let x2 = i32::from(area.x2).min(self.width as i32 - 1);
+        let y2 = i32::from(area.y2).min(self.height as i32 - 1);
+        if x2 < x1 || y2 < y1 {
+            return Ok(());
+        }
+
+        let src_width = (i32::from(area.x2) - i32::from(area.x1) + 1) as usize;
+        let clipped_width = (x2 - x1 + 1) as usize;
+        let bytes_per_row = clipped_width * self.bytes_per_pixel;
+        let area_x1 = i32::from(area.x1);
+        let area_y1 = i32::from(area.y1);
+        let mut row_buf = vec![0u8; bytes_per_row];
+
+        for y in y1..=y2 {
+            let src_row = (y - area_y1) as usize;
+            let src_col = (x1 - area_x1) as usize;
+            let row_start = src_row * src_width + src_col;
+
+            for col in 0..clipped_width {
+                let color = refresh.colors[row_start + col];
+                let raw: lvgl_sys::lv_color_t = color.into();
+                let pixel = self.pack_pixel(unsafe { raw.full });
+                let dst = col * self.bytes_per_pixel;
+                let bytes = pixel.to_ne_bytes();
+                row_buf[dst..dst + self.bytes_per_pixel].copy_from_slice(&bytes[..self.bytes_per_pixel]);
+            }
+
+            let offset = ((y as u64 + u64::from(self.yoffset)) * self.stride as u64)
+                + ((x1 as u64 + u64::from(self.xoffset)) * self.bytes_per_pixel as u64);
+            self.write_all_at(&row_buf, offset)?;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+impl FbdevBackend {
+    fn new(device: String, width: u32, height: u32) -> Self {
+        let framebuffer =
+            LinuxFramebuffer::open(&device).unwrap_or_else(|err| panic!("failed to open {device}: {err}"));
+        super::debug_log(&format!(
+            "FbdevBackend::new device={} actual={}x{} bpp={} stride={}",
+            device, framebuffer.width, framebuffer.height, framebuffer.bits_per_pixel, framebuffer.stride
+        ));
+        Self {
+            core: LvglUiCore::new(width, height),
+            framebuffer,
+        }
+    }
+}
+
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+impl LvglBackend for FbdevBackend {
+    fn init(&mut self) {
+        super::debug_log(&format!(
+            "FbdevBackend::init begin logical={}x{} fb={}x{}",
+            self.core.width, self.core.height, self.framebuffer.width, self.framebuffer.height
+        ));
+        unsafe {
+            lvgl_sys::lv_deinit();
+            lvgl_sys::lv_init();
+        }
+
+        let draw_buf = lvgl::DrawBuffer::<LVGL_DRAW_BUF_PIXELS>::default();
+        let fb_ptr: *mut LinuxFramebuffer = &mut self.framebuffer;
+        let display = lvgl::Display::register(draw_buf, self.core.width, self.core.height, move |refresh| {
+            let fb = unsafe { &mut *fb_ptr };
+            if let Err(err) = fb.write_refresh(refresh) {
+                super::debug_log(&format!("FbdevBackend::write_refresh failed: {err}"));
+            }
+        })
+        .expect("failed to register lvgl display");
+
+        self.core.display = Some(display);
+        LvglUiCore::set_latest_display_default();
+        self.core.build_ui();
+        self.core.last_tick = std::time::Instant::now();
+        super::debug_log("FbdevBackend::init done");
+    }
+
+    fn poll_event(&mut self) -> Option<UiInputEvent> {
+        None
+    }
+
+    fn render(&mut self, frame: &UiFrame) {
+        self.core.sync_ui(frame);
+        self.core.start_frame();
+    }
+
+    fn shutdown(&mut self) {
+        self.core.ui = None;
+        self.core.display = None;
     }
 }

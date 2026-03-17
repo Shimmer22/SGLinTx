@@ -23,6 +23,7 @@ dependencies = [
  "crsf",
  "embedded-hal",
  "joydev",
+ "libc",
  "linux-embedded-hal",
  "lvgl",
  "lvgl-sys",

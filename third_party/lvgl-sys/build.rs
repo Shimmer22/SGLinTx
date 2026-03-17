@@ -3,10 +3,44 @@ use cc::Build;
 use std::collections::HashSet;
 use std::{
     env,
+    fs,
     path::{Path, PathBuf},
 };
 
 static CONFIG_NAME: &str = "DEP_LV_CONFIG_PATH";
+
+fn clang_target(target: &str) -> Option<String> {
+    match target {
+        // In our riscv64 musl cross image, bindgen can parse LVGL headers with the host
+        // clang, but `-target` causes libclang to require a target sysroot that is not present.
+        "riscv64gc-unknown-linux-musl" => None,
+        other => Some(other.to_string()),
+    }
+}
+
+fn host_clang_include(host: &str) -> Option<&'static str> {
+    match host {
+        "x86_64-unknown-linux-gnu" => Some("/usr/include/x86_64-linux-gnu"),
+        "aarch64-unknown-linux-gnu" => Some("/usr/include/aarch64-linux-gnu"),
+        _ => None,
+    }
+}
+
+fn find_prebuilt_bindings(workspace_root: &Path) -> Option<PathBuf> {
+    for profile in ["debug", "release"] {
+        let build_dir = workspace_root.join("target").join(profile).join("build");
+        let Ok(entries) = fs::read_dir(build_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path().join("out").join("bindings.rs");
+            if path.exists() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
 
 // See https://github.com/rust-lang/rust-bindgen/issues/687#issuecomment-450750547
 #[cfg(feature = "drivers")]
@@ -169,12 +203,21 @@ fn main() {
     // Set correct target triple for bindgen when cross-compiling
     let target = env::var("TARGET").expect("Cargo build scripts always have TARGET");
     let host = env::var("HOST").expect("Cargo build scripts always have HOST");
+    let bindgen_target = clang_target(&target);
     if target != host {
-        cc_args.push("-target");
-        cc_args.push(target.as_str());
+        if let Some(bindgen_target) = bindgen_target.as_deref() {
+            cc_args.push("-target");
+            cc_args.push(bindgen_target);
+        }
     }
 
     let mut additional_args = Vec::new();
+    if bindgen_target.is_none() {
+        if let Some(include_dir) = host_clang_include(&host) {
+            additional_args.push("-I".to_string());
+            additional_args.push(include_dir.to_string());
+        }
+    }
     if target.ends_with("emscripten") {
         match env::var("EMSDK") {
             Ok(em_path) =>
@@ -214,30 +257,48 @@ fn main() {
     );
 
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let bindings =
-        bindgen::Builder::default().header(shims_dir.join("lvgl_sys.h").to_str().unwrap());
-    let bindings = add_font_headers(bindings, &font_extra_src);
-    #[cfg(feature = "drivers")]
-    let bindings = bindings
-        .header(shims_dir.join("lvgl_drv.h").to_str().unwrap())
-        .parse_callbacks(Box::new(ignored_macros));
-    //#[cfg(feature = "rust_timer")]
-    //let bindings = bindings.header(shims_dir.join("rs_timer.h").to_str().unwrap());
-    let bindings = bindings
-        .generate_comments(false)
-        .derive_default(true)
-        .layout_tests(false)
-        .use_core()
-        .rustfmt_bindings(true)
-        .ctypes_prefix("cty")
-        .clang_args(&cc_args)
-        .clang_args(&additional_args)
-        .generate()
-        .expect("Unable to generate bindings");
+    let bindings_out = out_path.join("bindings.rs");
+    let reused_prebuilt = if target == "riscv64gc-unknown-linux-musl" {
+        let workspace_root = project_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("lvgl-sys should live under <workspace>/third_party");
+        if let Some(prebuilt) = find_prebuilt_bindings(workspace_root) {
+            fs::copy(prebuilt, &bindings_out).expect("Can't reuse prebuilt bindings");
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
 
-    bindings
-        .write_to_file(out_path.join("bindings.rs"))
-        .expect("Can't write bindings!");
+    if !reused_prebuilt {
+        let bindings =
+            bindgen::Builder::default().header(shims_dir.join("lvgl_sys.h").to_str().unwrap());
+        let bindings = add_font_headers(bindings, &font_extra_src);
+        #[cfg(feature = "drivers")]
+        let bindings = bindings
+            .header(shims_dir.join("lvgl_drv.h").to_str().unwrap())
+            .parse_callbacks(Box::new(ignored_macros));
+        //#[cfg(feature = "rust_timer")]
+        //let bindings = bindings.header(shims_dir.join("rs_timer.h").to_str().unwrap());
+        let bindings = bindings
+            .generate_comments(false)
+            .derive_default(true)
+            .layout_tests(false)
+            .use_core()
+            .rustfmt_bindings(true)
+            .ctypes_prefix("cty")
+            .clang_args(&cc_args)
+            .clang_args(&additional_args)
+            .generate()
+            .expect("Unable to generate bindings");
+
+        bindings
+            .write_to_file(&bindings_out)
+            .expect("Can't write bindings!");
+    }
 
     #[cfg(feature = "drivers")]
     link_extra.split(',').for_each(|a| {
