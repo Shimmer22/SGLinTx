@@ -1,3 +1,5 @@
+#[cfg(any(feature = "sdl_ui", all(feature = "lvgl_ui", target_os = "linux")))]
+use std::collections::VecDeque;
 use std::io::Write;
 
 #[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
@@ -99,17 +101,27 @@ pub enum BackendKind {
     },
     Fbdev {
         device: String,
+        touch_device: Option<String>,
         width: u32,
         height: u32,
     },
 }
 
 impl BackendKind {
-    pub fn parse(name: &str, fb_device: &str, width: u32, height: u32) -> Self {
+    pub fn parse(
+        name: &str,
+        fb_device: &str,
+        touch_device: Option<&str>,
+        width: u32,
+        height: u32,
+    ) -> Self {
         match name {
             "pc_sdl" | "sdl" => Self::PcSdl { width, height },
             "fb" | "fbdev" => Self::Fbdev {
                 device: fb_device.to_string(),
+                touch_device: touch_device
+                    .map(|path| path.trim().to_string())
+                    .filter(|path| !path.is_empty()),
                 width,
                 height,
             },
@@ -370,15 +382,16 @@ pub fn new_backend(kind: BackendKind) -> Box<dyn LvglBackend> {
         }
         BackendKind::Fbdev {
             device,
+            touch_device,
             width,
             height,
         } => {
             super::debug_log(&format!(
-                "new_backend -> Fbdev device={device} size={width}x{height}"
+                "new_backend -> Fbdev device={device} touch_device={touch_device:?} size={width}x{height}"
             ));
             #[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
             {
-                return Box::new(FbdevBackend::new(device, width, height));
+                return Box::new(FbdevBackend::new(device, touch_device, width, height));
             }
             #[cfg(not(all(feature = "lvgl_ui", target_os = "linux")))]
             {
@@ -388,7 +401,7 @@ pub fn new_backend(kind: BackendKind) -> Box<dyn LvglBackend> {
     }
 }
 
-#[cfg(feature = "lvgl_ui")]
+#[cfg(any(feature = "sdl_ui", all(feature = "lvgl_ui", target_os = "linux")))]
 const TOP_BAR_HEIGHT: i32 = 44;
 #[cfg(feature = "lvgl_ui")]
 const LVGL_DRAW_BUF_PIXELS: usize = 800 * 80;
@@ -398,7 +411,9 @@ struct LvglUiObjects {
     status_label: *mut lvgl_sys::lv_obj_t,
     clock_label: *mut lvgl_sys::lv_obj_t,
     page_label: *mut lvgl_sys::lv_obj_t,
+    back_button: *mut lvgl_sys::lv_obj_t,
     launcher_panel: *mut lvgl_sys::lv_obj_t,
+    launcher_panel_alt: *mut lvgl_sys::lv_obj_t,
     app_panel: *mut lvgl_sys::lv_obj_t,
     app_header_card: *mut lvgl_sys::lv_obj_t,
     app_badge_label: *mut lvgl_sys::lv_obj_t,
@@ -412,10 +427,15 @@ struct LvglUiObjects {
     app_list_lines: [*mut lvgl_sys::lv_obj_t; 4],
     app_hint_label: *mut lvgl_sys::lv_obj_t,
     branding_label: *mut lvgl_sys::lv_obj_t,
+    branding_label_alt: *mut lvgl_sys::lv_obj_t,
     app_cards: [*mut lvgl_sys::lv_obj_t; 8],
+    app_cards_alt: [*mut lvgl_sys::lv_obj_t; 8],
     app_icon_boxes: [*mut lvgl_sys::lv_obj_t; 8],
+    app_icon_boxes_alt: [*mut lvgl_sys::lv_obj_t; 8],
     app_icon_labels: [*mut lvgl_sys::lv_obj_t; 8],
+    app_icon_labels_alt: [*mut lvgl_sys::lv_obj_t; 8],
     app_title_labels: [*mut lvgl_sys::lv_obj_t; 8],
+    app_title_labels_alt: [*mut lvgl_sys::lv_obj_t; 8],
 }
 
 #[cfg(feature = "lvgl_ui")]
@@ -439,6 +459,14 @@ struct LvglUiCore {
     display: Option<lvgl::Display>,
     ui: Option<LvglUiObjects>,
     last_tick: std::time::Instant,
+    drag_offset_x: Option<i32>,
+    current_launcher_x: i32,
+    target_launcher_x: i32,
+    current_app_x: i32,
+    target_app_x: i32,
+    last_page: Option<UiPage>,
+    last_launcher_page: usize,
+    launcher_transition_from: Option<usize>,
 }
 
 #[cfg(feature = "sdl_ui")]
@@ -448,12 +476,15 @@ struct SdlBackend {
     canvas: Option<sdl2::render::Canvas<sdl2::video::Window>>,
     event_pump: Option<sdl2::EventPump>,
     framebuffer: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+    pointer: PointerInputAdapter,
 }
 
 #[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
 struct FbdevBackend {
     core: LvglUiCore,
     framebuffer: LinuxFramebuffer,
+    touch_input: Option<EvdevTouchInput>,
+    pointer: PointerInputAdapter,
 }
 
 #[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
@@ -481,6 +512,285 @@ enum SdlRenderMode {
     Accelerated,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "sdl_ui", all(feature = "lvgl_ui", target_os = "linux")))]
+enum PointerSwipeAction {
+    PrevPage,
+    NextPage,
+    Back,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "sdl_ui", all(feature = "lvgl_ui", target_os = "linux")))]
+enum PointerTapAction {
+    OpenLauncherApp { row: usize, col: usize },
+    BackButton,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "sdl_ui", all(feature = "lvgl_ui", target_os = "linux")))]
+struct PointerUiSnapshot {
+    page: UiPage,
+    launcher_page: usize,
+    selected_row: usize,
+    selected_col: usize,
+    width: i32,
+    height: i32,
+}
+
+#[derive(Debug, Default)]
+#[cfg(any(feature = "sdl_ui", all(feature = "lvgl_ui", target_os = "linux")))]
+struct PointerGestureState {
+    pressed: bool,
+    start: (i32, i32),
+    current: (i32, i32),
+}
+
+#[derive(Debug, Default)]
+#[cfg(any(feature = "sdl_ui", all(feature = "lvgl_ui", target_os = "linux")))]
+struct PointerInputAdapter {
+    snapshot: Option<PointerUiSnapshot>,
+    gesture: PointerGestureState,
+    pending_events: VecDeque<UiInputEvent>,
+}
+
+#[cfg(any(feature = "sdl_ui", all(feature = "lvgl_ui", target_os = "linux")))]
+impl PointerUiSnapshot {
+    fn from_frame(frame: &UiFrame, width: u32, height: u32) -> Self {
+        Self {
+            page: frame.page,
+            launcher_page: frame.launcher_page,
+            selected_row: frame.selected_row,
+            selected_col: frame.selected_col,
+            width: width as i32,
+            height: height as i32,
+        }
+    }
+
+    fn hit_test_launcher_app(&self, x: i32, y: i32) -> Option<(usize, usize)> {
+        if !matches!(self.page, UiPage::Launcher) {
+            return None;
+        }
+
+        let content_top = TOP_BAR_HEIGHT;
+        if y < content_top {
+            return None;
+        }
+
+        let p = page(self.launcher_page);
+        let panel_h = (self.height - TOP_BAR_HEIGHT - 20).max(120);
+        let panel_w = self.width - 40;
+        let col_gap = 20;
+        let row_gap = 25;
+        let cols = p.cols.max(1) as i32;
+        let cell_w = (panel_w - (cols - 1) * col_gap) / cols;
+        let cell_h = 140;
+        let is_home = self.launcher_page == 0;
+
+        for row in 0..p.rows {
+            for col in 0..p.cols {
+                if app_at(self.launcher_page, row, col).is_none() {
+                    continue;
+                }
+                let left = 20 + col as i32 * (cell_w + col_gap);
+                let top = if is_home {
+                    TOP_BAR_HEIGHT + panel_h - cell_h - 40
+                } else {
+                    TOP_BAR_HEIGHT + 20 + row as i32 * (cell_h + row_gap)
+                };
+                if x >= left && x < left + cell_w && y >= top && y < top + cell_h {
+                    return Some((row, col));
+                }
+            }
+        }
+
+        None
+    }
+
+    fn hit_test_back_button(&self, x: i32, y: i32) -> bool {
+        !matches!(self.page, UiPage::Launcher) && x >= 8 && x < 88 && y >= 6 && y < 36
+    }
+
+    fn tap_action(&self, x: i32, y: i32) -> Option<PointerTapAction> {
+        if let Some((row, col)) = self.hit_test_launcher_app(x, y) {
+            return Some(PointerTapAction::OpenLauncherApp { row, col });
+        }
+        if self.hit_test_back_button(x, y) {
+            return Some(PointerTapAction::BackButton);
+        }
+        None
+    }
+
+    fn swipe_action(&self, dx: i32) -> Option<PointerSwipeAction> {
+        match self.page {
+            UiPage::Launcher if dx <= -48 => Some(PointerSwipeAction::NextPage),
+            UiPage::Launcher if dx >= 48 => Some(PointerSwipeAction::PrevPage),
+            UiPage::App(_) if dx >= 48 => Some(PointerSwipeAction::Back),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(any(feature = "sdl_ui", all(feature = "lvgl_ui", target_os = "linux")))]
+impl PointerInputAdapter {
+    fn update_snapshot(&mut self, frame: &UiFrame, width: u32, height: u32) {
+        self.snapshot = Some(PointerUiSnapshot::from_frame(frame, width, height));
+    }
+
+    fn pop_event(&mut self) -> Option<UiInputEvent> {
+        self.pending_events.pop_front()
+    }
+
+    fn drag_offset_x(&self) -> Option<i32> {
+        self.gesture
+            .pressed
+            .then_some(self.gesture.current.0 - self.gesture.start.0)
+    }
+
+    fn begin(&mut self, x: i32, y: i32) {
+        self.gesture.pressed = true;
+        self.gesture.start = (x, y);
+        self.gesture.current = (x, y);
+    }
+
+    fn update(&mut self, x: i32, y: i32) {
+        if self.gesture.pressed {
+            self.gesture.current = (x, y);
+        }
+    }
+
+    fn end(&mut self, x: i32, y: i32) {
+        if !self.gesture.pressed {
+            return;
+        }
+
+        self.gesture.current = (x, y);
+        self.gesture.pressed = false;
+
+        let Some(snapshot) = self.snapshot else {
+            return;
+        };
+
+        let dx = self.gesture.current.0 - self.gesture.start.0;
+        let dy = self.gesture.current.1 - self.gesture.start.1;
+        let abs_dx = dx.abs();
+        let abs_dy = dy.abs();
+
+        if abs_dx >= 48 && abs_dx > abs_dy {
+            match snapshot.swipe_action(dx) {
+                Some(PointerSwipeAction::PrevPage) => {
+                    self.pending_events.push_back(UiInputEvent::PagePrev)
+                }
+                Some(PointerSwipeAction::NextPage) => {
+                    self.pending_events.push_back(UiInputEvent::PageNext)
+                }
+                Some(PointerSwipeAction::Back) => self.pending_events.push_back(UiInputEvent::Back),
+                None => {}
+            }
+            return;
+        }
+
+        if abs_dx <= 18 && abs_dy <= 18 {
+            match snapshot.tap_action(x, y) {
+                Some(PointerTapAction::OpenLauncherApp { row, col }) => {
+                    for evt in self.align_selection(snapshot, row, col) {
+                        self.pending_events.push_back(evt);
+                    }
+                    self.pending_events.push_back(UiInputEvent::Open);
+                }
+                Some(PointerTapAction::BackButton) => {
+                    self.pending_events.push_back(UiInputEvent::Back);
+                }
+                None => {}
+            }
+        }
+    }
+
+    fn align_selection(
+        &self,
+        snapshot: PointerUiSnapshot,
+        row: usize,
+        col: usize,
+    ) -> std::vec::IntoIter<UiInputEvent> {
+        let mut events = Vec::new();
+        if !matches!(snapshot.page, UiPage::Launcher) {
+            return events.into_iter();
+        }
+
+        for _ in row..snapshot.selected_row {
+            events.push(UiInputEvent::Up);
+        }
+        for _ in snapshot.selected_row..row {
+            events.push(UiInputEvent::Down);
+        }
+        for _ in col..snapshot.selected_col {
+            events.push(UiInputEvent::Left);
+        }
+        for _ in snapshot.selected_col..col {
+            events.push(UiInputEvent::Right);
+        }
+
+        events.into_iter()
+    }
+}
+
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LinuxInputEvent {
+    time: libc::timeval,
+    type_: u16,
+    code: u16,
+    value: i32,
+}
+
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LinuxInputAbsInfo {
+    value: i32,
+    minimum: i32,
+    maximum: i32,
+    fuzz: i32,
+    flat: i32,
+    resolution: i32,
+}
+
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+struct EvdevAxisCalibration {
+    min: i32,
+    max: i32,
+}
+
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+struct EvdevTouchInput {
+    file: std::fs::File,
+    x_axis: Option<EvdevAxisCalibration>,
+    y_axis: Option<EvdevAxisCalibration>,
+    pressed: bool,
+    x: i32,
+    y: i32,
+}
+
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+const EV_SYN: u16 = 0x00;
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+const EV_KEY: u16 = 0x01;
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+const EV_ABS: u16 = 0x03;
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+const SYN_REPORT: u16 = 0;
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+const BTN_TOUCH: u16 = 0x14a;
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+const ABS_X: u16 = 0x00;
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+const ABS_Y: u16 = 0x01;
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+const ABS_MT_POSITION_X: u16 = 0x35;
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+const ABS_MT_POSITION_Y: u16 = 0x36;
+
 #[cfg(feature = "lvgl_ui")]
 impl LvglUiCore {
     fn to_coord(v: i32) -> lvgl_sys::lv_coord_t {
@@ -488,12 +798,21 @@ impl LvglUiCore {
     }
 
     fn new(width: u32, height: u32) -> Self {
+        let hidden_right = width as i32 + 20;
         Self {
             width,
             height,
             display: None,
             ui: None,
             last_tick: std::time::Instant::now(),
+            drag_offset_x: None,
+            current_launcher_x: 0,
+            target_launcher_x: 0,
+            current_app_x: hidden_right,
+            target_app_x: hidden_right,
+            last_page: None,
+            last_launcher_page: 0,
+            launcher_transition_from: None,
         }
     }
 
@@ -535,6 +854,33 @@ impl LvglUiCore {
         lvgl::tick_inc(std::time::Duration::from_millis(tick_ms as u64));
         lvgl::task_handler();
     }
+
+    fn set_drag_offset(&mut self, drag_offset_x: Option<i32>) {
+        self.drag_offset_x = drag_offset_x;
+    }
+
+    fn hidden_right(&self) -> i32 {
+        self.width as i32 + 20
+    }
+
+    fn hidden_left(&self) -> i32 {
+        -self.hidden_right()
+    }
+
+    fn animate_axis(current: &mut i32, target: i32) {
+        if *current == target {
+            return;
+        }
+
+        let delta = target - *current;
+        if delta.abs() <= 8 {
+            *current = target;
+            return;
+        }
+
+        let step = ((delta as f32) * 0.28).round() as i32;
+        *current += if step == 0 { delta.signum() } else { step };
+    }
 }
 
 #[cfg(feature = "sdl_ui")]
@@ -547,7 +893,24 @@ impl SdlBackend {
             canvas: None,
             event_pump: None,
             framebuffer: std::rc::Rc::new(std::cell::RefCell::new(vec![0; fb_size])),
+            pointer: PointerInputAdapter::default(),
         }
+    }
+
+    fn window_to_logical(
+        width: u32,
+        height: u32,
+        window_w: u32,
+        window_h: u32,
+        x: i32,
+        y: i32,
+    ) -> (i32, i32) {
+        let logical_x = x.saturating_mul(width as i32) / window_w.max(1) as i32;
+        let logical_y = y.saturating_mul(height as i32) / window_h.max(1) as i32;
+        (
+            logical_x.clamp(0, width.saturating_sub(1) as i32),
+            logical_y.clamp(0, height.saturating_sub(1) as i32),
+        )
     }
 
     fn is_wsl() -> bool {
@@ -579,6 +942,145 @@ impl SdlBackend {
             }
         }
     }
+}
+
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+impl EvdevTouchInput {
+    fn open(path: &str) -> io::Result<Self> {
+        let file = OpenOptions::new().read(true).open(path)?;
+        let fd = file.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(Self {
+            x_axis: Self::axis_calibration(fd, ABS_MT_POSITION_X)
+                .or_else(|| Self::axis_calibration(fd, ABS_X)),
+            y_axis: Self::axis_calibration(fd, ABS_MT_POSITION_Y)
+                .or_else(|| Self::axis_calibration(fd, ABS_Y)),
+            file,
+            pressed: false,
+            x: 0,
+            y: 0,
+        })
+    }
+
+    fn axis_calibration(fd: libc::c_int, axis: u16) -> Option<EvdevAxisCalibration> {
+        let mut abs = LinuxInputAbsInfo::default();
+        let req = eviocgabs(axis);
+        let ret = unsafe { libc::ioctl(fd, req as _, &mut abs) };
+        if ret < 0 || abs.maximum <= abs.minimum {
+            return None;
+        }
+        Some(EvdevAxisCalibration {
+            min: abs.minimum,
+            max: abs.maximum,
+        })
+    }
+
+    fn read_events(&mut self, width: u32, height: u32, pointer: &mut PointerInputAdapter) {
+        loop {
+            let mut event = LinuxInputEvent::default();
+            let read_len = unsafe {
+                libc::read(
+                    self.file.as_raw_fd(),
+                    &mut event as *mut _ as *mut libc::c_void,
+                    std::mem::size_of::<LinuxInputEvent>(),
+                )
+            };
+
+            if read_len == 0 {
+                return;
+            }
+            if read_len < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::WouldBlock {
+                    super::debug_log(&format!("touch read failed: {err}"));
+                }
+                return;
+            }
+            if read_len as usize != std::mem::size_of::<LinuxInputEvent>() {
+                return;
+            }
+
+            match event.type_ {
+                EV_KEY if event.code == BTN_TOUCH => {
+                    if event.value > 0 {
+                        self.pressed = true;
+                    } else {
+                        self.pressed = false;
+                    }
+                }
+                EV_ABS => match event.code {
+                    ABS_X | ABS_MT_POSITION_X => {
+                        self.x = self.scale_axis(event.value, self.x_axis.as_ref(), width)
+                    }
+                    ABS_Y | ABS_MT_POSITION_Y => {
+                        self.y = self.scale_axis(event.value, self.y_axis.as_ref(), height)
+                    }
+                    _ => {}
+                },
+                EV_SYN if event.code == SYN_REPORT => {
+                    if self.pressed && !pointer.gesture.pressed {
+                        pointer.begin(self.x, self.y);
+                    } else if self.pressed {
+                        pointer.update(self.x, self.y);
+                    } else if pointer.gesture.pressed {
+                        pointer.end(self.x, self.y);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn scale_axis(&self, value: i32, axis: Option<&EvdevAxisCalibration>, extent: u32) -> i32 {
+        let Some(axis) = axis else {
+            return value.clamp(0, extent.saturating_sub(1) as i32);
+        };
+        let span = (axis.max - axis.min).max(1);
+        let logical = (value - axis.min) * (extent.saturating_sub(1) as i32) / span;
+        logical.clamp(0, extent.saturating_sub(1) as i32)
+    }
+}
+
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+const IOC_NRBITS: u32 = 8;
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+const IOC_TYPEBITS: u32 = 8;
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+const IOC_SIZEBITS: u32 = 14;
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+const IOC_NRSHIFT: u32 = 0;
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+const IOC_TYPESHIFT: u32 = IOC_NRSHIFT + IOC_NRBITS;
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+const IOC_SIZESHIFT: u32 = IOC_TYPESHIFT + IOC_TYPEBITS;
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+const IOC_DIRSHIFT: u32 = IOC_SIZESHIFT + IOC_SIZEBITS;
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+const IOC_READ: u32 = 2;
+
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+const fn ioc(dir: u32, type_: u32, nr: u32, size: u32) -> libc::c_ulong {
+    ((dir << IOC_DIRSHIFT)
+        | (type_ << IOC_TYPESHIFT)
+        | (nr << IOC_NRSHIFT)
+        | (size << IOC_SIZESHIFT)) as libc::c_ulong
+}
+
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+const fn eviocgabs(axis: u16) -> libc::c_ulong {
+    ioc(
+        IOC_READ,
+        b'E' as u32,
+        0x40 + axis as u32,
+        std::mem::size_of::<LinuxInputAbsInfo>() as u32,
+    )
 }
 
 #[cfg(feature = "lvgl_ui")]
@@ -851,6 +1353,37 @@ impl LvglUiCore {
                 Self::to_coord(10),
             );
 
+            let back_button = lvgl_sys::lv_obj_create(root);
+            lvgl_sys::lv_obj_set_pos(back_button, Self::to_coord(8), Self::to_coord(6));
+            lvgl_sys::lv_obj_set_size(back_button, Self::to_coord(80), Self::to_coord(30));
+            lvgl_sys::lv_obj_set_style_radius(back_button, 15, 0);
+            lvgl_sys::lv_obj_set_style_bg_color(
+                back_button,
+                lvgl_sys::_LV_COLOR_MAKE(56, 60, 68),
+                0,
+            );
+            lvgl_sys::lv_obj_set_style_border_width(back_button, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_top(back_button, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_bottom(back_button, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_left(back_button, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_right(back_button, 0, 0);
+            lvgl_sys::lv_obj_clear_flag(back_button, lvgl_sys::LV_OBJ_FLAG_SCROLLABLE);
+            lvgl_sys::lv_obj_add_flag(back_button, lvgl_sys::LV_OBJ_FLAG_HIDDEN);
+
+            let back_button_label = lvgl_sys::lv_label_create(back_button);
+            Self::set_label_text(back_button_label, "< Back");
+            lvgl_sys::lv_obj_set_style_text_color(
+                back_button_label,
+                lvgl_sys::_LV_COLOR_MAKE(255, 255, 255),
+                0,
+            );
+            lvgl_sys::lv_obj_align(
+                back_button_label,
+                lvgl_sys::LV_ALIGN_CENTER as lvgl_sys::lv_align_t,
+                0,
+                0,
+            );
+
             let clock_label = lvgl_sys::lv_label_create(root);
             lvgl_sys::lv_obj_set_style_text_color(
                 clock_label,
@@ -955,6 +1488,104 @@ impl LvglUiCore {
                 app_icon_boxes[i] = icon_box;
                 app_icon_labels[i] = icon_label;
                 app_title_labels[i] = title_label;
+            }
+
+            let launcher_panel_alt = lvgl_sys::lv_obj_create(root);
+            lvgl_sys::lv_obj_set_pos(
+                launcher_panel_alt,
+                Self::to_coord(width + 20),
+                Self::to_coord(TOP_BAR_HEIGHT),
+            );
+            lvgl_sys::lv_obj_set_size(
+                launcher_panel_alt,
+                Self::to_coord(width),
+                Self::to_coord(height - TOP_BAR_HEIGHT),
+            );
+            lvgl_sys::lv_obj_set_style_bg_color(
+                launcher_panel_alt,
+                lvgl_sys::_LV_COLOR_MAKE(30, 30, 32),
+                0,
+            );
+            lvgl_sys::lv_obj_set_style_border_width(launcher_panel_alt, 0, 0);
+            lvgl_sys::lv_obj_set_style_radius(launcher_panel_alt, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_top(launcher_panel_alt, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_bottom(launcher_panel_alt, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_left(launcher_panel_alt, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_right(launcher_panel_alt, 0, 0);
+            lvgl_sys::lv_obj_clear_flag(launcher_panel_alt, lvgl_sys::LV_OBJ_FLAG_SCROLLABLE);
+            lvgl_sys::lv_obj_set_scrollbar_mode(
+                launcher_panel_alt,
+                lvgl_sys::LV_SCROLLBAR_MODE_OFF as lvgl_sys::lv_scrollbar_mode_t,
+            );
+
+            let branding_label_alt = lvgl_sys::lv_label_create(launcher_panel_alt);
+            Self::set_label_text(branding_label_alt, "LinTX");
+            lvgl_sys::lv_obj_set_style_text_color(
+                branding_label_alt,
+                lvgl_sys::lv_color_t { full: 0xFFFF },
+                0,
+            );
+            lvgl_sys::lv_obj_set_style_text_font(
+                branding_label_alt,
+                &lvgl_sys::lv_font_montserrat_48 as *const _ as *const lvgl_sys::lv_font_t,
+                0,
+            );
+            lvgl_sys::lv_obj_align(
+                branding_label_alt,
+                lvgl_sys::LV_ALIGN_TOP_MID as lvgl_sys::lv_align_t,
+                0,
+                60,
+            );
+
+            let mut app_cards_alt = [std::ptr::null_mut(); 8];
+            let mut app_icon_boxes_alt = [std::ptr::null_mut(); 8];
+            let mut app_icon_labels_alt = [std::ptr::null_mut(); 8];
+            let mut app_title_labels_alt = [std::ptr::null_mut(); 8];
+
+            for i in 0..8 {
+                let card = lvgl_sys::lv_obj_create(launcher_panel_alt);
+                lvgl_sys::lv_obj_set_style_bg_opa(card, 0, 0);
+                lvgl_sys::lv_obj_set_style_border_width(card, 0, 0);
+                lvgl_sys::lv_obj_set_style_pad_top(card, 0, 0);
+                lvgl_sys::lv_obj_set_style_pad_bottom(card, 0, 0);
+                lvgl_sys::lv_obj_set_style_pad_left(card, 0, 0);
+                lvgl_sys::lv_obj_set_style_pad_right(card, 0, 0);
+                lvgl_sys::lv_obj_clear_flag(card, lvgl_sys::LV_OBJ_FLAG_SCROLLABLE);
+
+                let icon_box = lvgl_sys::lv_obj_create(card);
+                lvgl_sys::lv_obj_set_style_radius(icon_box, 16, 0);
+                lvgl_sys::lv_obj_set_style_border_width(icon_box, 0, 0);
+                lvgl_sys::lv_obj_clear_flag(icon_box, lvgl_sys::LV_OBJ_FLAG_SCROLLABLE);
+
+                let icon_label = lvgl_sys::lv_label_create(icon_box);
+                lvgl_sys::lv_obj_set_style_text_color(
+                    icon_label,
+                    lvgl_sys::_LV_COLOR_MAKE(255, 255, 255),
+                    0,
+                );
+                lvgl_sys::lv_obj_align(
+                    icon_label,
+                    lvgl_sys::LV_ALIGN_CENTER as lvgl_sys::lv_align_t,
+                    0,
+                    0,
+                );
+
+                let title_label = lvgl_sys::lv_label_create(card);
+                lvgl_sys::lv_obj_set_style_text_color(
+                    title_label,
+                    lvgl_sys::_LV_COLOR_MAKE(220, 220, 220),
+                    0,
+                );
+                lvgl_sys::lv_obj_set_style_text_align(
+                    title_label,
+                    lvgl_sys::LV_TEXT_ALIGN_CENTER as lvgl_sys::lv_text_align_t,
+                    0,
+                );
+
+                app_cards_alt[i] = card;
+                app_icon_boxes_alt[i] = icon_box;
+                app_icon_labels_alt[i] = icon_label;
+                app_title_labels_alt[i] = title_label;
             }
 
             let app_panel = lvgl_sys::lv_obj_create(root);
@@ -1139,7 +1770,9 @@ impl LvglUiCore {
                 status_label,
                 clock_label,
                 page_label,
+                back_button,
                 launcher_panel,
+                launcher_panel_alt,
                 app_panel,
                 app_header_card,
                 app_badge_label,
@@ -1153,26 +1786,40 @@ impl LvglUiCore {
                 app_list_lines,
                 app_hint_label,
                 branding_label,
+                branding_label_alt,
                 app_cards,
+                app_cards_alt,
                 app_icon_boxes,
+                app_icon_boxes_alt,
                 app_icon_labels,
+                app_icon_labels_alt,
                 app_title_labels,
+                app_title_labels_alt,
             });
         }
     }
 
-    fn update_launcher(&self, frame: &UiFrame, ui: &LvglUiObjects) {
-        let p = page(frame.launcher_page);
+    fn update_launcher_panel(
+        &self,
+        page_idx: usize,
+        selected: Option<(usize, usize)>,
+        branding_label: *mut lvgl_sys::lv_obj_t,
+        app_cards: &[*mut lvgl_sys::lv_obj_t; 8],
+        app_icon_boxes: &[*mut lvgl_sys::lv_obj_t; 8],
+        app_icon_labels: &[*mut lvgl_sys::lv_obj_t; 8],
+        app_title_labels: &[*mut lvgl_sys::lv_obj_t; 8],
+    ) {
+        let p = page(page_idx);
         let panel_h = (self.height as i32 - TOP_BAR_HEIGHT - 20).max(120);
         let panel_w = self.width as i32 - 40;
 
-        let is_home = frame.launcher_page == 0;
+        let is_home = page_idx == 0;
 
         unsafe {
             if is_home {
-                lvgl_sys::lv_obj_clear_flag(ui.branding_label, lvgl_sys::LV_OBJ_FLAG_HIDDEN);
+                lvgl_sys::lv_obj_clear_flag(branding_label, lvgl_sys::LV_OBJ_FLAG_HIDDEN);
             } else {
-                lvgl_sys::lv_obj_add_flag(ui.branding_label, lvgl_sys::LV_OBJ_FLAG_HIDDEN);
+                lvgl_sys::lv_obj_add_flag(branding_label, lvgl_sys::LV_OBJ_FLAG_HIDDEN);
             }
         }
 
@@ -1187,15 +1834,15 @@ impl LvglUiCore {
             let row = idx / 4;
             let col = idx % 4;
 
-            let card = ui.app_cards[idx];
-            let icon_box = ui.app_icon_boxes[idx];
-            let title_label = ui.app_title_labels[idx];
-            let icon_label = ui.app_icon_labels[idx];
+            let card = app_cards[idx];
+            let icon_box = app_icon_boxes[idx];
+            let title_label = app_title_labels[idx];
+            let icon_label = app_icon_labels[idx];
 
             if row < p.rows {
-                if let Some(app) = app_at(frame.launcher_page, row, col) {
+                if let Some(app) = app_at(page_idx, row, col) {
                     let spec = app_spec(app);
-                    let is_selected = row == frame.selected_row && col == frame.selected_col;
+                    let is_selected = selected == Some((row, col));
 
                     let x = 20 + col as i32 * (cell_w + col_gap);
                     let mut y = 20 + row as i32 * (cell_h + row_gap);
@@ -1292,6 +1939,18 @@ impl LvglUiCore {
         }
     }
 
+    fn update_launcher(&self, frame: &UiFrame, ui: &LvglUiObjects) {
+        self.update_launcher_panel(
+            frame.launcher_page,
+            Some((frame.selected_row, frame.selected_col)),
+            ui.branding_label,
+            &ui.app_cards,
+            &ui.app_icon_boxes,
+            &ui.app_icon_labels,
+            &ui.app_title_labels,
+        );
+    }
+
     fn update_app_page(&self, frame: &UiFrame, ui: &LvglUiObjects, app: AppId) {
         let data = self.app_template_data(frame, app);
 
@@ -1371,38 +2030,148 @@ impl LvglUiCore {
         let page_txt = format!("Page {}/{}", frame.launcher_page + 1, PAGE_SPECS.len());
         Self::set_label_text(ui.page_label, &page_txt);
 
+        let hidden_right = self.hidden_right();
+        let hidden_left = self.hidden_left();
+        let prev_page = self.last_page;
+        let prev_launcher_page = self.last_launcher_page;
+
+        if self.last_page.is_none() {
+            self.current_launcher_x = 0;
+            self.target_launcher_x = 0;
+            self.current_app_x = if matches!(frame.page, UiPage::App(_)) {
+                0
+            } else {
+                hidden_right
+            };
+            self.target_app_x = self.current_app_x;
+        } else if prev_page != Some(frame.page) {
+            match (prev_page, frame.page) {
+                (Some(UiPage::Launcher), UiPage::App(_)) => {
+                    self.current_launcher_x = 0;
+                    self.target_launcher_x = 0;
+                    self.current_app_x = hidden_right;
+                    self.target_app_x = 0;
+                }
+                (Some(UiPage::App(_)), UiPage::Launcher) => {
+                    self.current_launcher_x = 0;
+                    self.target_launcher_x = 0;
+                    self.current_app_x = self.drag_offset_x.unwrap_or(0).max(0);
+                    self.target_app_x = hidden_right;
+                }
+                _ => {}
+            }
+        } else if matches!(frame.page, UiPage::Launcher)
+            && prev_launcher_page != frame.launcher_page
+        {
+            self.launcher_transition_from = Some(prev_launcher_page);
+            self.current_launcher_x = if frame.launcher_page > prev_launcher_page {
+                hidden_right
+            } else {
+                hidden_left
+            };
+            self.target_launcher_x = 0;
+        }
+
         match frame.page {
             UiPage::Launcher => {
+                let mut alt_page = None;
+                let mut alt_x = hidden_right;
+                if let Some(drag_x) = self.drag_offset_x {
+                    self.current_launcher_x = drag_x.clamp(hidden_left / 2, hidden_right / 2);
+                    self.target_launcher_x = self.current_launcher_x;
+                    if drag_x < 0 && frame.launcher_page + 1 < PAGE_SPECS.len() {
+                        alt_page = Some(frame.launcher_page + 1);
+                        alt_x = self.current_launcher_x + hidden_right;
+                    } else if drag_x > 0 && frame.launcher_page > 0 {
+                        alt_page = Some(frame.launcher_page - 1);
+                        alt_x = self.current_launcher_x - hidden_right;
+                    }
+                } else {
+                    self.target_launcher_x = 0;
+                    Self::animate_axis(&mut self.current_launcher_x, self.target_launcher_x);
+                    if let Some(from_page) = self.launcher_transition_from {
+                        alt_page = Some(from_page);
+                        alt_x = if frame.launcher_page > from_page {
+                            self.current_launcher_x - hidden_right
+                        } else {
+                            self.current_launcher_x + hidden_right
+                        };
+                        if self.current_launcher_x == self.target_launcher_x {
+                            self.launcher_transition_from = None;
+                        }
+                    }
+                }
+                Self::animate_axis(&mut self.current_app_x, self.target_app_x);
+
                 unsafe {
+                    lvgl_sys::lv_obj_add_flag(ui.back_button, lvgl_sys::LV_OBJ_FLAG_HIDDEN);
                     lvgl_sys::lv_obj_set_pos(
                         ui.launcher_panel,
-                        Self::to_coord(0),
+                        Self::to_coord(self.current_launcher_x),
                         Self::to_coord(TOP_BAR_HEIGHT),
                     );
                     lvgl_sys::lv_obj_set_pos(
                         ui.app_panel,
-                        Self::to_coord(self.width as i32 + 20),
+                        Self::to_coord(self.current_app_x),
+                        Self::to_coord(TOP_BAR_HEIGHT),
+                    );
+                    lvgl_sys::lv_obj_set_pos(
+                        ui.launcher_panel_alt,
+                        Self::to_coord(alt_page.map(|_| alt_x).unwrap_or(hidden_right)),
                         Self::to_coord(TOP_BAR_HEIGHT),
                     );
                 }
                 self.update_launcher(frame, ui);
+                if let Some(page_idx) = alt_page {
+                    self.update_launcher_panel(
+                        page_idx,
+                        None,
+                        ui.branding_label_alt,
+                        &ui.app_cards_alt,
+                        &ui.app_icon_boxes_alt,
+                        &ui.app_icon_labels_alt,
+                        &ui.app_title_labels_alt,
+                    );
+                }
             }
             UiPage::App(app) => {
+                if let Some(drag_x) = self.drag_offset_x {
+                    self.current_app_x = if drag_x > 0 {
+                        drag_x.clamp(0, hidden_right)
+                    } else {
+                        (drag_x / 4).clamp(hidden_left / 4, 0)
+                    };
+                    self.target_app_x = self.current_app_x;
+                } else {
+                    self.target_app_x = 0;
+                    Self::animate_axis(&mut self.current_app_x, self.target_app_x);
+                }
+
                 unsafe {
+                    lvgl_sys::lv_obj_clear_flag(ui.back_button, lvgl_sys::LV_OBJ_FLAG_HIDDEN);
                     lvgl_sys::lv_obj_set_pos(
                         ui.launcher_panel,
-                        Self::to_coord(self.width as i32 + 20),
+                        Self::to_coord(0),
+                        Self::to_coord(TOP_BAR_HEIGHT),
+                    );
+                    lvgl_sys::lv_obj_set_pos(
+                        ui.launcher_panel_alt,
+                        Self::to_coord(hidden_right),
                         Self::to_coord(TOP_BAR_HEIGHT),
                     );
                     lvgl_sys::lv_obj_set_pos(
                         ui.app_panel,
-                        Self::to_coord(0),
+                        Self::to_coord(self.current_app_x),
                         Self::to_coord(TOP_BAR_HEIGHT),
                     );
                 }
+                self.update_launcher(frame, ui);
                 self.update_app_page(frame, ui, app);
             }
         }
+
+        self.last_page = Some(frame.page);
+        self.last_launcher_page = frame.launcher_page;
     }
 }
 
@@ -1560,6 +2329,16 @@ impl LvglBackend for SdlBackend {
         use sdl2::event::Event;
         use sdl2::keyboard::Keycode;
 
+        if let Some(evt) = self.pointer.pop_event() {
+            return Some(evt);
+        }
+
+        let (window_w, window_h) = self
+            .canvas
+            .as_ref()
+            .and_then(|canvas| canvas.output_size().ok())
+            .unwrap_or((self.core.width, self.core.height));
+        let logical_size = (self.core.width, self.core.height);
         let event_pump = self.event_pump.as_mut()?;
         for event in event_pump.poll_iter() {
             match event {
@@ -1600,13 +2379,64 @@ impl LvglBackend for SdlBackend {
                     keycode: Some(Keycode::RightBracket),
                     ..
                 } => return Some(UiInputEvent::PageNext),
+                Event::MouseButtonDown {
+                    mouse_btn: sdl2::mouse::MouseButton::Left,
+                    x,
+                    y,
+                    ..
+                } => {
+                    let (x, y) = Self::window_to_logical(
+                        logical_size.0,
+                        logical_size.1,
+                        window_w,
+                        window_h,
+                        x,
+                        y,
+                    );
+                    self.pointer.begin(x, y);
+                }
+                Event::MouseMotion {
+                    x, y, mousestate, ..
+                } if mousestate.left() => {
+                    let (x, y) = Self::window_to_logical(
+                        logical_size.0,
+                        logical_size.1,
+                        window_w,
+                        window_h,
+                        x,
+                        y,
+                    );
+                    self.pointer.update(x, y);
+                }
+                Event::MouseButtonUp {
+                    mouse_btn: sdl2::mouse::MouseButton::Left,
+                    x,
+                    y,
+                    ..
+                } => {
+                    let (x, y) = Self::window_to_logical(
+                        logical_size.0,
+                        logical_size.1,
+                        window_w,
+                        window_h,
+                        x,
+                        y,
+                    );
+                    self.pointer.end(x, y);
+                    if let Some(evt) = self.pointer.pop_event() {
+                        return Some(evt);
+                    }
+                }
                 _ => {}
             }
         }
-        None
+        self.pointer.pop_event()
     }
 
     fn render(&mut self, frame: &UiFrame) {
+        self.pointer
+            .update_snapshot(frame, self.core.width, self.core.height);
+        self.core.set_drag_offset(self.pointer.drag_offset_x());
         self.core.sync_ui(frame);
         self.core.start_frame();
 
@@ -1794,9 +2624,24 @@ impl LinuxFramebuffer {
 
 #[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
 impl FbdevBackend {
-    fn new(device: String, width: u32, height: u32) -> Self {
+    fn new(device: String, touch_device: Option<String>, width: u32, height: u32) -> Self {
         let framebuffer = LinuxFramebuffer::open(&device)
             .unwrap_or_else(|err| panic!("failed to open {device}: {err}"));
+        let touch_input =
+            touch_device
+                .as_deref()
+                .and_then(|path| match EvdevTouchInput::open(path) {
+                    Ok(input) => {
+                        super::debug_log(&format!("FbdevBackend::new touch input opened: {path}"));
+                        Some(input)
+                    }
+                    Err(err) => {
+                        super::debug_log(&format!(
+                            "FbdevBackend::new touch input open failed path={path}: {err}"
+                        ));
+                        None
+                    }
+                });
         super::debug_log(&format!(
             "FbdevBackend::new device={} actual={}x{} bpp={} stride={} rotate={} swap_rb={}",
             device,
@@ -1810,6 +2655,8 @@ impl FbdevBackend {
         Self {
             core: LvglUiCore::new(width, height),
             framebuffer,
+            touch_input,
+            pointer: PointerInputAdapter::default(),
         }
     }
 }
@@ -1849,10 +2696,19 @@ impl LvglBackend for FbdevBackend {
     }
 
     fn poll_event(&mut self) -> Option<UiInputEvent> {
-        None
+        if let Some(evt) = self.pointer.pop_event() {
+            return Some(evt);
+        }
+        if let Some(touch) = self.touch_input.as_mut() {
+            touch.read_events(self.core.width, self.core.height, &mut self.pointer);
+        }
+        self.pointer.pop_event()
     }
 
     fn render(&mut self, frame: &UiFrame) {
+        self.pointer
+            .update_snapshot(frame, self.core.width, self.core.height);
+        self.core.set_drag_offset(self.pointer.drag_offset_x());
         self.core.sync_ui(frame);
         self.core.start_frame();
     }

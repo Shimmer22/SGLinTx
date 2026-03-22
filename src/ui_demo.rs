@@ -17,6 +17,9 @@ struct Cli {
     #[arg(long, default_value = "/dev/fb0")]
     fb_device: String,
 
+    #[arg(long)]
+    touch_device: Option<String>,
+
     #[arg(long, default_value_t = 30)]
     fps: u32,
 
@@ -37,11 +40,17 @@ fn ui_demo_main(argc: u32, argv: *const &str) {
         }
     };
     crate::ui::debug_log(&format!(
-        "ui_demo args backend={} fb_device={} fps={} size={}x{}",
-        args.backend, args.fb_device, args.fps, args.width, args.height
+        "ui_demo args backend={} fb_device={} touch_device={:?} fps={} size={}x{}",
+        args.backend, args.fb_device, args.touch_device, args.fps, args.width, args.height
     ));
 
-    let backend_kind = BackendKind::parse(&args.backend, &args.fb_device, args.width, args.height);
+    let backend_kind = BackendKind::parse(
+        &args.backend,
+        &args.fb_device,
+        args.touch_device.as_deref(),
+        args.width,
+        args.height,
+    );
     let mut backend = new_backend(backend_kind);
     crate::ui::debug_log("ui backend created");
 
