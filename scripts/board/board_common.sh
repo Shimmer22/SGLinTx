@@ -9,6 +9,7 @@ UI_WIDTH="800"
 UI_HEIGHT="480"
 FB_ROTATE="270"
 FB_SWAP_RB="1"
+TOUCH_DEVICE="${TOUCH_DEVICE:-auto}"
 
 mkdir -p "$LOG_DIR"
 
@@ -29,10 +30,28 @@ start_server() {
 }
 
 start_ui_fb() {
+    touch_args=""
+    touch_device="$TOUCH_DEVICE"
+    if [ "$touch_device" = "auto" ]; then
+        for event in /dev/input/event*; do
+            [ -e "$event" ] || continue
+            event_name=$(basename "$event")
+            dev_name=$(cat "/sys/class/input/$event_name/device/name" 2>/dev/null || true)
+            case "$dev_name" in
+                *Touchscreen*|*touchscreen*|*CST128A*)
+                    touch_device="$event"
+                    break
+                    ;;
+            esac
+        done
+    fi
+    if [ -n "$touch_device" ] && [ "$touch_device" != "auto" ]; then
+        touch_args="--touch-device $touch_device"
+    fi
     LINTX_SOCKET_PATH="$SOCKET_PATH" \
     LINTX_FB_ROTATE="$FB_ROTATE" \
     LINTX_FB_SWAP_RB="$FB_SWAP_RB" \
-    "$BIN" -- ui_demo --backend fb --fb-device /dev/fb0 --width "$UI_WIDTH" --height "$UI_HEIGHT" \
+    "$BIN" -- ui_demo --backend fb --fb-device /dev/fb0 $touch_args --width "$UI_WIDTH" --height "$UI_HEIGHT" \
     >"$LOG_DIR/ui.log" 2>&1 &
 }
 
@@ -47,5 +66,5 @@ show_status() {
         tail -n 20 "$log" || true
     done
     echo
-    echo "UI_WIDTH=$UI_WIDTH UI_HEIGHT=$UI_HEIGHT FB_ROTATE=$FB_ROTATE FB_SWAP_RB=$FB_SWAP_RB"
+    echo "UI_WIDTH=$UI_WIDTH UI_HEIGHT=$UI_HEIGHT FB_ROTATE=$FB_ROTATE FB_SWAP_RB=$FB_SWAP_RB TOUCH_DEVICE=$TOUCH_DEVICE"
 }

@@ -10,7 +10,7 @@
 - `cargo check` : fast validation for the host target.
 - `cargo check --features sdl_ui` : validate LVGL/SDL UI path.
 - `cargo check --target x86_64-pc-windows-gnu` : verify Windows build.
-- `cross build --target riscv64gc-unknown-linux-musl --release` : produce board binary.
+- `cross build --target riscv64gc-unknown-linux-musl --release --features lvgl_ui` : produce board GUI binary.
 - `cargo run -- --server` : start Unix socket server (`./rpsocket`).
 - `cargo run -- -- ui_demo --backend sdl --width 800 --height 480 --fps 30` : launch SDL UI client.
 

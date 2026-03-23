@@ -633,6 +633,20 @@ impl PointerUiSnapshot {
 
 #[cfg(any(feature = "sdl_ui", all(feature = "lvgl_ui", target_os = "linux")))]
 impl PointerInputAdapter {
+    const TAP_SLOP: i32 = 32;
+
+    fn touch_debug_enabled() -> bool {
+        std::env::var("LINTX_TOUCH_DEBUG")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
+            .unwrap_or(false)
+    }
+
+    fn touch_debug_log(msg: &str) {
+        if Self::touch_debug_enabled() {
+            super::debug_log(msg);
+        }
+    }
+
     fn update_snapshot(&mut self, frame: &UiFrame, width: u32, height: u32) {
         self.snapshot = Some(PointerUiSnapshot::from_frame(frame, width, height));
     }
@@ -648,6 +662,7 @@ impl PointerInputAdapter {
     }
 
     fn begin(&mut self, x: i32, y: i32) {
+        Self::touch_debug_log(&format!("touch begin x={x} y={y}"));
         self.gesture.pressed = true;
         self.gesture.start = (x, y);
         self.gesture.current = (x, y);
@@ -655,6 +670,7 @@ impl PointerInputAdapter {
 
     fn update(&mut self, x: i32, y: i32) {
         if self.gesture.pressed {
+            Self::touch_debug_log(&format!("touch update x={x} y={y}"));
             self.gesture.current = (x, y);
         }
     }
@@ -675,33 +691,57 @@ impl PointerInputAdapter {
         let dy = self.gesture.current.1 - self.gesture.start.1;
         let abs_dx = dx.abs();
         let abs_dy = dy.abs();
+        Self::touch_debug_log(&format!(
+            "touch end x={} y={} dx={} dy={} abs_dx={} abs_dy={} page={:?} launcher_page={}",
+            x, y, dx, dy, abs_dx, abs_dy, snapshot.page, snapshot.launcher_page
+        ));
 
         if abs_dx >= 48 && abs_dx > abs_dy {
             match snapshot.swipe_action(dx) {
                 Some(PointerSwipeAction::PrevPage) => {
+                    Self::touch_debug_log("touch gesture -> UiInputEvent::PagePrev");
                     self.pending_events.push_back(UiInputEvent::PagePrev)
                 }
                 Some(PointerSwipeAction::NextPage) => {
+                    Self::touch_debug_log("touch gesture -> UiInputEvent::PageNext");
                     self.pending_events.push_back(UiInputEvent::PageNext)
                 }
-                Some(PointerSwipeAction::Back) => self.pending_events.push_back(UiInputEvent::Back),
+                Some(PointerSwipeAction::Back) => {
+                    Self::touch_debug_log("touch gesture -> UiInputEvent::Back");
+                    self.pending_events.push_back(UiInputEvent::Back)
+                }
                 None => {}
             }
             return;
         }
 
-        if abs_dx <= 18 && abs_dy <= 18 {
-            match snapshot.tap_action(x, y) {
+        if abs_dx <= Self::TAP_SLOP && abs_dy <= Self::TAP_SLOP {
+            let tap_x = (self.gesture.start.0 + x) / 2;
+            let tap_y = (self.gesture.start.1 + y) / 2;
+            Self::touch_debug_log(&format!(
+                "touch tap candidate x={} y={} start=({}, {}) end=({}, {})",
+                tap_x, tap_y, self.gesture.start.0, self.gesture.start.1, x, y
+            ));
+            match snapshot.tap_action(tap_x, tap_y) {
                 Some(PointerTapAction::OpenLauncherApp { row, col }) => {
+                    Self::touch_debug_log(&format!(
+                        "touch tap -> launcher app row={} col={}",
+                        row, col
+                    ));
                     for evt in self.align_selection(snapshot, row, col) {
+                        Self::touch_debug_log(&format!("touch align -> {:?}", evt));
                         self.pending_events.push_back(evt);
                     }
+                    Self::touch_debug_log("touch tap -> UiInputEvent::Open");
                     self.pending_events.push_back(UiInputEvent::Open);
                 }
                 Some(PointerTapAction::BackButton) => {
+                    Self::touch_debug_log("touch tap -> UiInputEvent::Back");
                     self.pending_events.push_back(UiInputEvent::Back);
                 }
-                None => {}
+                None => {
+                    Self::touch_debug_log("touch tap candidate -> no hit");
+                }
             }
         }
     }
@@ -767,6 +807,7 @@ struct EvdevTouchInput {
     file: std::fs::File,
     x_axis: Option<EvdevAxisCalibration>,
     y_axis: Option<EvdevAxisCalibration>,
+    rotate_degrees: u16,
     pressed: bool,
     x: i32,
     y: i32,
@@ -946,6 +987,18 @@ impl SdlBackend {
 
 #[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
 impl EvdevTouchInput {
+    fn touch_debug_enabled() -> bool {
+        std::env::var("LINTX_TOUCH_DEBUG")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
+            .unwrap_or(false)
+    }
+
+    fn touch_debug_log(msg: &str) {
+        if Self::touch_debug_enabled() {
+            super::debug_log(msg);
+        }
+    }
+
     fn open(path: &str) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).open(path)?;
         let fd = file.as_raw_fd();
@@ -962,6 +1015,11 @@ impl EvdevTouchInput {
                 .or_else(|| Self::axis_calibration(fd, ABS_X)),
             y_axis: Self::axis_calibration(fd, ABS_MT_POSITION_Y)
                 .or_else(|| Self::axis_calibration(fd, ABS_Y)),
+            rotate_degrees: std::env::var("LINTX_FB_ROTATE")
+                .ok()
+                .and_then(|v| v.parse::<u16>().ok())
+                .map(|v| v % 360)
+                .unwrap_or(0),
             file,
             pressed: false,
             x: 0,
@@ -1009,6 +1067,10 @@ impl EvdevTouchInput {
 
             match event.type_ {
                 EV_KEY if event.code == BTN_TOUCH => {
+                    Self::touch_debug_log(&format!(
+                        "evdev key code=0x{:x} value={}",
+                        event.code, event.value
+                    ));
                     if event.value > 0 {
                         self.pressed = true;
                     } else {
@@ -1017,25 +1079,63 @@ impl EvdevTouchInput {
                 }
                 EV_ABS => match event.code {
                     ABS_X | ABS_MT_POSITION_X => {
-                        self.x = self.scale_axis(event.value, self.x_axis.as_ref(), width)
+                        let (phys_w, _) = self.touch_extent(width, height);
+                        self.x = self.scale_axis(event.value, self.x_axis.as_ref(), phys_w)
                     }
                     ABS_Y | ABS_MT_POSITION_Y => {
-                        self.y = self.scale_axis(event.value, self.y_axis.as_ref(), height)
+                        let (_, phys_h) = self.touch_extent(width, height);
+                        self.y = self.scale_axis(event.value, self.y_axis.as_ref(), phys_h)
                     }
                     _ => {}
                 },
                 EV_SYN if event.code == SYN_REPORT => {
+                    let (logical_x, logical_y) = self.map_touch_to_logical(width, height);
+                    Self::touch_debug_log(&format!(
+                        "evdev syn pressed={} raw=({}, {}) mapped=({}, {}) rotate={}",
+                        self.pressed, self.x, self.y, logical_x, logical_y, self.rotate_degrees
+                    ));
                     if self.pressed && !pointer.gesture.pressed {
-                        pointer.begin(self.x, self.y);
+                        pointer.begin(logical_x, logical_y);
                     } else if self.pressed {
-                        pointer.update(self.x, self.y);
+                        pointer.update(logical_x, logical_y);
                     } else if pointer.gesture.pressed {
-                        pointer.end(self.x, self.y);
+                        pointer.end(logical_x, logical_y);
                     }
                 }
                 _ => {}
             }
         }
+    }
+
+    fn touch_extent(&self, width: u32, height: u32) -> (u32, u32) {
+        match self.rotate_degrees {
+            90 | 270 => (height, width),
+            _ => (width, height),
+        }
+    }
+
+    fn map_touch_to_logical(&self, width: u32, height: u32) -> (i32, i32) {
+        let logical_w = width as i32;
+        let logical_h = height as i32;
+        let phys_h = self.touch_extent(width, height).1 as i32;
+
+        let (x, y) = match self.rotate_degrees {
+            90 => (self.y, (logical_h - 1 - self.x).clamp(0, logical_h.saturating_sub(1))),
+            180 => (
+                (logical_w - 1 - self.x).clamp(0, logical_w.saturating_sub(1)),
+                (logical_h - 1 - self.y).clamp(0, logical_h.saturating_sub(1)),
+            ),
+            270 => (
+                (phys_h - 1 - self.y).clamp(0, logical_w.saturating_sub(1)),
+                (logical_h - 1 - self.x).clamp(0, logical_h.saturating_sub(1)),
+            ),
+            _ => (
+                self.x.clamp(0, logical_w.saturating_sub(1)),
+                self.y.clamp(0, logical_h.saturating_sub(1)),
+            ),
+        };
+
+        (x, y)
     }
 
     fn scale_axis(&self, value: i32, axis: Option<&EvdevAxisCalibration>, extent: u32) -> i32 {

@@ -23,10 +23,11 @@ cargo check
 rustup target add x86_64-pc-windows-gnu
 cargo check --target x86_64-pc-windows-gnu
 
-# 4. 使用 cross 编译 RISC-V（已配置自定义镜像）
-cross build --target riscv64gc-unknown-linux-musl --release
+# 4. 使用 cross 编译 RISC-V 板端 GUI 包（已配置自定义镜像）
+cross build --target riscv64gc-unknown-linux-musl --release --features lvgl_ui
 ```
 编译完成后，二进制位于 `target/riscv64gc-unknown-linux-musl/release/LinTx`。
+注意：板端 `fb` UI 依赖 `lvgl_ui` feature；如果不带这个 feature，`ui_demo --backend fb` 会退化成文本终端后端，不会打开 `/dev/fb0`。
 
 ### 可选功能
 - `joydev_input`：启用 Linux `joydev` 输入模块
