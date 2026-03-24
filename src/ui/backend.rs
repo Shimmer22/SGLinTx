@@ -7,7 +7,7 @@ use std::{
     fs::OpenOptions,
     io,
     mem::MaybeUninit,
-    os::{fd::AsRawFd, unix::fs::FileExt},
+    os::fd::AsRawFd,
 };
 
 #[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
@@ -404,7 +404,7 @@ pub fn new_backend(kind: BackendKind) -> Box<dyn LvglBackend> {
 #[cfg(any(feature = "sdl_ui", all(feature = "lvgl_ui", target_os = "linux")))]
 const TOP_BAR_HEIGHT: i32 = 44;
 #[cfg(feature = "lvgl_ui")]
-const LVGL_DRAW_BUF_PIXELS: usize = 800 * 80;
+const LVGL_DRAW_BUF_PIXELS: usize = 800 * 480;
 
 #[cfg(feature = "lvgl_ui")]
 struct LvglUiObjects {
@@ -439,6 +439,7 @@ struct LvglUiObjects {
 }
 
 #[cfg(feature = "lvgl_ui")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct AppTemplateData {
     accent: (u8, u8, u8),
     badge: String,
@@ -467,6 +468,12 @@ struct LvglUiCore {
     last_page: Option<UiPage>,
     last_launcher_page: usize,
     launcher_transition_from: Option<usize>,
+    last_synced_frame: Option<UiFrame>,
+    last_alt_launcher_page: Option<usize>,
+    last_launcher_panel_pos: Option<(i32, i32)>,
+    last_launcher_panel_alt_pos: Option<(i32, i32)>,
+    last_app_panel_pos: Option<(i32, i32)>,
+    back_button_hidden: bool,
 }
 
 #[cfg(feature = "sdl_ui")]
@@ -490,6 +497,10 @@ struct FbdevBackend {
 #[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
 struct LinuxFramebuffer {
     file: std::fs::File,
+    map: *mut u8,
+    map_len: usize,
+    shadow: Vec<u8>,
+    dirty: Option<(u32, u32, u32, u32)>,
     row_scratch: Vec<u8>,
     width: u32,
     height: u32,
@@ -504,6 +515,17 @@ struct LinuxFramebuffer {
     transp: LinuxFbBitfield,
     rotate_degrees: u16,
     swap_rb: bool,
+}
+
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+impl Drop for LinuxFramebuffer {
+    fn drop(&mut self) {
+        if !self.map.is_null() && self.map_len != 0 {
+            unsafe {
+                libc::munmap(self.map.cast(), self.map_len);
+            }
+        }
+    }
 }
 
 #[cfg(feature = "sdl_ui")]
@@ -855,6 +877,12 @@ impl LvglUiCore {
             last_page: None,
             last_launcher_page: 0,
             launcher_transition_from: None,
+            last_synced_frame: None,
+            last_alt_launcher_page: None,
+            last_launcher_panel_pos: None,
+            last_launcher_panel_alt_pos: None,
+            last_app_panel_pos: None,
+            back_button_hidden: true,
         }
     }
 
@@ -869,6 +897,35 @@ impl LvglUiCore {
 
     fn clamp_pct(v: i32) -> u8 {
         v.clamp(0, 100) as u8
+    }
+
+    fn set_obj_pos_if_changed(
+        obj: *mut lvgl_sys::lv_obj_t,
+        cache: &mut Option<(i32, i32)>,
+        x: i32,
+        y: i32,
+    ) {
+        if *cache == Some((x, y)) {
+            return;
+        }
+        unsafe {
+            lvgl_sys::lv_obj_set_pos(obj, Self::to_coord(x), Self::to_coord(y));
+        }
+        *cache = Some((x, y));
+    }
+
+    fn set_hidden_if_changed(obj: *mut lvgl_sys::lv_obj_t, hidden: bool, cache: &mut bool) {
+        if *cache == hidden {
+            return;
+        }
+        unsafe {
+            if hidden {
+                lvgl_sys::lv_obj_add_flag(obj, lvgl_sys::LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lvgl_sys::lv_obj_clear_flag(obj, lvgl_sys::LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        *cache = hidden;
     }
 
     fn set_latest_display_default() {
@@ -2113,26 +2170,35 @@ impl LvglUiCore {
         let Some(ui) = self.ui.as_ref() else {
             return;
         };
+        let prev_frame = self.last_synced_frame.clone();
+        let prev_frame = prev_frame.as_ref();
 
-        let status = format!(
-            "R {}%  A {}%  S {}%",
-            frame.status.remote_battery_percent,
-            frame.status.aircraft_battery_percent,
-            frame.status.signal_strength_percent,
-        );
-        Self::set_label_text(ui.status_label, &status);
+        if prev_frame.map(|prev| prev.status != frame.status).unwrap_or(true) {
+            let status = format!(
+                "R {}%  A {}%  S {}%",
+                frame.status.remote_battery_percent,
+                frame.status.aircraft_battery_percent,
+                frame.status.signal_strength_percent,
+            );
+            Self::set_label_text(ui.status_label, &status);
 
-        let secs = frame.status.unix_time_secs % 86400;
-        let clock = format!(
-            "{:02}:{:02}:{:02}",
-            secs / 3600,
-            (secs % 3600) / 60,
-            secs % 60
-        );
-        Self::set_label_text(ui.clock_label, &clock);
+            let secs = frame.status.unix_time_secs % 86400;
+            let clock = format!(
+                "{:02}:{:02}:{:02}",
+                secs / 3600,
+                (secs % 3600) / 60,
+                secs % 60
+            );
+            Self::set_label_text(ui.clock_label, &clock);
+        }
 
-        let page_txt = format!("Page {}/{}", frame.launcher_page + 1, PAGE_SPECS.len());
-        Self::set_label_text(ui.page_label, &page_txt);
+        if prev_frame
+            .map(|prev| prev.launcher_page != frame.launcher_page)
+            .unwrap_or(true)
+        {
+            let page_txt = format!("Page {}/{}", frame.launcher_page + 1, PAGE_SPECS.len());
+            Self::set_label_text(ui.page_label, &page_txt);
+        }
 
         let hidden_right = self.hidden_right();
         let hidden_left = self.hidden_left();
@@ -2207,26 +2273,39 @@ impl LvglUiCore {
                 }
                 Self::animate_axis(&mut self.current_app_x, self.target_app_x);
 
-                unsafe {
-                    lvgl_sys::lv_obj_add_flag(ui.back_button, lvgl_sys::LV_OBJ_FLAG_HIDDEN);
-                    lvgl_sys::lv_obj_set_pos(
-                        ui.launcher_panel,
-                        Self::to_coord(self.current_launcher_x),
-                        Self::to_coord(TOP_BAR_HEIGHT),
-                    );
-                    lvgl_sys::lv_obj_set_pos(
-                        ui.app_panel,
-                        Self::to_coord(self.current_app_x),
-                        Self::to_coord(TOP_BAR_HEIGHT),
-                    );
-                    lvgl_sys::lv_obj_set_pos(
-                        ui.launcher_panel_alt,
-                        Self::to_coord(alt_page.map(|_| alt_x).unwrap_or(hidden_right)),
-                        Self::to_coord(TOP_BAR_HEIGHT),
-                    );
+                Self::set_hidden_if_changed(ui.back_button, true, &mut self.back_button_hidden);
+                Self::set_obj_pos_if_changed(
+                    ui.launcher_panel,
+                    &mut self.last_launcher_panel_pos,
+                    self.current_launcher_x,
+                    TOP_BAR_HEIGHT,
+                );
+                Self::set_obj_pos_if_changed(
+                    ui.app_panel,
+                    &mut self.last_app_panel_pos,
+                    self.current_app_x,
+                    TOP_BAR_HEIGHT,
+                );
+                Self::set_obj_pos_if_changed(
+                    ui.launcher_panel_alt,
+                    &mut self.last_launcher_panel_alt_pos,
+                    alt_page.map(|_| alt_x).unwrap_or(hidden_right),
+                    TOP_BAR_HEIGHT,
+                );
+
+                let launcher_changed = prev_frame
+                    .map(|prev| {
+                        prev.page != frame.page
+                            || prev.launcher_page != frame.launcher_page
+                            || prev.selected_row != frame.selected_row
+                            || prev.selected_col != frame.selected_col
+                    })
+                    .unwrap_or(true);
+                if launcher_changed {
+                    self.update_launcher(frame, ui);
                 }
-                self.update_launcher(frame, ui);
-                if let Some(page_idx) = alt_page {
+                if let Some(page_idx) = alt_page.filter(|_| self.last_alt_launcher_page != alt_page)
+                {
                     self.update_launcher_panel(
                         page_idx,
                         None,
@@ -2237,6 +2316,7 @@ impl LvglUiCore {
                         &ui.app_title_labels_alt,
                     );
                 }
+                self.last_alt_launcher_page = alt_page;
             }
             UiPage::App(app) => {
                 if let Some(drag_x) = self.drag_offset_x {
@@ -2251,29 +2331,44 @@ impl LvglUiCore {
                     Self::animate_axis(&mut self.current_app_x, self.target_app_x);
                 }
 
-                unsafe {
-                    lvgl_sys::lv_obj_clear_flag(ui.back_button, lvgl_sys::LV_OBJ_FLAG_HIDDEN);
-                    lvgl_sys::lv_obj_set_pos(
-                        ui.launcher_panel,
-                        Self::to_coord(0),
-                        Self::to_coord(TOP_BAR_HEIGHT),
-                    );
-                    lvgl_sys::lv_obj_set_pos(
-                        ui.launcher_panel_alt,
-                        Self::to_coord(hidden_right),
-                        Self::to_coord(TOP_BAR_HEIGHT),
-                    );
-                    lvgl_sys::lv_obj_set_pos(
-                        ui.app_panel,
-                        Self::to_coord(self.current_app_x),
-                        Self::to_coord(TOP_BAR_HEIGHT),
-                    );
+                Self::set_hidden_if_changed(ui.back_button, false, &mut self.back_button_hidden);
+                Self::set_obj_pos_if_changed(
+                    ui.launcher_panel,
+                    &mut self.last_launcher_panel_pos,
+                    0,
+                    TOP_BAR_HEIGHT,
+                );
+                Self::set_obj_pos_if_changed(
+                    ui.launcher_panel_alt,
+                    &mut self.last_launcher_panel_alt_pos,
+                    hidden_right,
+                    TOP_BAR_HEIGHT,
+                );
+                Self::set_obj_pos_if_changed(
+                    ui.app_panel,
+                    &mut self.last_app_panel_pos,
+                    self.current_app_x,
+                    TOP_BAR_HEIGHT,
+                );
+                if prev_frame
+                    .map(|prev| {
+                        prev.page != frame.page
+                            || prev.launcher_page != frame.launcher_page
+                            || prev.selected_row != frame.selected_row
+                            || prev.selected_col != frame.selected_col
+                    })
+                    .unwrap_or(true)
+                {
+                    self.update_launcher(frame, ui);
                 }
-                self.update_launcher(frame, ui);
-                self.update_app_page(frame, ui, app);
+                if prev_frame.map(|prev| prev != frame).unwrap_or(true) {
+                    self.update_app_page(frame, ui, app);
+                }
+                self.last_alt_launcher_page = None;
             }
         }
 
+        self.last_synced_frame = Some(frame.clone());
         self.last_page = Some(frame.page);
         self.last_launcher_page = frame.launcher_page;
     }
@@ -2602,9 +2697,28 @@ impl LinuxFramebuffer {
         let finfo = unsafe { finfo.assume_init() };
         let vinfo = unsafe { vinfo.assume_init() };
         let bytes_per_pixel = vinfo.bits_per_pixel.div_ceil(8) as usize;
+        let map_len = finfo.smem_len as usize;
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if map == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let shadow = unsafe { std::slice::from_raw_parts(map.cast::<u8>(), map_len) }.to_vec();
 
         Ok(Self {
             file,
+            map: map.cast(),
+            map_len,
+            shadow,
+            dirty: None,
             row_scratch: Vec::new(),
             width: vinfo.xres,
             height: vinfo.yres,
@@ -2624,21 +2738,6 @@ impl LinuxFramebuffer {
                 .unwrap_or(0),
             swap_rb: std::env::var_os("LINTX_FB_SWAP_RB").is_some(),
         })
-    }
-
-    fn write_all_at(&self, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
-        while !buf.is_empty() {
-            let written = self.file.write_at(buf, offset)?;
-            if written == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "short framebuffer write",
-                ));
-            }
-            buf = &buf[written..];
-            offset += written as u64;
-        }
-        Ok(())
     }
 
     fn scale_channel(value: u8, length: u32) -> u32 {
@@ -2676,12 +2775,52 @@ impl LinuxFramebuffer {
         }
     }
 
-    fn write_span(&mut self, dst_y: u32, dst_x: u32, pixels: usize) -> io::Result<()> {
+    fn span_offset(&self, dst_y: u32, dst_x: u32, pixels: usize) -> io::Result<(usize, usize)> {
         let byte_len = pixels * self.bytes_per_pixel;
         let offset = ((u64::from(dst_y) + u64::from(self.yoffset)) * self.stride as u64)
-            + ((u64::from(dst_x) + u64::from(self.xoffset)) * self.bytes_per_pixel as u64);
-        let scratch = &self.row_scratch[..byte_len];
-        self.write_all_at(scratch, offset)
+            + ((u64::from(dst_x) + u64::from(self.xoffset)) * self.bytes_per_pixel as u64)
+            as u64;
+        let end = offset as usize + byte_len;
+        if end > self.shadow.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "framebuffer span out of range",
+            ));
+        }
+        Ok((offset as usize, byte_len))
+    }
+
+    fn mark_dirty(&mut self, x1: u32, y1: u32, x2: u32, y2: u32) {
+        self.dirty = Some(match self.dirty.take() {
+            Some((dx1, dy1, dx2, dy2)) => (dx1.min(x1), dy1.min(y1), dx2.max(x2), dy2.max(y2)),
+            None => (x1, y1, x2, y2),
+        });
+    }
+
+    fn write_span(&mut self, dst_y: u32, dst_x: u32, pixels: usize) -> io::Result<()> {
+        let (offset, byte_len) = self.span_offset(dst_y, dst_x, pixels)?;
+        self.shadow[offset..offset + byte_len].copy_from_slice(&self.row_scratch[..byte_len]);
+        self.mark_dirty(dst_x, dst_y, dst_x + pixels as u32 - 1, dst_y);
+        Ok(())
+    }
+
+    fn present(&mut self) -> io::Result<()> {
+        let Some((x1, y1, x2, y2)) = self.dirty.take() else {
+            return Ok(());
+        };
+
+        let row_bytes = (x2 - x1 + 1) as usize * self.bytes_per_pixel;
+        for y in y1..=y2 {
+            let (offset, _) = self.span_offset(y, x1, (x2 - x1 + 1) as usize)?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.shadow.as_ptr().add(offset),
+                    self.map.add(offset),
+                    row_bytes,
+                );
+            }
+        }
+        Ok(())
     }
 
     fn write_refresh<const N: usize>(
@@ -2881,6 +3020,9 @@ impl LvglBackend for FbdevBackend {
         self.core.set_drag_offset(self.pointer.drag_offset_x());
         self.core.sync_ui(frame);
         self.core.start_frame();
+        if let Err(err) = self.framebuffer.present() {
+            super::debug_log(&format!("FbdevBackend::present failed: {err}"));
+        }
     }
 
     fn shutdown(&mut self) {

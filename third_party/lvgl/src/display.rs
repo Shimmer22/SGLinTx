@@ -3,6 +3,10 @@ use crate::{disp_drv_register, disp_get_default, get_str_act, RunOnce};
 use crate::{Box, Color, Obj};
 #[cfg(feature = "alloc")]
 use alloc::boxed::Box as DriverBox;
+#[cfg(feature = "alloc")]
+use alloc::vec;
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec;
 #[cfg(not(feature = "alloc"))]
 use crate::Box as DriverBox;
 use core::cell::RefCell;
@@ -157,6 +161,9 @@ impl DefaultDisplay {
 pub struct DrawBuffer<const N: usize> {
     //inner: NonNull<lvgl_sys::lv_disp_draw_buf_t>,
     initialized: RunOnce,
+    #[cfg(feature = "alloc")]
+    refresh_buffer: RefCell<alloc::boxed::Box<[MaybeUninit<lvgl_sys::lv_color_t>]>>,
+    #[cfg(not(feature = "alloc"))]
     refresh_buffer: RefCell<[MaybeUninit<lvgl_sys::lv_color_t>; N]>,
 }
 
@@ -164,6 +171,9 @@ impl<const N: usize> Default for DrawBuffer<N> {
     fn default() -> Self {
         Self {
             initialized: RunOnce::new(),
+            #[cfg(feature = "alloc")]
+            refresh_buffer: RefCell::new(vec![MaybeUninit::uninit(); N].into_boxed_slice()),
+            #[cfg(not(feature = "alloc"))]
             refresh_buffer: RefCell::new([MaybeUninit::uninit(); N]),
         }
     }
@@ -300,6 +310,9 @@ pub struct Area {
 /// are represented in a contiguous array.
 pub struct DisplayRefresh<const N: usize> {
     pub area: Area,
+    #[cfg(feature = "alloc")]
+    pub colors: Vec<Color>,
+    #[cfg(not(feature = "alloc"))]
     pub colors: [Color; N],
 }
 
@@ -352,6 +365,9 @@ unsafe extern "C" fn disp_flush_trampoline<'a, F, const N: usize>(
         let height = ((*area).y2 - (*area).y1 + 1).max(0) as usize;
         let color_count = width.saturating_mul(height).min(N);
 
+        #[cfg(feature = "alloc")]
+        let mut colors = vec![Color::default(); N];
+        #[cfg(not(feature = "alloc"))]
         let mut colors = [Color::default(); N];
         for (color_len, color) in colors.iter_mut().take(color_count).enumerate() {
             let lv_color = *color_p.add(color_len);
