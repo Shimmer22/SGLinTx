@@ -510,6 +510,7 @@ impl UiApp {
         super::debug_log("backend.init done");
 
         loop {
+            let loop_start = std::time::Instant::now();
             let mut dirty = false;
 
             while let Some(status) = status_rx.try_read() {
@@ -576,7 +577,7 @@ impl UiApp {
             }
 
             let sleep_for = if std::time::Instant::now() < active_until {
-                frame_time
+                frame_time.saturating_sub(loop_start.elapsed())
             } else {
                 idle_sleep
             };

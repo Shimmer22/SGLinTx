@@ -79,8 +79,9 @@ struct LinuxFramebuffer {
     var_info: LinuxFbVarScreeninfo,
     map: *mut u8,
     map_len: usize,
-    shadow: Vec<u8>,
+    frame_shadow: Vec<u8>,
     dirty: Option<(u32, u32, u32, u32)>,
+    previous_dirty: Option<(u32, u32, u32, u32)>,
     row_scratch: Vec<u8>,
     width: u32,
     height: u32,
@@ -97,6 +98,7 @@ struct LinuxFramebuffer {
     transp: LinuxFbBitfield,
     rotate_degrees: u16,
     swap_rb: bool,
+    rgb565_to_native32_lut: Option<Box<[u32]>>,
 }
 
 impl Drop for LinuxFramebuffer {
@@ -184,6 +186,101 @@ pub(super) struct FbdevBackend {
     framebuffer: LinuxFramebuffer,
     touch_input: Option<EvdevTouchInput>,
     pointer: PointerInputAdapter,
+    perf: FbdevPerfStats,
+}
+
+#[derive(Default)]
+struct FbdevPerfStats {
+    enabled: bool,
+    window_start: Option<std::time::Instant>,
+    frames: u32,
+    flush_calls: u32,
+    flush_pixels: u64,
+    sync_ui_ns: u128,
+    task_handler_ns: u128,
+    present_ns: u128,
+}
+
+impl FbdevPerfStats {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var("LINTX_UI_PERF_TRACE")
+                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
+                .unwrap_or(false),
+            ..Self::default()
+        }
+    }
+
+    fn begin_window_if_needed(&mut self, now: std::time::Instant) {
+        if self.window_start.is_none() {
+            self.window_start = Some(now);
+        }
+    }
+
+    fn record_flush_area(
+        &mut self,
+        x1: lvgl_sys::lv_coord_t,
+        y1: lvgl_sys::lv_coord_t,
+        x2: lvgl_sys::lv_coord_t,
+        y2: lvgl_sys::lv_coord_t,
+    ) {
+        if !self.enabled || x2 < x1 || y2 < y1 {
+            return;
+        }
+        let width = i64::from(x2) - i64::from(x1) + 1;
+        let height = i64::from(y2) - i64::from(y1) + 1;
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        self.flush_calls = self.flush_calls.saturating_add(1);
+        self.flush_pixels = self
+            .flush_pixels
+            .saturating_add((width as u64).saturating_mul(height as u64));
+    }
+
+    fn record_frame(
+        &mut self,
+        now: std::time::Instant,
+        sync_ui: std::time::Duration,
+        task_handler: std::time::Duration,
+        present: std::time::Duration,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        self.begin_window_if_needed(now);
+        self.frames = self.frames.saturating_add(1);
+        self.sync_ui_ns = self.sync_ui_ns.saturating_add(sync_ui.as_nanos());
+        self.task_handler_ns = self.task_handler_ns.saturating_add(task_handler.as_nanos());
+        self.present_ns = self.present_ns.saturating_add(present.as_nanos());
+
+        let Some(start) = self.window_start else {
+            return;
+        };
+        let elapsed = now.saturating_duration_since(start);
+        if elapsed < std::time::Duration::from_secs(1) {
+            return;
+        }
+
+        let secs = elapsed.as_secs_f64().max(0.001);
+        let fps = self.frames as f64 / secs;
+        let flush_mpix = self.flush_pixels as f64 / 1_000_000.0 / secs;
+        super::super::debug_log(&format!(
+            "fb-perf fps={fps:.1} flush_calls={} flush_mpix_s={flush_mpix:.2} sync_ui_ms={:.2} task_ms={:.2} present_ms={:.2}",
+            self.flush_calls,
+            self.sync_ui_ns as f64 / 1_000_000.0 / self.frames.max(1) as f64,
+            self.task_handler_ns as f64 / 1_000_000.0 / self.frames.max(1) as f64,
+            self.present_ns as f64 / 1_000_000.0 / self.frames.max(1) as f64,
+        ));
+
+        self.window_start = Some(now);
+        self.frames = 0;
+        self.flush_calls = 0;
+        self.flush_pixels = 0;
+        self.sync_ui_ns = 0;
+        self.task_handler_ns = 0;
+        self.present_ns = 0;
+    }
 }
 
 impl EvdevTouchInput {
@@ -383,19 +480,46 @@ impl LinuxFramebuffer {
         if map == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        let shadow = unsafe { std::slice::from_raw_parts(map.cast::<u8>(), map_len) }.to_vec();
+        let stride = finfo.line_length as usize;
+        let frame_bytes = stride.saturating_mul(vinfo.yres as usize);
+        let current_offset = vinfo.yoffset as usize * stride;
+        if current_offset.saturating_add(frame_bytes) > map_len {
+            unsafe {
+                libc::munmap(map, map_len);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "framebuffer current page out of range",
+            ));
+        }
+        let frame_shadow = unsafe {
+            std::slice::from_raw_parts(map.cast::<u8>().add(current_offset), frame_bytes)
+        }
+        .to_vec();
+        let rgb565_to_native32_lut = if bytes_per_pixel == 4 {
+            Some(Self::build_rgb565_to_native32_lut(
+                vinfo.red,
+                vinfo.green,
+                vinfo.blue,
+                vinfo.transp,
+                std::env::var_os("LINTX_FB_SWAP_RB").is_some(),
+            ))
+        } else {
+            None
+        };
 
         Ok(Self {
             file,
             var_info: vinfo,
             map: map.cast(),
             map_len,
-            shadow,
+            frame_shadow,
             dirty: None,
+            previous_dirty: None,
             row_scratch: Vec::new(),
             width: vinfo.xres,
             height: vinfo.yres,
-            stride: finfo.line_length as usize,
+            stride,
             bits_per_pixel: vinfo.bits_per_pixel,
             bytes_per_pixel,
             xoffset: vinfo.xoffset,
@@ -412,11 +536,42 @@ impl LinuxFramebuffer {
                 .map(|v| v % 360)
                 .unwrap_or(0),
             swap_rb: std::env::var_os("LINTX_FB_SWAP_RB").is_some(),
+            rgb565_to_native32_lut,
         })
     }
 
-    fn frame_bytes(&self) -> usize {
-        self.stride.saturating_mul(self.height as usize)
+    fn build_rgb565_to_native32_lut(
+        red: LinuxFbBitfield,
+        green: LinuxFbBitfield,
+        blue: LinuxFbBitfield,
+        transp: LinuxFbBitfield,
+        swap_rb: bool,
+    ) -> Box<[u32]> {
+        let alpha_mask = if transp.length > 0 {
+            ((1u32 << transp.length.min(16)) - 1) << transp.offset
+        } else {
+            0
+        };
+
+        let mut lut = vec![0u32; 1 << 16];
+        for (rgb565, slot) in lut.iter_mut().enumerate() {
+            let rgb565 = rgb565 as u16;
+            let r5 = ((rgb565 >> 11) & 0x1F) as u8;
+            let g6 = ((rgb565 >> 5) & 0x3F) as u8;
+            let b5 = (rgb565 & 0x1F) as u8;
+
+            let r8 = (r5 << 3) | (r5 >> 2);
+            let g8 = (g6 << 2) | (g6 >> 4);
+            let b8 = (b5 << 3) | (b5 >> 2);
+            let (r8, b8) = if swap_rb { (b8, r8) } else { (r8, b8) };
+
+            *slot = alpha_mask
+                | (Self::scale_channel(r8, red.length) << red.offset)
+                | (Self::scale_channel(g8, green.length) << green.offset)
+                | (Self::scale_channel(b8, blue.length) << blue.offset);
+        }
+
+        lut.into_boxed_slice()
     }
 
     fn begin_frame(&mut self) {
@@ -431,17 +586,10 @@ impl LinuxFramebuffer {
         } else {
             self.height
         };
-        let frame_bytes = self.frame_bytes();
-        let src_offset = self.current_yoffset as usize * self.stride;
-        let dst_offset = next_yoffset as usize * self.stride;
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.map.add(src_offset),
-                self.map.add(dst_offset),
-                frame_bytes,
-            );
-        }
         self.render_yoffset = next_yoffset;
+        if let Some((x1, y1, x2, y2)) = self.previous_dirty {
+            self.copy_shadow_rect_to_page(next_yoffset, x1, y1, x2, y2);
+        }
     }
 
     fn scale_channel(value: u8, length: u32) -> u32 {
@@ -453,6 +601,9 @@ impl LinuxFramebuffer {
     }
 
     fn pack_pixel(&self, rgb565: u16) -> u32 {
+        if let Some(lut) = self.rgb565_to_native32_lut.as_ref() {
+            return lut[rgb565 as usize];
+        }
         let r5 = ((rgb565 >> 11) & 0x1F) as u8;
         let g6 = ((rgb565 >> 5) & 0x3F) as u8;
         let b5 = (rgb565 & 0x1F) as u8;
@@ -470,6 +621,30 @@ impl LinuxFramebuffer {
             pixel |= ((1u32 << self.transp.length.min(16)) - 1) << self.transp.offset;
         }
         pixel
+    }
+
+    fn copy_shadow_rect_to_page(&mut self, page_yoffset: u32, x1: u32, y1: u32, x2: u32, y2: u32) {
+        let row_bytes = (x2 - x1 + 1) as usize * self.bytes_per_pixel;
+        for y in y1..=y2 {
+            let shadow_offset = self.shadow_offset(y, x1);
+            let page_offset = self.page_offset(page_yoffset, y, x1);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.frame_shadow.as_ptr().add(shadow_offset),
+                    self.map.add(page_offset),
+                    row_bytes,
+                );
+            }
+        }
+    }
+
+    fn shadow_offset(&self, dst_y: u32, dst_x: u32) -> usize {
+        (dst_y as usize * self.stride) + ((dst_x + self.xoffset) as usize * self.bytes_per_pixel)
+    }
+
+    fn page_offset(&self, page_yoffset: u32, dst_y: u32, dst_x: u32) -> usize {
+        ((page_yoffset as usize + dst_y as usize) * self.stride)
+            + ((dst_x + self.xoffset) as usize * self.bytes_per_pixel)
     }
 
     fn resize_row_scratch(&mut self, pixels: usize) {
@@ -502,16 +677,15 @@ impl LinuxFramebuffer {
 
     fn write_span(&mut self, dst_y: u32, dst_x: u32, pixels: usize) -> io::Result<()> {
         let (offset, byte_len) = self.span_offset(dst_y, dst_x, pixels)?;
-        if self.page_flip {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    self.row_scratch.as_ptr(),
-                    self.map.add(offset),
-                    byte_len,
-                );
-            }
-        } else {
-            self.shadow[offset..offset + byte_len].copy_from_slice(&self.row_scratch[..byte_len]);
+        let shadow_offset = self.shadow_offset(dst_y, dst_x);
+        self.frame_shadow[shadow_offset..shadow_offset + byte_len]
+            .copy_from_slice(&self.row_scratch[..byte_len]);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.row_scratch.as_ptr(),
+                self.map.add(offset),
+                byte_len,
+            );
         }
         self.mark_dirty(dst_x, dst_y, dst_x + pixels as u32 - 1, dst_y);
         Ok(())
@@ -535,7 +709,7 @@ impl LinuxFramebuffer {
                 self.current_yoffset = self.render_yoffset;
                 self.var_info.yoffset = self.render_yoffset;
             }
-            self.dirty = None;
+            self.previous_dirty = self.dirty.take();
             return Ok(());
         }
 
@@ -545,10 +719,11 @@ impl LinuxFramebuffer {
 
         let row_bytes = (x2 - x1 + 1) as usize * self.bytes_per_pixel;
         for y in y1..=y2 {
-            let (offset, _) = self.span_offset(y, x1, (x2 - x1 + 1) as usize)?;
+            let offset = self.page_offset(self.current_yoffset, y, x1);
+            let shadow_offset = self.shadow_offset(y, x1);
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    self.shadow.as_ptr().add(offset),
+                    self.frame_shadow.as_ptr().add(shadow_offset),
                     self.map.add(offset),
                     row_bytes,
                 );
@@ -706,6 +881,7 @@ impl FbdevBackend {
             framebuffer,
             touch_input,
             pointer: PointerInputAdapter::default(),
+            perf: FbdevPerfStats::new(),
         }
     }
 }
@@ -723,12 +899,20 @@ impl LvglBackend for FbdevBackend {
 
         let draw_buf = lvgl::DrawBuffer::<LVGL_DRAW_BUF_PIXELS>::default();
         let fb_ptr: *mut LinuxFramebuffer = &mut self.framebuffer;
+        let perf_ptr: *mut FbdevPerfStats = &mut self.perf;
         let display = lvgl::Display::register(
             draw_buf,
             self.core.width,
             self.core.height,
             move |refresh| {
                 let fb = unsafe { &mut *fb_ptr };
+                let perf = unsafe { &mut *perf_ptr };
+                perf.record_flush_area(
+                    refresh.area.x1,
+                    refresh.area.y1,
+                    refresh.area.x2,
+                    refresh.area.y2,
+                );
                 if let Err(err) = fb.write_refresh(refresh) {
                     super::super::debug_log(&format!("FbdevBackend::write_refresh failed: {err}"));
                 }
@@ -754,15 +938,24 @@ impl LvglBackend for FbdevBackend {
     }
 
     fn render(&mut self, frame: &UiFrame) {
+        let now = std::time::Instant::now();
         self.pointer
             .update_snapshot(frame, self.core.width, self.core.height);
         self.core.set_drag_offset(self.pointer.drag_offset_x());
+        let sync_ui_start = std::time::Instant::now();
         self.core.sync_ui(frame);
+        let sync_ui_elapsed = sync_ui_start.elapsed();
         self.framebuffer.begin_frame();
+        let task_handler_start = std::time::Instant::now();
         self.core.start_frame();
+        let task_handler_elapsed = task_handler_start.elapsed();
+        let present_start = std::time::Instant::now();
         if let Err(err) = self.framebuffer.present() {
             super::super::debug_log(&format!("FbdevBackend::present failed: {err}"));
         }
+        let present_elapsed = present_start.elapsed();
+        self.perf
+            .record_frame(now, sync_ui_elapsed, task_handler_elapsed, present_elapsed);
     }
 
     fn shutdown(&mut self) {

@@ -8,6 +8,7 @@ use super::{elrs_list_lines, signal_grade};
 pub(super) const TOP_BAR_HEIGHT: i32 = 44;
 pub(super) const LVGL_DRAW_BUF_PIXELS: usize = 800 * 480;
 
+#[derive(Clone, Copy)]
 pub(super) struct LvglUiObjects {
     pub(super) debug_panel: *mut lvgl_sys::lv_obj_t,
     pub(super) debug_label: *mut lvgl_sys::lv_obj_t,
@@ -39,6 +40,9 @@ pub(super) struct LvglUiObjects {
     pub(super) app_icon_labels_alt: [*mut lvgl_sys::lv_obj_t; 8],
     pub(super) app_title_labels: [*mut lvgl_sys::lv_obj_t; 8],
     pub(super) app_title_labels_alt: [*mut lvgl_sys::lv_obj_t; 8],
+    pub(super) snapshot_layer: *mut lvgl_sys::lv_obj_t,
+    pub(super) snapshot_img_primary: *mut lvgl_sys::lv_obj_t,
+    pub(super) snapshot_img_secondary: *mut lvgl_sys::lv_obj_t,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +57,38 @@ struct AppTemplateData {
     list_title: String,
     list_lines: [String; 4],
     hint: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapshotScene {
+    LauncherDrag {
+        launcher_page: usize,
+        alt_page: Option<usize>,
+    },
+    LauncherTransition {
+        from_page: usize,
+        to_page: usize,
+    },
+    LauncherToApp {
+        launcher_page: usize,
+        app: AppId,
+    },
+    AppDrag {
+        launcher_page: usize,
+        app: AppId,
+    },
+    AppToLauncher {
+        launcher_page: usize,
+        app: AppId,
+    },
+}
+
+#[derive(Default)]
+struct SnapshotAnimationState {
+    scene: Option<SnapshotScene>,
+    primary_dsc: Option<*mut lvgl_sys::lv_img_dsc_t>,
+    secondary_dsc: Option<*mut lvgl_sys::lv_img_dsc_t>,
+    active: bool,
 }
 
 pub(super) struct LvglUiCore {
@@ -76,6 +112,7 @@ pub(super) struct LvglUiCore {
     last_app_panel_pos: Option<(i32, i32)>,
     back_button_hidden: bool,
     debug_overlay_hidden: bool,
+    snapshot: SnapshotAnimationState,
 }
 
 impl LvglUiCore {
@@ -106,6 +143,7 @@ impl LvglUiCore {
             last_app_panel_pos: None,
             back_button_hidden: true,
             debug_overlay_hidden: true,
+            snapshot: SnapshotAnimationState::default(),
         }
     }
 
@@ -149,6 +187,16 @@ impl LvglUiCore {
             }
         }
         *cache = hidden;
+    }
+
+    fn set_obj_hidden(obj: *mut lvgl_sys::lv_obj_t, hidden: bool) {
+        unsafe {
+            if hidden {
+                lvgl_sys::lv_obj_add_flag(obj, lvgl_sys::LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lvgl_sys::lv_obj_clear_flag(obj, lvgl_sys::LV_OBJ_FLAG_HIDDEN);
+            }
+        }
     }
 
     pub(super) fn set_latest_display_default() {
@@ -202,6 +250,76 @@ impl LvglUiCore {
 
         let step = ((delta as f32) * 0.28).round() as i32;
         *current += if step == 0 { delta.signum() } else { step };
+    }
+
+    fn snapshot_scene(&self, frame: &UiFrame, prev_page: Option<UiPage>) -> Option<SnapshotScene> {
+        match frame.page {
+            UiPage::Launcher => {
+                if let Some(drag_x) = self.drag_offset_x {
+                    let alt_page = if drag_x < 0 && frame.launcher_page + 1 < PAGE_SPECS.len() {
+                        Some(frame.launcher_page + 1)
+                    } else if drag_x > 0 && frame.launcher_page > 0 {
+                        Some(frame.launcher_page - 1)
+                    } else {
+                        None
+                    };
+                    return Some(SnapshotScene::LauncherDrag {
+                        launcher_page: frame.launcher_page,
+                        alt_page,
+                    });
+                }
+                if let Some(from_page) = self.launcher_transition_from {
+                    return Some(SnapshotScene::LauncherTransition {
+                        from_page,
+                        to_page: frame.launcher_page,
+                    });
+                }
+                if let Some(UiPage::App(app)) = prev_page {
+                    return Some(SnapshotScene::AppToLauncher {
+                        launcher_page: frame.launcher_page,
+                        app,
+                    });
+                }
+                None
+            }
+            UiPage::App(app) => {
+                if self.drag_offset_x.is_some() {
+                    return Some(SnapshotScene::AppDrag {
+                        launcher_page: frame.launcher_page,
+                        app,
+                    });
+                }
+                if matches!(prev_page, Some(UiPage::Launcher)) {
+                    return Some(SnapshotScene::LauncherToApp {
+                        launcher_page: frame.launcher_page,
+                        app,
+                    });
+                }
+                None
+            }
+        }
+    }
+
+    fn free_snapshot_dsc(slot: &mut Option<*mut lvgl_sys::lv_img_dsc_t>) {
+        if let Some(ptr) = slot.take() {
+            unsafe {
+                lvgl_sys::lv_snapshot_free(ptr);
+            }
+        }
+    }
+
+    fn clear_snapshot_sources(&mut self, ui: &LvglUiObjects) {
+        unsafe {
+            lvgl_sys::lv_img_set_src(ui.snapshot_img_primary, std::ptr::null_mut());
+            lvgl_sys::lv_img_set_src(ui.snapshot_img_secondary, std::ptr::null_mut());
+        }
+    }
+
+    fn take_snapshot(obj: *mut lvgl_sys::lv_obj_t) -> Option<*mut lvgl_sys::lv_img_dsc_t> {
+        let ptr = unsafe {
+            lvgl_sys::lv_snapshot_take(obj, lvgl_sys::LV_IMG_CF_TRUE_COLOR as lvgl_sys::lv_img_cf_t)
+        };
+        (!ptr.is_null()).then_some(ptr)
     }
 
     fn app_template_data(&self, frame: &UiFrame, app: AppId) -> AppTemplateData {
@@ -439,6 +557,213 @@ impl LvglUiCore {
                     hint: "ESC: Back".to_string(),
                 }
             }
+        }
+    }
+
+    fn prepare_snapshot_scene(
+        &mut self,
+        frame: &UiFrame,
+        ui: &LvglUiObjects,
+        scene: SnapshotScene,
+    ) {
+        match scene {
+            SnapshotScene::LauncherDrag {
+                launcher_page,
+                alt_page,
+            } => {
+                self.update_launcher_panel(
+                    launcher_page,
+                    Some((frame.selected_row, frame.selected_col)),
+                    ui.branding_label,
+                    &ui.app_cards,
+                    &ui.app_icon_boxes,
+                    &ui.app_icon_labels,
+                    &ui.app_title_labels,
+                );
+                if let Some(page_idx) = alt_page {
+                    self.update_launcher_panel(
+                        page_idx,
+                        None,
+                        ui.branding_label_alt,
+                        &ui.app_cards_alt,
+                        &ui.app_icon_boxes_alt,
+                        &ui.app_icon_labels_alt,
+                        &ui.app_title_labels_alt,
+                    );
+                }
+            }
+            SnapshotScene::LauncherTransition { from_page, to_page } => {
+                self.update_launcher_panel(
+                    to_page,
+                    Some((frame.selected_row, frame.selected_col)),
+                    ui.branding_label,
+                    &ui.app_cards,
+                    &ui.app_icon_boxes,
+                    &ui.app_icon_labels,
+                    &ui.app_title_labels,
+                );
+                self.update_launcher_panel(
+                    from_page,
+                    None,
+                    ui.branding_label_alt,
+                    &ui.app_cards_alt,
+                    &ui.app_icon_boxes_alt,
+                    &ui.app_icon_labels_alt,
+                    &ui.app_title_labels_alt,
+                );
+            }
+            SnapshotScene::LauncherToApp { launcher_page, app }
+            | SnapshotScene::AppDrag { launcher_page, app }
+            | SnapshotScene::AppToLauncher { launcher_page, app } => {
+                self.update_launcher_panel(
+                    launcher_page,
+                    Some((frame.selected_row, frame.selected_col)),
+                    ui.branding_label,
+                    &ui.app_cards,
+                    &ui.app_icon_boxes,
+                    &ui.app_icon_labels,
+                    &ui.app_title_labels,
+                );
+                self.update_app_page(frame, ui, app);
+            }
+        }
+    }
+
+    fn rebuild_snapshot_scene(
+        &mut self,
+        frame: &UiFrame,
+        ui: &LvglUiObjects,
+        scene: SnapshotScene,
+    ) -> bool {
+        self.prepare_snapshot_scene(frame, ui, scene);
+        Self::free_snapshot_dsc(&mut self.snapshot.primary_dsc);
+        Self::free_snapshot_dsc(&mut self.snapshot.secondary_dsc);
+
+        let (primary_obj, secondary_obj) = match scene {
+            SnapshotScene::LauncherDrag { alt_page, .. } => {
+                (ui.launcher_panel, alt_page.map(|_| ui.launcher_panel_alt))
+            }
+            SnapshotScene::LauncherTransition { .. } => {
+                (ui.launcher_panel, Some(ui.launcher_panel_alt))
+            }
+            SnapshotScene::LauncherToApp { .. }
+            | SnapshotScene::AppDrag { .. }
+            | SnapshotScene::AppToLauncher { .. } => (ui.app_panel, Some(ui.launcher_panel)),
+        };
+
+        self.snapshot.primary_dsc = Self::take_snapshot(primary_obj);
+        self.snapshot.secondary_dsc = secondary_obj.and_then(Self::take_snapshot);
+        if self.snapshot.primary_dsc.is_none() {
+            self.clear_snapshot_sources(ui);
+            self.snapshot.scene = None;
+            return false;
+        }
+
+        unsafe {
+            lvgl_sys::lv_img_set_src(
+                ui.snapshot_img_primary,
+                self.snapshot
+                    .primary_dsc
+                    .map(|ptr| ptr.cast::<core::ffi::c_void>())
+                    .unwrap_or(std::ptr::null_mut()),
+            );
+            lvgl_sys::lv_img_set_src(
+                ui.snapshot_img_secondary,
+                self.snapshot
+                    .secondary_dsc
+                    .map(|ptr| ptr.cast::<core::ffi::c_void>())
+                    .unwrap_or(std::ptr::null_mut()),
+            );
+        }
+
+        self.snapshot.scene = Some(scene);
+        true
+    }
+
+    fn set_snapshot_overlay_active(&mut self, ui: &LvglUiObjects, active: bool) {
+        if active {
+            Self::set_obj_hidden(ui.snapshot_layer, false);
+            Self::set_obj_hidden(ui.launcher_panel, true);
+            Self::set_obj_hidden(ui.launcher_panel_alt, true);
+            Self::set_obj_hidden(ui.app_panel, true);
+        } else {
+            Self::set_obj_hidden(ui.snapshot_layer, true);
+            self.clear_snapshot_sources(ui);
+            Self::set_obj_hidden(ui.launcher_panel, false);
+            Self::set_obj_hidden(ui.launcher_panel_alt, false);
+            Self::set_obj_hidden(ui.app_panel, false);
+        }
+        self.snapshot.active = active;
+    }
+
+    fn ensure_snapshot_scene(
+        &mut self,
+        frame: &UiFrame,
+        ui: &LvglUiObjects,
+        scene: SnapshotScene,
+    ) -> bool {
+        if self.snapshot.scene != Some(scene) && !self.rebuild_snapshot_scene(frame, ui, scene) {
+            return false;
+        }
+        if !self.snapshot.active {
+            self.set_snapshot_overlay_active(ui, true);
+        }
+        true
+    }
+
+    fn teardown_snapshot_scene(&mut self, ui: &LvglUiObjects) {
+        if self.snapshot.active {
+            self.set_snapshot_overlay_active(ui, false);
+        }
+        Self::free_snapshot_dsc(&mut self.snapshot.primary_dsc);
+        Self::free_snapshot_dsc(&mut self.snapshot.secondary_dsc);
+        self.snapshot.scene = None;
+    }
+
+    fn layout_snapshot_launcher(
+        &self,
+        ui: &LvglUiObjects,
+        primary_x: i32,
+        secondary_x: Option<i32>,
+    ) {
+        unsafe {
+            lvgl_sys::lv_obj_set_pos(
+                ui.snapshot_img_primary,
+                Self::to_coord(primary_x),
+                Self::to_coord(TOP_BAR_HEIGHT),
+            );
+            if let Some(x) = secondary_x {
+                lvgl_sys::lv_obj_set_pos(
+                    ui.snapshot_img_secondary,
+                    Self::to_coord(x),
+                    Self::to_coord(TOP_BAR_HEIGHT),
+                );
+                Self::set_obj_hidden(
+                    ui.snapshot_img_secondary,
+                    self.snapshot.secondary_dsc.is_none(),
+                );
+            } else {
+                Self::set_obj_hidden(ui.snapshot_img_secondary, true);
+            }
+        }
+    }
+
+    fn layout_snapshot_app(&self, ui: &LvglUiObjects, app_x: i32, launcher_x: i32) {
+        unsafe {
+            lvgl_sys::lv_obj_set_pos(
+                ui.snapshot_img_primary,
+                Self::to_coord(app_x),
+                Self::to_coord(TOP_BAR_HEIGHT),
+            );
+            lvgl_sys::lv_obj_set_pos(
+                ui.snapshot_img_secondary,
+                Self::to_coord(launcher_x),
+                Self::to_coord(TOP_BAR_HEIGHT),
+            );
+            Self::set_obj_hidden(
+                ui.snapshot_img_secondary,
+                self.snapshot.secondary_dsc.is_none(),
+            );
         }
     }
 
@@ -931,6 +1256,42 @@ impl LvglUiCore {
             );
             lvgl_sys::lv_obj_set_width(app_hint_label, Self::to_coord(width - 28));
 
+            let snapshot_layer = lvgl_sys::lv_obj_create(root);
+            lvgl_sys::lv_obj_set_pos(snapshot_layer, Self::to_coord(0), Self::to_coord(0));
+            lvgl_sys::lv_obj_set_size(
+                snapshot_layer,
+                Self::to_coord(width),
+                Self::to_coord(height),
+            );
+            lvgl_sys::lv_obj_set_style_bg_opa(snapshot_layer, 0, 0);
+            lvgl_sys::lv_obj_set_style_border_width(snapshot_layer, 0, 0);
+            lvgl_sys::lv_obj_set_style_radius(snapshot_layer, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_top(snapshot_layer, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_bottom(snapshot_layer, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_left(snapshot_layer, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_right(snapshot_layer, 0, 0);
+            lvgl_sys::lv_obj_clear_flag(snapshot_layer, lvgl_sys::LV_OBJ_FLAG_SCROLLABLE);
+            lvgl_sys::lv_obj_add_flag(snapshot_layer, lvgl_sys::LV_OBJ_FLAG_HIDDEN);
+
+            let snapshot_img_primary = lvgl_sys::lv_img_create(snapshot_layer);
+            lvgl_sys::lv_obj_add_flag(snapshot_img_primary, lvgl_sys::LV_OBJ_FLAG_ADV_HITTEST);
+            lvgl_sys::lv_img_set_antialias(snapshot_img_primary, false);
+            lvgl_sys::lv_obj_set_pos(
+                snapshot_img_primary,
+                Self::to_coord(0),
+                Self::to_coord(TOP_BAR_HEIGHT),
+            );
+
+            let snapshot_img_secondary = lvgl_sys::lv_img_create(snapshot_layer);
+            lvgl_sys::lv_obj_add_flag(snapshot_img_secondary, lvgl_sys::LV_OBJ_FLAG_ADV_HITTEST);
+            lvgl_sys::lv_img_set_antialias(snapshot_img_secondary, false);
+            lvgl_sys::lv_obj_add_flag(snapshot_img_secondary, lvgl_sys::LV_OBJ_FLAG_HIDDEN);
+            lvgl_sys::lv_obj_set_pos(
+                snapshot_img_secondary,
+                Self::to_coord(width + 20),
+                Self::to_coord(TOP_BAR_HEIGHT),
+            );
+
             self.ui = Some(LvglUiObjects {
                 debug_panel,
                 debug_label,
@@ -962,6 +1323,9 @@ impl LvglUiCore {
                 app_icon_labels_alt,
                 app_title_labels,
                 app_title_labels_alt,
+                snapshot_layer,
+                snapshot_img_primary,
+                snapshot_img_secondary,
             });
         }
     }
@@ -1163,7 +1527,7 @@ impl LvglUiCore {
     }
 
     pub(super) fn sync_ui(&mut self, frame: &UiFrame) {
-        let Some(ui) = self.ui.as_ref() else {
+        let Some(ui) = self.ui else {
             return;
         };
         let prev_frame = self.last_synced_frame.clone();
@@ -1261,6 +1625,8 @@ impl LvglUiCore {
             self.target_launcher_x = 0;
         }
 
+        let snapshot_scene = self.snapshot_scene(frame, prev_page);
+
         match frame.page {
             UiPage::Launcher => {
                 let mut alt_page = None;
@@ -1293,24 +1659,6 @@ impl LvglUiCore {
                 Self::animate_axis(&mut self.current_app_x, self.target_app_x);
 
                 Self::set_hidden_if_changed(ui.back_button, true, &mut self.back_button_hidden);
-                Self::set_obj_pos_if_changed(
-                    ui.launcher_panel,
-                    &mut self.last_launcher_panel_pos,
-                    self.current_launcher_x,
-                    TOP_BAR_HEIGHT,
-                );
-                Self::set_obj_pos_if_changed(
-                    ui.app_panel,
-                    &mut self.last_app_panel_pos,
-                    self.current_app_x,
-                    TOP_BAR_HEIGHT,
-                );
-                Self::set_obj_pos_if_changed(
-                    ui.launcher_panel_alt,
-                    &mut self.last_launcher_panel_alt_pos,
-                    alt_page.map(|_| alt_x).unwrap_or(hidden_right),
-                    TOP_BAR_HEIGHT,
-                );
 
                 let launcher_changed = prev_frame
                     .map(|prev| {
@@ -1321,7 +1669,7 @@ impl LvglUiCore {
                     })
                     .unwrap_or(true);
                 if launcher_changed {
-                    self.update_launcher(frame, ui);
+                    self.update_launcher(frame, &ui);
                 }
                 if let Some(page_idx) = alt_page.filter(|_| self.last_alt_launcher_page != alt_page)
                 {
@@ -1336,6 +1684,87 @@ impl LvglUiCore {
                     );
                 }
                 self.last_alt_launcher_page = alt_page;
+
+                match snapshot_scene {
+                    Some(
+                        scene @ SnapshotScene::LauncherDrag { .. }
+                        | scene @ SnapshotScene::LauncherTransition { .. },
+                    ) => {
+                        if self.ensure_snapshot_scene(frame, &ui, scene) {
+                            self.layout_snapshot_launcher(
+                                &ui,
+                                self.current_launcher_x,
+                                alt_page.map(|_| alt_x),
+                            );
+                        } else {
+                            self.teardown_snapshot_scene(&ui);
+                            Self::set_obj_pos_if_changed(
+                                ui.launcher_panel,
+                                &mut self.last_launcher_panel_pos,
+                                self.current_launcher_x,
+                                TOP_BAR_HEIGHT,
+                            );
+                            Self::set_obj_pos_if_changed(
+                                ui.app_panel,
+                                &mut self.last_app_panel_pos,
+                                self.current_app_x,
+                                TOP_BAR_HEIGHT,
+                            );
+                            Self::set_obj_pos_if_changed(
+                                ui.launcher_panel_alt,
+                                &mut self.last_launcher_panel_alt_pos,
+                                alt_page.map(|_| alt_x).unwrap_or(hidden_right),
+                                TOP_BAR_HEIGHT,
+                            );
+                        }
+                    }
+                    Some(scene @ SnapshotScene::AppToLauncher { .. }) => {
+                        if self.ensure_snapshot_scene(frame, &ui, scene) {
+                            self.layout_snapshot_app(&ui, self.current_app_x, 0);
+                        } else {
+                            self.teardown_snapshot_scene(&ui);
+                            Self::set_obj_pos_if_changed(
+                                ui.launcher_panel,
+                                &mut self.last_launcher_panel_pos,
+                                self.current_launcher_x,
+                                TOP_BAR_HEIGHT,
+                            );
+                            Self::set_obj_pos_if_changed(
+                                ui.app_panel,
+                                &mut self.last_app_panel_pos,
+                                self.current_app_x,
+                                TOP_BAR_HEIGHT,
+                            );
+                            Self::set_obj_pos_if_changed(
+                                ui.launcher_panel_alt,
+                                &mut self.last_launcher_panel_alt_pos,
+                                alt_page.map(|_| alt_x).unwrap_or(hidden_right),
+                                TOP_BAR_HEIGHT,
+                            );
+                        }
+                    }
+                    _ => {
+                        self.teardown_snapshot_scene(&ui);
+                        Self::set_obj_pos_if_changed(
+                            ui.launcher_panel,
+                            &mut self.last_launcher_panel_pos,
+                            self.current_launcher_x,
+                            TOP_BAR_HEIGHT,
+                        );
+                        Self::set_obj_pos_if_changed(
+                            ui.app_panel,
+                            &mut self.last_app_panel_pos,
+                            self.current_app_x,
+                            TOP_BAR_HEIGHT,
+                        );
+                        Self::set_obj_pos_if_changed(
+                            ui.launcher_panel_alt,
+                            &mut self.last_launcher_panel_alt_pos,
+                            alt_page.map(|_| alt_x).unwrap_or(hidden_right),
+                            TOP_BAR_HEIGHT,
+                        );
+                    }
+                }
             }
             UiPage::App(app) => {
                 if let Some(drag_x) = self.drag_offset_x {
@@ -1351,24 +1780,6 @@ impl LvglUiCore {
                 }
 
                 Self::set_hidden_if_changed(ui.back_button, false, &mut self.back_button_hidden);
-                Self::set_obj_pos_if_changed(
-                    ui.launcher_panel,
-                    &mut self.last_launcher_panel_pos,
-                    0,
-                    TOP_BAR_HEIGHT,
-                );
-                Self::set_obj_pos_if_changed(
-                    ui.launcher_panel_alt,
-                    &mut self.last_launcher_panel_alt_pos,
-                    hidden_right,
-                    TOP_BAR_HEIGHT,
-                );
-                Self::set_obj_pos_if_changed(
-                    ui.app_panel,
-                    &mut self.last_app_panel_pos,
-                    self.current_app_x,
-                    TOP_BAR_HEIGHT,
-                );
                 if prev_frame
                     .map(|prev| {
                         prev.page != frame.page
@@ -1378,10 +1789,59 @@ impl LvglUiCore {
                     })
                     .unwrap_or(true)
                 {
-                    self.update_launcher(frame, ui);
+                    self.update_launcher(frame, &ui);
                 }
                 if prev_frame.map(|prev| prev != frame).unwrap_or(true) {
-                    self.update_app_page(frame, ui, app);
+                    self.update_app_page(frame, &ui, app);
+                }
+                match snapshot_scene {
+                    Some(scene @ SnapshotScene::LauncherToApp { .. })
+                    | Some(scene @ SnapshotScene::AppDrag { .. }) => {
+                        if self.ensure_snapshot_scene(frame, &ui, scene) {
+                            self.layout_snapshot_app(&ui, self.current_app_x, 0);
+                        } else {
+                            self.teardown_snapshot_scene(&ui);
+                            Self::set_obj_pos_if_changed(
+                                ui.launcher_panel,
+                                &mut self.last_launcher_panel_pos,
+                                0,
+                                TOP_BAR_HEIGHT,
+                            );
+                            Self::set_obj_pos_if_changed(
+                                ui.launcher_panel_alt,
+                                &mut self.last_launcher_panel_alt_pos,
+                                hidden_right,
+                                TOP_BAR_HEIGHT,
+                            );
+                            Self::set_obj_pos_if_changed(
+                                ui.app_panel,
+                                &mut self.last_app_panel_pos,
+                                self.current_app_x,
+                                TOP_BAR_HEIGHT,
+                            );
+                        }
+                    }
+                    _ => {
+                        self.teardown_snapshot_scene(&ui);
+                        Self::set_obj_pos_if_changed(
+                            ui.launcher_panel,
+                            &mut self.last_launcher_panel_pos,
+                            0,
+                            TOP_BAR_HEIGHT,
+                        );
+                        Self::set_obj_pos_if_changed(
+                            ui.launcher_panel_alt,
+                            &mut self.last_launcher_panel_alt_pos,
+                            hidden_right,
+                            TOP_BAR_HEIGHT,
+                        );
+                        Self::set_obj_pos_if_changed(
+                            ui.app_panel,
+                            &mut self.last_app_panel_pos,
+                            self.current_app_x,
+                            TOP_BAR_HEIGHT,
+                        );
+                    }
                 }
                 self.last_alt_launcher_page = None;
             }
