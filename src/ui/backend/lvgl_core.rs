@@ -1,0 +1,1326 @@
+use crate::ui::{
+    catalog::{app_at, app_spec, page, PAGE_SPECS},
+    model::{AppId, UiFrame, UiPage},
+};
+
+use super::{elrs_list_lines, signal_grade};
+
+pub(super) const TOP_BAR_HEIGHT: i32 = 44;
+pub(super) const LVGL_DRAW_BUF_PIXELS: usize = 800 * 480;
+
+pub(super) struct LvglUiObjects {
+    pub(super) status_label: *mut lvgl_sys::lv_obj_t,
+    pub(super) clock_label: *mut lvgl_sys::lv_obj_t,
+    pub(super) page_label: *mut lvgl_sys::lv_obj_t,
+    pub(super) back_button: *mut lvgl_sys::lv_obj_t,
+    pub(super) launcher_panel: *mut lvgl_sys::lv_obj_t,
+    pub(super) launcher_panel_alt: *mut lvgl_sys::lv_obj_t,
+    pub(super) app_panel: *mut lvgl_sys::lv_obj_t,
+    pub(super) app_header_card: *mut lvgl_sys::lv_obj_t,
+    pub(super) app_badge_label: *mut lvgl_sys::lv_obj_t,
+    pub(super) app_title_label: *mut lvgl_sys::lv_obj_t,
+    pub(super) app_subtitle_label: *mut lvgl_sys::lv_obj_t,
+    pub(super) app_metric_cards: [*mut lvgl_sys::lv_obj_t; 2],
+    pub(super) app_metric_titles: [*mut lvgl_sys::lv_obj_t; 2],
+    pub(super) app_metric_values: [*mut lvgl_sys::lv_obj_t; 2],
+    pub(super) app_metric_bars: [*mut lvgl_sys::lv_obj_t; 2],
+    pub(super) app_list_title: *mut lvgl_sys::lv_obj_t,
+    pub(super) app_list_lines: [*mut lvgl_sys::lv_obj_t; 4],
+    pub(super) app_hint_label: *mut lvgl_sys::lv_obj_t,
+    pub(super) branding_label: *mut lvgl_sys::lv_obj_t,
+    pub(super) branding_label_alt: *mut lvgl_sys::lv_obj_t,
+    pub(super) app_cards: [*mut lvgl_sys::lv_obj_t; 8],
+    pub(super) app_cards_alt: [*mut lvgl_sys::lv_obj_t; 8],
+    pub(super) app_icon_boxes: [*mut lvgl_sys::lv_obj_t; 8],
+    pub(super) app_icon_boxes_alt: [*mut lvgl_sys::lv_obj_t; 8],
+    pub(super) app_icon_labels: [*mut lvgl_sys::lv_obj_t; 8],
+    pub(super) app_icon_labels_alt: [*mut lvgl_sys::lv_obj_t; 8],
+    pub(super) app_title_labels: [*mut lvgl_sys::lv_obj_t; 8],
+    pub(super) app_title_labels_alt: [*mut lvgl_sys::lv_obj_t; 8],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AppTemplateData {
+    accent: (u8, u8, u8),
+    badge: String,
+    title: String,
+    subtitle: String,
+    metric_titles: [String; 2],
+    metric_values: [String; 2],
+    metric_progress: [u8; 2],
+    list_title: String,
+    list_lines: [String; 4],
+    hint: String,
+}
+
+pub(super) struct LvglUiCore {
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) display: Option<lvgl::Display>,
+    pub(super) ui: Option<LvglUiObjects>,
+    pub(super) last_tick: std::time::Instant,
+    drag_offset_x: Option<i32>,
+    current_launcher_x: i32,
+    target_launcher_x: i32,
+    current_app_x: i32,
+    target_app_x: i32,
+    last_page: Option<UiPage>,
+    last_launcher_page: usize,
+    launcher_transition_from: Option<usize>,
+    last_synced_frame: Option<UiFrame>,
+    last_alt_launcher_page: Option<usize>,
+    last_launcher_panel_pos: Option<(i32, i32)>,
+    last_launcher_panel_alt_pos: Option<(i32, i32)>,
+    last_app_panel_pos: Option<(i32, i32)>,
+    back_button_hidden: bool,
+}
+
+impl LvglUiCore {
+    fn to_coord(v: i32) -> lvgl_sys::lv_coord_t {
+        v.clamp(i16::MIN as i32, i16::MAX as i32) as lvgl_sys::lv_coord_t
+    }
+
+    pub(super) fn new(width: u32, height: u32) -> Self {
+        let hidden_right = width as i32 + 20;
+        Self {
+            width,
+            height,
+            display: None,
+            ui: None,
+            last_tick: std::time::Instant::now(),
+            drag_offset_x: None,
+            current_launcher_x: 0,
+            target_launcher_x: 0,
+            current_app_x: hidden_right,
+            target_app_x: hidden_right,
+            last_page: None,
+            last_launcher_page: 0,
+            launcher_transition_from: None,
+            last_synced_frame: None,
+            last_alt_launcher_page: None,
+            last_launcher_panel_pos: None,
+            last_launcher_panel_alt_pos: None,
+            last_app_panel_pos: None,
+            back_button_hidden: true,
+        }
+    }
+
+    fn set_label_text(label: *mut lvgl_sys::lv_obj_t, text: &str) {
+        let sanitized = text.replace('\0', " ");
+        if let Ok(c_text) = std::ffi::CString::new(sanitized) {
+            unsafe {
+                lvgl_sys::lv_label_set_text(label, c_text.as_ptr());
+            }
+        }
+    }
+
+    fn clamp_pct(v: i32) -> u8 {
+        v.clamp(0, 100) as u8
+    }
+
+    fn set_obj_pos_if_changed(
+        obj: *mut lvgl_sys::lv_obj_t,
+        cache: &mut Option<(i32, i32)>,
+        x: i32,
+        y: i32,
+    ) {
+        if *cache == Some((x, y)) {
+            return;
+        }
+        unsafe {
+            lvgl_sys::lv_obj_set_pos(obj, Self::to_coord(x), Self::to_coord(y));
+        }
+        *cache = Some((x, y));
+    }
+
+    fn set_hidden_if_changed(obj: *mut lvgl_sys::lv_obj_t, hidden: bool, cache: &mut bool) {
+        if *cache == hidden {
+            return;
+        }
+        unsafe {
+            if hidden {
+                lvgl_sys::lv_obj_add_flag(obj, lvgl_sys::LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lvgl_sys::lv_obj_clear_flag(obj, lvgl_sys::LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        *cache = hidden;
+    }
+
+    pub(super) fn set_latest_display_default() {
+        unsafe {
+            let mut last = std::ptr::null_mut();
+            let mut cur = lvgl_sys::lv_disp_get_next(std::ptr::null_mut());
+            while !cur.is_null() {
+                last = cur;
+                cur = lvgl_sys::lv_disp_get_next(cur);
+            }
+            if !last.is_null() {
+                lvgl_sys::lv_disp_set_default(last);
+            }
+        }
+    }
+
+    pub(super) fn start_frame(&mut self) {
+        let now = std::time::Instant::now();
+        let tick_ms = now
+            .saturating_duration_since(self.last_tick)
+            .as_millis()
+            .clamp(1, 1000) as u32;
+        self.last_tick = now;
+
+        lvgl::tick_inc(std::time::Duration::from_millis(tick_ms as u64));
+        lvgl::task_handler();
+    }
+
+    pub(super) fn set_drag_offset(&mut self, drag_offset_x: Option<i32>) {
+        self.drag_offset_x = drag_offset_x;
+    }
+
+    fn hidden_right(&self) -> i32 {
+        self.width as i32 + 20
+    }
+
+    fn hidden_left(&self) -> i32 {
+        -self.hidden_right()
+    }
+
+    fn animate_axis(current: &mut i32, target: i32) {
+        if *current == target {
+            return;
+        }
+
+        let delta = target - *current;
+        if delta.abs() <= 8 {
+            *current = target;
+            return;
+        }
+
+        let step = ((delta as f32) * 0.28).round() as i32;
+        *current += if step == 0 { delta.signum() } else { step };
+    }
+
+    fn app_template_data(&self, frame: &UiFrame, app: AppId) -> AppTemplateData {
+        let spec = app_spec(app);
+        match app {
+            AppId::System => AppTemplateData {
+                accent: spec.accent,
+                badge: "SYSTEM".to_string(),
+                title: "Power & Device Health".to_string(),
+                subtitle: "Live status and quick parameter tuning".to_string(),
+                metric_titles: ["Remote Battery".to_string(), "Aircraft Battery".to_string()],
+                metric_values: [
+                    format!("{}%", frame.status.remote_battery_percent),
+                    format!("{}%", frame.status.aircraft_battery_percent),
+                ],
+                metric_progress: [
+                    frame.status.remote_battery_percent,
+                    frame.status.aircraft_battery_percent,
+                ],
+                list_title: "Quick Info".to_string(),
+                list_lines: [
+                    format!(
+                        "Signal: {}% ({})",
+                        frame.status.signal_strength_percent,
+                        signal_grade(frame.status.signal_strength_percent)
+                    ),
+                    format!("Unix Time: {}", frame.status.unix_time_secs),
+                    format!("Backlight: {}%", frame.config.backlight_percent),
+                    format!("Sound: {}%", frame.config.sound_percent),
+                ],
+                hint: "UP/DOWN: Backlight   LEFT/RIGHT: Sound   ESC: Back".to_string(),
+            },
+            AppId::Control => {
+                let left_avg =
+                    ((frame.adc_raw.value[0] as i32 + frame.adc_raw.value[1] as i32) / 2).max(0);
+                let right_avg =
+                    ((frame.adc_raw.value[2] as i32 + frame.adc_raw.value[3] as i32) / 2).max(0);
+                AppTemplateData {
+                    accent: spec.accent,
+                    badge: "CONTROL".to_string(),
+                    title: "Input Pipeline Monitor".to_string(),
+                    subtitle: "Sensor input and mixer output diagnostics".to_string(),
+                    metric_titles: ["ADC CH1/2".to_string(), "ADC CH3/4".to_string()],
+                    metric_values: [
+                        format!("{}/{}", frame.adc_raw.value[0], frame.adc_raw.value[1]),
+                        format!("{}/{}", frame.adc_raw.value[2], frame.adc_raw.value[3]),
+                    ],
+                    metric_progress: [
+                        Self::clamp_pct(left_avg * 100 / 2048),
+                        Self::clamp_pct(right_avg * 100 / 2048),
+                    ],
+                    list_title: "Mixer Out".to_string(),
+                    list_lines: [
+                        format!("Thrust: {}", frame.mixer_out.thrust),
+                        format!("Direction: {}", frame.mixer_out.direction),
+                        format!("Aileron: {}", frame.mixer_out.aileron),
+                        format!("Elevator: {}", frame.mixer_out.elevator),
+                    ],
+                    hint: "Use for ADC -> mixer chain validation   ESC: Back".to_string(),
+                }
+            }
+            AppId::Models => {
+                let model_count = frame.model_entries.len().max(1);
+                let focus = frame.model_focus_idx.min(model_count.saturating_sub(1));
+                let active = frame.model_active_idx.min(model_count.saturating_sub(1));
+                let focused_entry = frame.model_entries.get(focus);
+                let active_entry = frame.model_entries.get(active);
+                let metric_active = active_entry
+                    .map(|entry| format!("{} · {}", entry.name, entry.protocol))
+                    .unwrap_or_else(|| "No models".to_string());
+                let metric_focus = focused_entry
+                    .map(|entry| format!("{} · {}", entry.name, entry.protocol))
+                    .unwrap_or_else(|| "No models".to_string());
+                let mut list_lines: Vec<String> = frame
+                    .model_entries
+                    .iter()
+                    .enumerate()
+                    .take(4)
+                    .map(|(idx, entry)| {
+                        format!(
+                            "{} {} ({})",
+                            if idx == active { "[A]" } else { "   " },
+                            if idx == focus {
+                                format!("> {}", entry.name)
+                            } else {
+                                format!("  {}", entry.name)
+                            },
+                            entry.protocol
+                        )
+                    })
+                    .collect();
+                if list_lines.is_empty() {
+                    list_lines.push("No imported models found in ./models".to_string());
+                }
+                while list_lines.len() < 4 {
+                    list_lines.push("".to_string());
+                }
+                AppTemplateData {
+                    accent: spec.accent,
+                    badge: "MODELS".to_string(),
+                    title: "Model Profile Manager".to_string(),
+                    subtitle: "Imported profiles from ./models".to_string(),
+                    metric_titles: ["Active Profile".to_string(), "Focused Profile".to_string()],
+                    metric_values: [metric_active, metric_focus],
+                    metric_progress: [
+                        Self::clamp_pct(((active + 1) * 100 / model_count) as i32),
+                        Self::clamp_pct(((focus + 1) * 100 / model_count) as i32),
+                    ],
+                    list_title: "Profiles".to_string(),
+                    list_lines: [
+                        list_lines[0].clone(),
+                        list_lines[1].clone(),
+                        list_lines[2].clone(),
+                        list_lines[3].clone(),
+                    ],
+                    hint: "UP/DOWN: Focus Profile   ENTER: Apply   Files: ./models   ESC: Back"
+                        .to_string(),
+                }
+            }
+            AppId::Cloud => {
+                let online = frame.cloud_connected;
+                let sync_secs = if online {
+                    frame
+                        .status
+                        .unix_time_secs
+                        .saturating_sub(frame.cloud_last_sync_secs)
+                } else {
+                    0
+                };
+                AppTemplateData {
+                    accent: spec.accent,
+                    badge: "CLOUD".to_string(),
+                    title: "Telemetry Link".to_string(),
+                    subtitle: "Sync state and link quality".to_string(),
+                    metric_titles: ["Connection".to_string(), "Link Quality".to_string()],
+                    metric_values: [
+                        if online {
+                            "ONLINE".to_string()
+                        } else {
+                            "OFFLINE".to_string()
+                        },
+                        format!("{}%", frame.status.signal_strength_percent),
+                    ],
+                    metric_progress: [
+                        if online { 100 } else { 0 },
+                        frame.status.signal_strength_percent,
+                    ],
+                    list_title: "Sync Status".to_string(),
+                    list_lines: [
+                        format!("Last Sync: {}s ago", sync_secs),
+                        format!("Remote Battery: {}%", frame.status.remote_battery_percent),
+                        format!(
+                            "Aircraft Battery: {}%",
+                            frame.status.aircraft_battery_percent
+                        ),
+                        format!(
+                            "Signal Class: {}",
+                            signal_grade(frame.status.signal_strength_percent)
+                        ),
+                    ],
+                    hint: "ENTER: Connect/Disconnect   ESC: Back".to_string(),
+                }
+            }
+            AppId::Scripts => {
+                let list_lines = elrs_list_lines(frame);
+                AppTemplateData {
+                    accent: spec.accent,
+                    badge: "ELRS".to_string(),
+                    title: "ExpressLRS Config".to_string(),
+                    subtitle: format!(
+                        "{} · {} · {}",
+                        if frame.elrs.connected {
+                            frame.elrs.module_name.as_str()
+                        } else {
+                            "Module not connected"
+                        },
+                        if frame.elrs.busy { "busy" } else { "ready" },
+                        frame.elrs.path,
+                    ),
+                    metric_titles: ["Packet / Telemetry".to_string(), "TX / WiFi".to_string()],
+                    metric_values: [
+                        format!(
+                            "{} · {}",
+                            frame.elrs.packet_rate, frame.elrs.telemetry_ratio
+                        ),
+                        format!(
+                            "{} · {}",
+                            frame.elrs.tx_power,
+                            if frame.elrs.wifi_running {
+                                "WiFi ON"
+                            } else {
+                                "WiFi OFF"
+                            }
+                        ),
+                    ],
+                    metric_progress: [
+                        if frame.elrs.connected { 100 } else { 0 },
+                        if frame.elrs.wifi_running { 100 } else { 35 },
+                    ],
+                    list_title: if frame.elrs.editor_active {
+                        format!(
+                            "Edit {} = {}",
+                            frame.elrs.editor_label, frame.elrs.editor_buffer
+                        )
+                    } else {
+                        format!("{} / {}", frame.elrs.device_name, frame.elrs.version)
+                    },
+                    list_lines,
+                    hint: if frame.elrs.editor_active {
+                        "UP/DOWN: Char   LEFT/RIGHT: Move   ENTER: Save   ESC: Cancel".to_string()
+                    } else {
+                        "UP/DOWN: Select   LEFT/RIGHT: Adjust   ENTER: Open/Apply   ]: Refresh   ESC: Back"
+                            .to_string()
+                    },
+                }
+            }
+            _ => {
+                let spec = app_spec(app);
+                let badge = spec.title.to_string();
+                AppTemplateData {
+                    accent: spec.accent,
+                    title: format!("{} Workspace", badge),
+                    badge,
+                    subtitle: "Template placeholder".to_string(),
+                    metric_titles: ["Metric A".to_string(), "Metric B".to_string()],
+                    metric_values: ["--".to_string(), "--".to_string()],
+                    metric_progress: [0, 0],
+                    list_title: "Details".to_string(),
+                    list_lines: [
+                        "No data".to_string(),
+                        "No data".to_string(),
+                        "No data".to_string(),
+                        "No data".to_string(),
+                    ],
+                    hint: "ESC: Back".to_string(),
+                }
+            }
+        }
+    }
+
+    pub(super) fn build_ui(&mut self) {
+        let width = self.width as i32;
+        let height = self.height as i32;
+
+        unsafe {
+            let root = lvgl_sys::lv_disp_get_scr_act(std::ptr::null_mut());
+            lvgl_sys::lv_obj_clean(root);
+            lvgl_sys::lv_obj_set_style_bg_color(root, lvgl_sys::_LV_COLOR_MAKE(20, 20, 22), 0);
+            lvgl_sys::lv_obj_clear_flag(root, lvgl_sys::LV_OBJ_FLAG_SCROLLABLE);
+            lvgl_sys::lv_obj_set_scrollbar_mode(
+                root,
+                lvgl_sys::LV_SCROLLBAR_MODE_OFF as lvgl_sys::lv_scrollbar_mode_t,
+            );
+
+            let status_label = lvgl_sys::lv_label_create(root);
+            lvgl_sys::lv_obj_set_style_text_color(
+                status_label,
+                lvgl_sys::_LV_COLOR_MAKE(180, 180, 185),
+                0,
+            );
+            lvgl_sys::lv_obj_set_pos(status_label, Self::to_coord(8), Self::to_coord(10));
+
+            let page_label = lvgl_sys::lv_label_create(root);
+            lvgl_sys::lv_obj_set_style_text_color(
+                page_label,
+                lvgl_sys::_LV_COLOR_MAKE(180, 180, 185),
+                0,
+            );
+            lvgl_sys::lv_obj_set_pos(
+                page_label,
+                Self::to_coord(width / 2 - 34),
+                Self::to_coord(10),
+            );
+
+            let back_button = lvgl_sys::lv_obj_create(root);
+            lvgl_sys::lv_obj_set_pos(back_button, Self::to_coord(8), Self::to_coord(6));
+            lvgl_sys::lv_obj_set_size(back_button, Self::to_coord(80), Self::to_coord(30));
+            lvgl_sys::lv_obj_set_style_radius(back_button, 15, 0);
+            lvgl_sys::lv_obj_set_style_bg_color(
+                back_button,
+                lvgl_sys::_LV_COLOR_MAKE(56, 60, 68),
+                0,
+            );
+            lvgl_sys::lv_obj_set_style_border_width(back_button, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_top(back_button, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_bottom(back_button, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_left(back_button, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_right(back_button, 0, 0);
+            lvgl_sys::lv_obj_clear_flag(back_button, lvgl_sys::LV_OBJ_FLAG_SCROLLABLE);
+            lvgl_sys::lv_obj_add_flag(back_button, lvgl_sys::LV_OBJ_FLAG_HIDDEN);
+
+            let back_button_label = lvgl_sys::lv_label_create(back_button);
+            Self::set_label_text(back_button_label, "< Back");
+            lvgl_sys::lv_obj_set_style_text_color(
+                back_button_label,
+                lvgl_sys::_LV_COLOR_MAKE(255, 255, 255),
+                0,
+            );
+            lvgl_sys::lv_obj_align(
+                back_button_label,
+                lvgl_sys::LV_ALIGN_CENTER as lvgl_sys::lv_align_t,
+                0,
+                0,
+            );
+
+            let clock_label = lvgl_sys::lv_label_create(root);
+            lvgl_sys::lv_obj_set_style_text_color(
+                clock_label,
+                lvgl_sys::_LV_COLOR_MAKE(180, 180, 185),
+                0,
+            );
+            lvgl_sys::lv_obj_set_pos(clock_label, Self::to_coord(width - 90), Self::to_coord(10));
+
+            let launcher_panel = lvgl_sys::lv_obj_create(root);
+            lvgl_sys::lv_obj_set_pos(
+                launcher_panel,
+                Self::to_coord(0),
+                Self::to_coord(TOP_BAR_HEIGHT),
+            );
+            lvgl_sys::lv_obj_set_size(
+                launcher_panel,
+                Self::to_coord(width),
+                Self::to_coord(height - TOP_BAR_HEIGHT),
+            );
+            lvgl_sys::lv_obj_set_style_bg_color(
+                launcher_panel,
+                lvgl_sys::_LV_COLOR_MAKE(30, 30, 32),
+                0,
+            );
+            lvgl_sys::lv_obj_set_style_border_width(launcher_panel, 0, 0);
+            lvgl_sys::lv_obj_set_style_radius(launcher_panel, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_top(launcher_panel, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_bottom(launcher_panel, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_left(launcher_panel, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_right(launcher_panel, 0, 0);
+            lvgl_sys::lv_obj_clear_flag(launcher_panel, lvgl_sys::LV_OBJ_FLAG_SCROLLABLE);
+            lvgl_sys::lv_obj_set_scrollbar_mode(
+                launcher_panel,
+                lvgl_sys::LV_SCROLLBAR_MODE_OFF as lvgl_sys::lv_scrollbar_mode_t,
+            );
+
+            let branding_label = lvgl_sys::lv_label_create(launcher_panel);
+            Self::set_label_text(branding_label, "LinTX");
+            lvgl_sys::lv_obj_set_style_text_color(
+                branding_label,
+                lvgl_sys::lv_color_t { full: 0xFFFF },
+                0,
+            );
+            lvgl_sys::lv_obj_set_style_text_font(
+                branding_label,
+                &lvgl_sys::lv_font_montserrat_48 as *const _ as *const lvgl_sys::lv_font_t,
+                0,
+            );
+            lvgl_sys::lv_obj_align(
+                branding_label,
+                lvgl_sys::LV_ALIGN_TOP_MID as lvgl_sys::lv_align_t,
+                0,
+                60,
+            );
+
+            let mut app_cards = [std::ptr::null_mut(); 8];
+            let mut app_icon_boxes = [std::ptr::null_mut(); 8];
+            let mut app_icon_labels = [std::ptr::null_mut(); 8];
+            let mut app_title_labels = [std::ptr::null_mut(); 8];
+
+            for i in 0..8 {
+                let card = lvgl_sys::lv_obj_create(launcher_panel);
+                lvgl_sys::lv_obj_set_style_bg_opa(card, 0, 0);
+                lvgl_sys::lv_obj_set_style_border_width(card, 0, 0);
+                lvgl_sys::lv_obj_set_style_pad_top(card, 0, 0);
+                lvgl_sys::lv_obj_set_style_pad_bottom(card, 0, 0);
+                lvgl_sys::lv_obj_set_style_pad_left(card, 0, 0);
+                lvgl_sys::lv_obj_set_style_pad_right(card, 0, 0);
+                lvgl_sys::lv_obj_clear_flag(card, lvgl_sys::LV_OBJ_FLAG_SCROLLABLE);
+
+                let icon_box = lvgl_sys::lv_obj_create(card);
+                lvgl_sys::lv_obj_set_style_radius(icon_box, 16, 0);
+                lvgl_sys::lv_obj_set_style_border_width(icon_box, 0, 0);
+                lvgl_sys::lv_obj_clear_flag(icon_box, lvgl_sys::LV_OBJ_FLAG_SCROLLABLE);
+
+                let icon_label = lvgl_sys::lv_label_create(icon_box);
+                lvgl_sys::lv_obj_set_style_text_color(
+                    icon_label,
+                    lvgl_sys::_LV_COLOR_MAKE(255, 255, 255),
+                    0,
+                );
+                lvgl_sys::lv_obj_align(
+                    icon_label,
+                    lvgl_sys::LV_ALIGN_CENTER as lvgl_sys::lv_align_t,
+                    0,
+                    0,
+                );
+
+                let title_label = lvgl_sys::lv_label_create(card);
+                lvgl_sys::lv_obj_set_style_text_color(
+                    title_label,
+                    lvgl_sys::_LV_COLOR_MAKE(220, 220, 220),
+                    0,
+                );
+                lvgl_sys::lv_obj_set_style_text_align(
+                    title_label,
+                    lvgl_sys::LV_TEXT_ALIGN_CENTER as lvgl_sys::lv_text_align_t,
+                    0,
+                );
+
+                app_cards[i] = card;
+                app_icon_boxes[i] = icon_box;
+                app_icon_labels[i] = icon_label;
+                app_title_labels[i] = title_label;
+            }
+
+            let launcher_panel_alt = lvgl_sys::lv_obj_create(root);
+            lvgl_sys::lv_obj_set_pos(
+                launcher_panel_alt,
+                Self::to_coord(width + 20),
+                Self::to_coord(TOP_BAR_HEIGHT),
+            );
+            lvgl_sys::lv_obj_set_size(
+                launcher_panel_alt,
+                Self::to_coord(width),
+                Self::to_coord(height - TOP_BAR_HEIGHT),
+            );
+            lvgl_sys::lv_obj_set_style_bg_color(
+                launcher_panel_alt,
+                lvgl_sys::_LV_COLOR_MAKE(30, 30, 32),
+                0,
+            );
+            lvgl_sys::lv_obj_set_style_border_width(launcher_panel_alt, 0, 0);
+            lvgl_sys::lv_obj_set_style_radius(launcher_panel_alt, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_top(launcher_panel_alt, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_bottom(launcher_panel_alt, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_left(launcher_panel_alt, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_right(launcher_panel_alt, 0, 0);
+            lvgl_sys::lv_obj_clear_flag(launcher_panel_alt, lvgl_sys::LV_OBJ_FLAG_SCROLLABLE);
+            lvgl_sys::lv_obj_set_scrollbar_mode(
+                launcher_panel_alt,
+                lvgl_sys::LV_SCROLLBAR_MODE_OFF as lvgl_sys::lv_scrollbar_mode_t,
+            );
+
+            let branding_label_alt = lvgl_sys::lv_label_create(launcher_panel_alt);
+            Self::set_label_text(branding_label_alt, "LinTX");
+            lvgl_sys::lv_obj_set_style_text_color(
+                branding_label_alt,
+                lvgl_sys::lv_color_t { full: 0xFFFF },
+                0,
+            );
+            lvgl_sys::lv_obj_set_style_text_font(
+                branding_label_alt,
+                &lvgl_sys::lv_font_montserrat_48 as *const _ as *const lvgl_sys::lv_font_t,
+                0,
+            );
+            lvgl_sys::lv_obj_align(
+                branding_label_alt,
+                lvgl_sys::LV_ALIGN_TOP_MID as lvgl_sys::lv_align_t,
+                0,
+                60,
+            );
+
+            let mut app_cards_alt = [std::ptr::null_mut(); 8];
+            let mut app_icon_boxes_alt = [std::ptr::null_mut(); 8];
+            let mut app_icon_labels_alt = [std::ptr::null_mut(); 8];
+            let mut app_title_labels_alt = [std::ptr::null_mut(); 8];
+
+            for i in 0..8 {
+                let card = lvgl_sys::lv_obj_create(launcher_panel_alt);
+                lvgl_sys::lv_obj_set_style_bg_opa(card, 0, 0);
+                lvgl_sys::lv_obj_set_style_border_width(card, 0, 0);
+                lvgl_sys::lv_obj_set_style_pad_top(card, 0, 0);
+                lvgl_sys::lv_obj_set_style_pad_bottom(card, 0, 0);
+                lvgl_sys::lv_obj_set_style_pad_left(card, 0, 0);
+                lvgl_sys::lv_obj_set_style_pad_right(card, 0, 0);
+                lvgl_sys::lv_obj_clear_flag(card, lvgl_sys::LV_OBJ_FLAG_SCROLLABLE);
+
+                let icon_box = lvgl_sys::lv_obj_create(card);
+                lvgl_sys::lv_obj_set_style_radius(icon_box, 16, 0);
+                lvgl_sys::lv_obj_set_style_border_width(icon_box, 0, 0);
+                lvgl_sys::lv_obj_clear_flag(icon_box, lvgl_sys::LV_OBJ_FLAG_SCROLLABLE);
+
+                let icon_label = lvgl_sys::lv_label_create(icon_box);
+                lvgl_sys::lv_obj_set_style_text_color(
+                    icon_label,
+                    lvgl_sys::_LV_COLOR_MAKE(255, 255, 255),
+                    0,
+                );
+                lvgl_sys::lv_obj_align(
+                    icon_label,
+                    lvgl_sys::LV_ALIGN_CENTER as lvgl_sys::lv_align_t,
+                    0,
+                    0,
+                );
+
+                let title_label = lvgl_sys::lv_label_create(card);
+                lvgl_sys::lv_obj_set_style_text_color(
+                    title_label,
+                    lvgl_sys::_LV_COLOR_MAKE(220, 220, 220),
+                    0,
+                );
+                lvgl_sys::lv_obj_set_style_text_align(
+                    title_label,
+                    lvgl_sys::LV_TEXT_ALIGN_CENTER as lvgl_sys::lv_text_align_t,
+                    0,
+                );
+
+                app_cards_alt[i] = card;
+                app_icon_boxes_alt[i] = icon_box;
+                app_icon_labels_alt[i] = icon_label;
+                app_title_labels_alt[i] = title_label;
+            }
+
+            let app_panel = lvgl_sys::lv_obj_create(root);
+            lvgl_sys::lv_obj_set_pos(
+                app_panel,
+                Self::to_coord(width + 20),
+                Self::to_coord(TOP_BAR_HEIGHT),
+            );
+            lvgl_sys::lv_obj_set_size(
+                app_panel,
+                Self::to_coord(width),
+                Self::to_coord(height - TOP_BAR_HEIGHT),
+            );
+            lvgl_sys::lv_obj_set_style_bg_color(app_panel, lvgl_sys::_LV_COLOR_MAKE(22, 24, 28), 0);
+            lvgl_sys::lv_obj_set_style_border_width(app_panel, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_top(app_panel, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_bottom(app_panel, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_left(app_panel, 0, 0);
+            lvgl_sys::lv_obj_set_style_pad_right(app_panel, 0, 0);
+            lvgl_sys::lv_obj_clear_flag(app_panel, lvgl_sys::LV_OBJ_FLAG_SCROLLABLE);
+            lvgl_sys::lv_obj_set_scrollbar_mode(
+                app_panel,
+                lvgl_sys::LV_SCROLLBAR_MODE_OFF as lvgl_sys::lv_scrollbar_mode_t,
+            );
+
+            let app_header_card = lvgl_sys::lv_obj_create(app_panel);
+            lvgl_sys::lv_obj_set_pos(app_header_card, Self::to_coord(14), Self::to_coord(14));
+            lvgl_sys::lv_obj_set_size(
+                app_header_card,
+                Self::to_coord(width - 28),
+                Self::to_coord(92),
+            );
+            lvgl_sys::lv_obj_set_style_bg_color(
+                app_header_card,
+                lvgl_sys::_LV_COLOR_MAKE(45, 62, 92),
+                0,
+            );
+            lvgl_sys::lv_obj_set_style_bg_opa(app_header_card, 240, 0);
+            lvgl_sys::lv_obj_set_style_radius(app_header_card, 16, 0);
+            lvgl_sys::lv_obj_set_style_border_width(app_header_card, 0, 0);
+            lvgl_sys::lv_obj_clear_flag(app_header_card, lvgl_sys::LV_OBJ_FLAG_SCROLLABLE);
+            lvgl_sys::lv_obj_set_scrollbar_mode(
+                app_header_card,
+                lvgl_sys::LV_SCROLLBAR_MODE_OFF as lvgl_sys::lv_scrollbar_mode_t,
+            );
+
+            let app_badge_label = lvgl_sys::lv_label_create(app_header_card);
+            lvgl_sys::lv_obj_set_style_text_color(
+                app_badge_label,
+                lvgl_sys::_LV_COLOR_MAKE(228, 236, 255),
+                0,
+            );
+            lvgl_sys::lv_obj_set_style_text_font(
+                app_badge_label,
+                &lvgl_sys::lv_font_montserrat_14 as *const _ as *const lvgl_sys::lv_font_t,
+                0,
+            );
+            lvgl_sys::lv_obj_set_pos(app_badge_label, Self::to_coord(14), Self::to_coord(6));
+
+            let app_title_label = lvgl_sys::lv_label_create(app_header_card);
+            lvgl_sys::lv_obj_set_style_text_color(
+                app_title_label,
+                lvgl_sys::_LV_COLOR_MAKE(255, 255, 255),
+                0,
+            );
+            lvgl_sys::lv_obj_set_style_text_font(
+                app_title_label,
+                &lvgl_sys::lv_font_montserrat_20 as *const _ as *const lvgl_sys::lv_font_t,
+                0,
+            );
+            lvgl_sys::lv_obj_set_pos(app_title_label, Self::to_coord(14), Self::to_coord(22));
+
+            let app_subtitle_label = lvgl_sys::lv_label_create(app_header_card);
+            lvgl_sys::lv_obj_set_style_text_color(
+                app_subtitle_label,
+                lvgl_sys::_LV_COLOR_MAKE(200, 200, 200),
+                0,
+            );
+            lvgl_sys::lv_obj_set_pos(app_subtitle_label, Self::to_coord(14), Self::to_coord(50));
+            lvgl_sys::lv_obj_set_width(app_subtitle_label, Self::to_coord(width - 56));
+
+            let mut app_metric_cards = [std::ptr::null_mut(); 2];
+            let mut app_metric_titles = [std::ptr::null_mut(); 2];
+            let mut app_metric_values = [std::ptr::null_mut(); 2];
+            let mut app_metric_bars = [std::ptr::null_mut(); 2];
+
+            for i in 0..2 {
+                let card = lvgl_sys::lv_obj_create(app_panel);
+                let card_w = ((width - 42) / 2).max(120);
+                let x = 14 + i as i32 * (card_w + 14);
+                lvgl_sys::lv_obj_set_pos(card, Self::to_coord(x), Self::to_coord(122));
+                lvgl_sys::lv_obj_set_size(card, Self::to_coord(card_w), Self::to_coord(110));
+                lvgl_sys::lv_obj_set_style_radius(card, 14, 0);
+                lvgl_sys::lv_obj_set_style_bg_color(card, lvgl_sys::_LV_COLOR_MAKE(34, 36, 42), 0);
+                lvgl_sys::lv_obj_set_style_bg_opa(card, 255, 0);
+                lvgl_sys::lv_obj_set_style_border_width(card, 0, 0);
+                lvgl_sys::lv_obj_clear_flag(card, lvgl_sys::LV_OBJ_FLAG_SCROLLABLE);
+                lvgl_sys::lv_obj_set_scrollbar_mode(
+                    card,
+                    lvgl_sys::LV_SCROLLBAR_MODE_OFF as lvgl_sys::lv_scrollbar_mode_t,
+                );
+
+                let title = lvgl_sys::lv_label_create(card);
+                lvgl_sys::lv_obj_set_style_text_color(
+                    title,
+                    lvgl_sys::_LV_COLOR_MAKE(168, 176, 188),
+                    0,
+                );
+                lvgl_sys::lv_obj_set_pos(title, Self::to_coord(10), Self::to_coord(10));
+
+                let value = lvgl_sys::lv_label_create(card);
+                lvgl_sys::lv_obj_set_style_text_color(
+                    value,
+                    lvgl_sys::_LV_COLOR_MAKE(255, 255, 255),
+                    0,
+                );
+                lvgl_sys::lv_obj_set_style_text_font(
+                    value,
+                    &lvgl_sys::lv_font_montserrat_20 as *const _ as *const lvgl_sys::lv_font_t,
+                    0,
+                );
+                lvgl_sys::lv_obj_set_pos(value, Self::to_coord(10), Self::to_coord(36));
+
+                let bar = lvgl_sys::lv_bar_create(card);
+                lvgl_sys::lv_obj_set_pos(bar, Self::to_coord(10), Self::to_coord(82));
+                lvgl_sys::lv_obj_set_size(bar, Self::to_coord(card_w - 20), Self::to_coord(12));
+                lvgl_sys::lv_bar_set_range(bar, 0, 100);
+                lvgl_sys::lv_bar_set_value(bar, 0, lvgl_sys::lv_anim_enable_t_LV_ANIM_OFF);
+                lvgl_sys::lv_obj_set_style_bg_color(bar, lvgl_sys::_LV_COLOR_MAKE(56, 58, 64), 0);
+                lvgl_sys::lv_obj_set_style_bg_color(
+                    bar,
+                    lvgl_sys::_LV_COLOR_MAKE(120, 196, 255),
+                    lvgl_sys::LV_PART_INDICATOR,
+                );
+                lvgl_sys::lv_obj_set_style_radius(bar, 6, 0);
+
+                app_metric_cards[i] = card;
+                app_metric_titles[i] = title;
+                app_metric_values[i] = value;
+                app_metric_bars[i] = bar;
+            }
+
+            let app_list_title = lvgl_sys::lv_label_create(app_panel);
+            lvgl_sys::lv_obj_set_style_text_color(
+                app_list_title,
+                lvgl_sys::_LV_COLOR_MAKE(174, 182, 196),
+                0,
+            );
+            lvgl_sys::lv_obj_set_pos(app_list_title, Self::to_coord(14), Self::to_coord(248));
+
+            let mut app_list_lines = [std::ptr::null_mut(); 4];
+            for (i, line) in app_list_lines.iter_mut().enumerate() {
+                let row = lvgl_sys::lv_label_create(app_panel);
+                lvgl_sys::lv_obj_set_style_text_color(
+                    row,
+                    lvgl_sys::_LV_COLOR_MAKE(228, 232, 238),
+                    0,
+                );
+                lvgl_sys::lv_obj_set_pos(
+                    row,
+                    Self::to_coord(14),
+                    Self::to_coord(274 + i as i32 * 28),
+                );
+                lvgl_sys::lv_obj_set_width(row, Self::to_coord(width - 28));
+                *line = row;
+            }
+
+            let app_hint_label = lvgl_sys::lv_label_create(app_panel);
+            lvgl_sys::lv_obj_set_style_text_color(
+                app_hint_label,
+                lvgl_sys::_LV_COLOR_MAKE(170, 174, 182),
+                0,
+            );
+            lvgl_sys::lv_obj_set_pos(
+                app_hint_label,
+                Self::to_coord(14),
+                Self::to_coord(height - TOP_BAR_HEIGHT - 34),
+            );
+            lvgl_sys::lv_obj_set_width(app_hint_label, Self::to_coord(width - 28));
+
+            self.ui = Some(LvglUiObjects {
+                status_label,
+                clock_label,
+                page_label,
+                back_button,
+                launcher_panel,
+                launcher_panel_alt,
+                app_panel,
+                app_header_card,
+                app_badge_label,
+                app_title_label,
+                app_subtitle_label,
+                app_metric_cards,
+                app_metric_titles,
+                app_metric_values,
+                app_metric_bars,
+                app_list_title,
+                app_list_lines,
+                app_hint_label,
+                branding_label,
+                branding_label_alt,
+                app_cards,
+                app_cards_alt,
+                app_icon_boxes,
+                app_icon_boxes_alt,
+                app_icon_labels,
+                app_icon_labels_alt,
+                app_title_labels,
+                app_title_labels_alt,
+            });
+        }
+    }
+
+    fn update_launcher_panel(
+        &self,
+        page_idx: usize,
+        selected: Option<(usize, usize)>,
+        branding_label: *mut lvgl_sys::lv_obj_t,
+        app_cards: &[*mut lvgl_sys::lv_obj_t; 8],
+        app_icon_boxes: &[*mut lvgl_sys::lv_obj_t; 8],
+        app_icon_labels: &[*mut lvgl_sys::lv_obj_t; 8],
+        app_title_labels: &[*mut lvgl_sys::lv_obj_t; 8],
+    ) {
+        let p = page(page_idx);
+        let panel_h = (self.height as i32 - TOP_BAR_HEIGHT - 20).max(120);
+        let panel_w = self.width as i32 - 40;
+        let is_home = page_idx == 0;
+
+        unsafe {
+            if is_home {
+                lvgl_sys::lv_obj_clear_flag(branding_label, lvgl_sys::LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lvgl_sys::lv_obj_add_flag(branding_label, lvgl_sys::LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+
+        let col_gap = 20;
+        let row_gap = 25;
+        let cols = p.cols.max(1) as i32;
+        let cell_w = (panel_w - (cols - 1) * col_gap) / cols;
+        let cell_h = 140;
+
+        for idx in 0..8 {
+            let row = idx / 4;
+            let col = idx % 4;
+            let card = app_cards[idx];
+            let icon_box = app_icon_boxes[idx];
+            let title_label = app_title_labels[idx];
+            let icon_label = app_icon_labels[idx];
+
+            if row < p.rows {
+                if let Some(app) = app_at(page_idx, row, col) {
+                    let spec = app_spec(app);
+                    let is_selected = selected == Some((row, col));
+                    let x = 20 + col as i32 * (cell_w + col_gap);
+                    let mut y = 20 + row as i32 * (cell_h + row_gap);
+
+                    if is_home {
+                        y = panel_h - cell_h - 40;
+                    }
+
+                    let mut icon_size = (cell_h - 25).min(cell_w).min(80);
+                    if is_selected {
+                        icon_size += 14;
+                    }
+
+                    unsafe {
+                        lvgl_sys::lv_obj_set_pos(card, Self::to_coord(x), Self::to_coord(y));
+                        lvgl_sys::lv_obj_set_size(
+                            card,
+                            Self::to_coord(cell_w),
+                            Self::to_coord(cell_h),
+                        );
+                        lvgl_sys::lv_obj_set_size(
+                            icon_box,
+                            Self::to_coord(icon_size),
+                            Self::to_coord(icon_size),
+                        );
+                        lvgl_sys::lv_obj_align(
+                            icon_box,
+                            lvgl_sys::LV_ALIGN_TOP_MID as lvgl_sys::lv_align_t,
+                            0,
+                            0,
+                        );
+                        lvgl_sys::lv_obj_set_style_bg_color(
+                            icon_box,
+                            lvgl_sys::_LV_COLOR_MAKE(spec.accent.0, spec.accent.1, spec.accent.2),
+                            0,
+                        );
+                        lvgl_sys::lv_obj_set_style_bg_opa(icon_box, 255, 0);
+                        lvgl_sys::lv_obj_set_style_text_color(
+                            title_label,
+                            lvgl_sys::lv_color_t { full: 0xFFFF },
+                            0,
+                        );
+                        lvgl_sys::lv_obj_align(
+                            title_label,
+                            lvgl_sys::LV_ALIGN_BOTTOM_MID as lvgl_sys::lv_align_t,
+                            0,
+                            0,
+                        );
+                        Self::set_label_text(title_label, spec.title);
+                        Self::set_label_text(icon_label, spec.icon_text);
+
+                        if is_selected {
+                            lvgl_sys::lv_obj_set_style_border_width(icon_box, 4, 0);
+                            lvgl_sys::lv_obj_set_style_border_color(
+                                icon_box,
+                                lvgl_sys::lv_color_t { full: 0xFFFF },
+                                0,
+                            );
+                            lvgl_sys::lv_obj_set_style_border_opa(icon_box, 255, 0);
+                            lvgl_sys::lv_obj_set_style_text_font(
+                                title_label,
+                                &lvgl_sys::lv_font_montserrat_20 as *const _
+                                    as *const lvgl_sys::lv_font_t,
+                                0,
+                            );
+                        } else {
+                            lvgl_sys::lv_obj_set_style_border_width(icon_box, 0, 0);
+                            lvgl_sys::lv_obj_set_style_outline_width(icon_box, 0, 0);
+                            lvgl_sys::lv_obj_set_style_text_font(
+                                title_label,
+                                &lvgl_sys::lv_font_montserrat_14 as *const _
+                                    as *const lvgl_sys::lv_font_t,
+                                0,
+                            );
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            unsafe {
+                lvgl_sys::lv_obj_set_pos(
+                    card,
+                    Self::to_coord(self.width as i32 + 100),
+                    Self::to_coord(self.height as i32 + 100),
+                );
+            }
+        }
+    }
+
+    fn update_launcher(&self, frame: &UiFrame, ui: &LvglUiObjects) {
+        self.update_launcher_panel(
+            frame.launcher_page,
+            Some((frame.selected_row, frame.selected_col)),
+            ui.branding_label,
+            &ui.app_cards,
+            &ui.app_icon_boxes,
+            &ui.app_icon_labels,
+            &ui.app_title_labels,
+        );
+    }
+
+    fn update_app_page(&self, frame: &UiFrame, ui: &LvglUiObjects, app: AppId) {
+        let data = self.app_template_data(frame, app);
+
+        unsafe {
+            lvgl_sys::lv_obj_set_style_bg_color(
+                ui.app_header_card,
+                lvgl_sys::_LV_COLOR_MAKE(data.accent.0, data.accent.1, data.accent.2),
+                0,
+            );
+
+            for card in ui.app_metric_cards {
+                lvgl_sys::lv_obj_set_style_border_width(card, 1, 0);
+                lvgl_sys::lv_obj_set_style_border_color(
+                    card,
+                    lvgl_sys::_LV_COLOR_MAKE(
+                        data.accent.0 / 2,
+                        data.accent.1 / 2,
+                        data.accent.2 / 2,
+                    ),
+                    0,
+                );
+            }
+            for bar in ui.app_metric_bars {
+                lvgl_sys::lv_obj_set_style_bg_color(
+                    bar,
+                    lvgl_sys::_LV_COLOR_MAKE(data.accent.0, data.accent.1, data.accent.2),
+                    lvgl_sys::LV_PART_INDICATOR,
+                );
+            }
+        }
+
+        Self::set_label_text(ui.app_badge_label, &data.badge);
+        Self::set_label_text(ui.app_title_label, &data.title);
+        Self::set_label_text(ui.app_subtitle_label, &data.subtitle);
+
+        for i in 0..2 {
+            Self::set_label_text(ui.app_metric_titles[i], &data.metric_titles[i]);
+            Self::set_label_text(ui.app_metric_values[i], &data.metric_values[i]);
+            unsafe {
+                lvgl_sys::lv_bar_set_value(
+                    ui.app_metric_bars[i],
+                    data.metric_progress[i].into(),
+                    lvgl_sys::lv_anim_enable_t_LV_ANIM_OFF,
+                );
+            }
+        }
+
+        Self::set_label_text(ui.app_list_title, &data.list_title);
+        for i in 0..4 {
+            Self::set_label_text(ui.app_list_lines[i], &data.list_lines[i]);
+        }
+        Self::set_label_text(ui.app_hint_label, &data.hint);
+    }
+
+    pub(super) fn sync_ui(&mut self, frame: &UiFrame) {
+        let Some(ui) = self.ui.as_ref() else {
+            return;
+        };
+        let prev_frame = self.last_synced_frame.clone();
+        let prev_frame = prev_frame.as_ref();
+
+        if prev_frame
+            .map(|prev| prev.status != frame.status)
+            .unwrap_or(true)
+        {
+            let status = format!(
+                "R {}%  A {}%  S {}%",
+                frame.status.remote_battery_percent,
+                frame.status.aircraft_battery_percent,
+                frame.status.signal_strength_percent,
+            );
+            Self::set_label_text(ui.status_label, &status);
+
+            let secs = frame.status.unix_time_secs % 86400;
+            let clock = format!(
+                "{:02}:{:02}:{:02}",
+                secs / 3600,
+                (secs % 3600) / 60,
+                secs % 60
+            );
+            Self::set_label_text(ui.clock_label, &clock);
+        }
+
+        if prev_frame
+            .map(|prev| prev.launcher_page != frame.launcher_page)
+            .unwrap_or(true)
+        {
+            let page_txt = format!("Page {}/{}", frame.launcher_page + 1, PAGE_SPECS.len());
+            Self::set_label_text(ui.page_label, &page_txt);
+        }
+
+        let hidden_right = self.hidden_right();
+        let hidden_left = self.hidden_left();
+        let prev_page = self.last_page;
+        let prev_launcher_page = self.last_launcher_page;
+
+        if self.last_page.is_none() {
+            self.current_launcher_x = 0;
+            self.target_launcher_x = 0;
+            self.current_app_x = if matches!(frame.page, UiPage::App(_)) {
+                0
+            } else {
+                hidden_right
+            };
+            self.target_app_x = self.current_app_x;
+        } else if prev_page != Some(frame.page) {
+            match (prev_page, frame.page) {
+                (Some(UiPage::Launcher), UiPage::App(_)) => {
+                    self.current_launcher_x = 0;
+                    self.target_launcher_x = 0;
+                    self.current_app_x = hidden_right;
+                    self.target_app_x = 0;
+                }
+                (Some(UiPage::App(_)), UiPage::Launcher) => {
+                    self.current_launcher_x = 0;
+                    self.target_launcher_x = 0;
+                    self.current_app_x = self.drag_offset_x.unwrap_or(0).max(0);
+                    self.target_app_x = hidden_right;
+                }
+                _ => {}
+            }
+        } else if matches!(frame.page, UiPage::Launcher)
+            && prev_launcher_page != frame.launcher_page
+        {
+            self.launcher_transition_from = Some(prev_launcher_page);
+            self.current_launcher_x = if frame.launcher_page > prev_launcher_page {
+                hidden_right
+            } else {
+                hidden_left
+            };
+            self.target_launcher_x = 0;
+        }
+
+        match frame.page {
+            UiPage::Launcher => {
+                let mut alt_page = None;
+                let mut alt_x = hidden_right;
+                if let Some(drag_x) = self.drag_offset_x {
+                    self.current_launcher_x = drag_x.clamp(hidden_left / 2, hidden_right / 2);
+                    self.target_launcher_x = self.current_launcher_x;
+                    if drag_x < 0 && frame.launcher_page + 1 < PAGE_SPECS.len() {
+                        alt_page = Some(frame.launcher_page + 1);
+                        alt_x = self.current_launcher_x + hidden_right;
+                    } else if drag_x > 0 && frame.launcher_page > 0 {
+                        alt_page = Some(frame.launcher_page - 1);
+                        alt_x = self.current_launcher_x - hidden_right;
+                    }
+                } else {
+                    self.target_launcher_x = 0;
+                    Self::animate_axis(&mut self.current_launcher_x, self.target_launcher_x);
+                    if let Some(from_page) = self.launcher_transition_from {
+                        alt_page = Some(from_page);
+                        alt_x = if frame.launcher_page > from_page {
+                            self.current_launcher_x - hidden_right
+                        } else {
+                            self.current_launcher_x + hidden_right
+                        };
+                        if self.current_launcher_x == self.target_launcher_x {
+                            self.launcher_transition_from = None;
+                        }
+                    }
+                }
+                Self::animate_axis(&mut self.current_app_x, self.target_app_x);
+
+                Self::set_hidden_if_changed(ui.back_button, true, &mut self.back_button_hidden);
+                Self::set_obj_pos_if_changed(
+                    ui.launcher_panel,
+                    &mut self.last_launcher_panel_pos,
+                    self.current_launcher_x,
+                    TOP_BAR_HEIGHT,
+                );
+                Self::set_obj_pos_if_changed(
+                    ui.app_panel,
+                    &mut self.last_app_panel_pos,
+                    self.current_app_x,
+                    TOP_BAR_HEIGHT,
+                );
+                Self::set_obj_pos_if_changed(
+                    ui.launcher_panel_alt,
+                    &mut self.last_launcher_panel_alt_pos,
+                    alt_page.map(|_| alt_x).unwrap_or(hidden_right),
+                    TOP_BAR_HEIGHT,
+                );
+
+                let launcher_changed = prev_frame
+                    .map(|prev| {
+                        prev.page != frame.page
+                            || prev.launcher_page != frame.launcher_page
+                            || prev.selected_row != frame.selected_row
+                            || prev.selected_col != frame.selected_col
+                    })
+                    .unwrap_or(true);
+                if launcher_changed {
+                    self.update_launcher(frame, ui);
+                }
+                if let Some(page_idx) = alt_page.filter(|_| self.last_alt_launcher_page != alt_page)
+                {
+                    self.update_launcher_panel(
+                        page_idx,
+                        None,
+                        ui.branding_label_alt,
+                        &ui.app_cards_alt,
+                        &ui.app_icon_boxes_alt,
+                        &ui.app_icon_labels_alt,
+                        &ui.app_title_labels_alt,
+                    );
+                }
+                self.last_alt_launcher_page = alt_page;
+            }
+            UiPage::App(app) => {
+                if let Some(drag_x) = self.drag_offset_x {
+                    self.current_app_x = if drag_x > 0 {
+                        drag_x.clamp(0, hidden_right)
+                    } else {
+                        (drag_x / 4).clamp(hidden_left / 4, 0)
+                    };
+                    self.target_app_x = self.current_app_x;
+                } else {
+                    self.target_app_x = 0;
+                    Self::animate_axis(&mut self.current_app_x, self.target_app_x);
+                }
+
+                Self::set_hidden_if_changed(ui.back_button, false, &mut self.back_button_hidden);
+                Self::set_obj_pos_if_changed(
+                    ui.launcher_panel,
+                    &mut self.last_launcher_panel_pos,
+                    0,
+                    TOP_BAR_HEIGHT,
+                );
+                Self::set_obj_pos_if_changed(
+                    ui.launcher_panel_alt,
+                    &mut self.last_launcher_panel_alt_pos,
+                    hidden_right,
+                    TOP_BAR_HEIGHT,
+                );
+                Self::set_obj_pos_if_changed(
+                    ui.app_panel,
+                    &mut self.last_app_panel_pos,
+                    self.current_app_x,
+                    TOP_BAR_HEIGHT,
+                );
+                if prev_frame
+                    .map(|prev| {
+                        prev.page != frame.page
+                            || prev.launcher_page != frame.launcher_page
+                            || prev.selected_row != frame.selected_row
+                            || prev.selected_col != frame.selected_col
+                    })
+                    .unwrap_or(true)
+                {
+                    self.update_launcher(frame, ui);
+                }
+                if prev_frame.map(|prev| prev != frame).unwrap_or(true) {
+                    self.update_app_page(frame, ui, app);
+                }
+                self.last_alt_launcher_page = None;
+            }
+        }
+
+        self.last_synced_frame = Some(frame.clone());
+        self.last_page = Some(frame.page);
+        self.last_launcher_page = frame.launcher_page;
+    }
+}

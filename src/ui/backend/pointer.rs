@@ -1,0 +1,265 @@
+#[cfg(any(feature = "sdl_ui", all(feature = "lvgl_ui", target_os = "linux")))]
+use std::collections::VecDeque;
+
+use crate::ui::{
+    catalog::{app_at, page},
+    input::UiInputEvent,
+    model::{UiFrame, UiPage},
+};
+
+use super::lvgl_core::TOP_BAR_HEIGHT;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PointerSwipeAction {
+    PrevPage,
+    NextPage,
+    Back,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PointerTapAction {
+    OpenLauncherApp { row: usize, col: usize },
+    BackButton,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PointerUiSnapshot {
+    page: UiPage,
+    launcher_page: usize,
+    selected_row: usize,
+    selected_col: usize,
+    width: i32,
+    height: i32,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct PointerGestureState {
+    pub(super) pressed: bool,
+    start: (i32, i32),
+    current: (i32, i32),
+}
+
+#[derive(Debug, Default)]
+pub(super) struct PointerInputAdapter {
+    snapshot: Option<PointerUiSnapshot>,
+    pub(super) gesture: PointerGestureState,
+    pending_events: VecDeque<UiInputEvent>,
+}
+
+impl PointerUiSnapshot {
+    pub(super) fn from_frame(frame: &UiFrame, width: u32, height: u32) -> Self {
+        Self {
+            page: frame.page,
+            launcher_page: frame.launcher_page,
+            selected_row: frame.selected_row,
+            selected_col: frame.selected_col,
+            width: width as i32,
+            height: height as i32,
+        }
+    }
+
+    fn hit_test_launcher_app(&self, x: i32, y: i32) -> Option<(usize, usize)> {
+        if !matches!(self.page, UiPage::Launcher) {
+            return None;
+        }
+
+        let content_top = TOP_BAR_HEIGHT;
+        if y < content_top {
+            return None;
+        }
+
+        let p = page(self.launcher_page);
+        let panel_h = (self.height - TOP_BAR_HEIGHT - 20).max(120);
+        let panel_w = self.width - 40;
+        let col_gap = 20;
+        let row_gap = 25;
+        let cols = p.cols.max(1) as i32;
+        let cell_w = (panel_w - (cols - 1) * col_gap) / cols;
+        let cell_h = 140;
+        let is_home = self.launcher_page == 0;
+
+        for row in 0..p.rows {
+            for col in 0..p.cols {
+                if app_at(self.launcher_page, row, col).is_none() {
+                    continue;
+                }
+                let left = 20 + col as i32 * (cell_w + col_gap);
+                let top = if is_home {
+                    TOP_BAR_HEIGHT + panel_h - cell_h - 40
+                } else {
+                    TOP_BAR_HEIGHT + 20 + row as i32 * (cell_h + row_gap)
+                };
+                if x >= left && x < left + cell_w && y >= top && y < top + cell_h {
+                    return Some((row, col));
+                }
+            }
+        }
+
+        None
+    }
+
+    fn hit_test_back_button(&self, x: i32, y: i32) -> bool {
+        !matches!(self.page, UiPage::Launcher) && x >= 8 && x < 88 && y >= 6 && y < 36
+    }
+
+    fn tap_action(&self, x: i32, y: i32) -> Option<PointerTapAction> {
+        if let Some((row, col)) = self.hit_test_launcher_app(x, y) {
+            return Some(PointerTapAction::OpenLauncherApp { row, col });
+        }
+        if self.hit_test_back_button(x, y) {
+            return Some(PointerTapAction::BackButton);
+        }
+        None
+    }
+
+    fn swipe_action(&self, dx: i32) -> Option<PointerSwipeAction> {
+        match self.page {
+            UiPage::Launcher if dx <= -48 => Some(PointerSwipeAction::NextPage),
+            UiPage::Launcher if dx >= 48 => Some(PointerSwipeAction::PrevPage),
+            UiPage::App(_) if dx >= 48 => Some(PointerSwipeAction::Back),
+            _ => None,
+        }
+    }
+}
+
+impl PointerInputAdapter {
+    const TAP_SLOP: i32 = 32;
+
+    fn touch_debug_enabled() -> bool {
+        std::env::var("LINTX_TOUCH_DEBUG")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
+            .unwrap_or(false)
+    }
+
+    fn touch_debug_log(msg: &str) {
+        if Self::touch_debug_enabled() {
+            super::super::debug_log(msg);
+        }
+    }
+
+    pub(super) fn update_snapshot(&mut self, frame: &UiFrame, width: u32, height: u32) {
+        self.snapshot = Some(PointerUiSnapshot::from_frame(frame, width, height));
+    }
+
+    pub(super) fn pop_event(&mut self) -> Option<UiInputEvent> {
+        self.pending_events.pop_front()
+    }
+
+    pub(super) fn drag_offset_x(&self) -> Option<i32> {
+        self.gesture
+            .pressed
+            .then_some(self.gesture.current.0 - self.gesture.start.0)
+    }
+
+    pub(super) fn begin(&mut self, x: i32, y: i32) {
+        Self::touch_debug_log(&format!("touch begin x={x} y={y}"));
+        self.gesture.pressed = true;
+        self.gesture.start = (x, y);
+        self.gesture.current = (x, y);
+    }
+
+    pub(super) fn update(&mut self, x: i32, y: i32) {
+        if self.gesture.pressed {
+            Self::touch_debug_log(&format!("touch update x={x} y={y}"));
+            self.gesture.current = (x, y);
+        }
+    }
+
+    pub(super) fn end(&mut self, x: i32, y: i32) {
+        if !self.gesture.pressed {
+            return;
+        }
+
+        self.gesture.current = (x, y);
+        self.gesture.pressed = false;
+
+        let Some(snapshot) = self.snapshot else {
+            return;
+        };
+
+        let dx = self.gesture.current.0 - self.gesture.start.0;
+        let dy = self.gesture.current.1 - self.gesture.start.1;
+        let abs_dx = dx.abs();
+        let abs_dy = dy.abs();
+        Self::touch_debug_log(&format!(
+            "touch end x={} y={} dx={} dy={} abs_dx={} abs_dy={} page={:?} launcher_page={}",
+            x, y, dx, dy, abs_dx, abs_dy, snapshot.page, snapshot.launcher_page
+        ));
+
+        if abs_dx >= 48 && abs_dx > abs_dy {
+            match snapshot.swipe_action(dx) {
+                Some(PointerSwipeAction::PrevPage) => {
+                    Self::touch_debug_log("touch gesture -> UiInputEvent::PagePrev");
+                    self.pending_events.push_back(UiInputEvent::PagePrev)
+                }
+                Some(PointerSwipeAction::NextPage) => {
+                    Self::touch_debug_log("touch gesture -> UiInputEvent::PageNext");
+                    self.pending_events.push_back(UiInputEvent::PageNext)
+                }
+                Some(PointerSwipeAction::Back) => {
+                    Self::touch_debug_log("touch gesture -> UiInputEvent::Back");
+                    self.pending_events.push_back(UiInputEvent::Back)
+                }
+                None => {}
+            }
+            return;
+        }
+
+        if abs_dx <= Self::TAP_SLOP && abs_dy <= Self::TAP_SLOP {
+            let tap_x = (self.gesture.start.0 + x) / 2;
+            let tap_y = (self.gesture.start.1 + y) / 2;
+            Self::touch_debug_log(&format!(
+                "touch tap candidate x={} y={} start=({}, {}) end=({}, {})",
+                tap_x, tap_y, self.gesture.start.0, self.gesture.start.1, x, y
+            ));
+            match snapshot.tap_action(tap_x, tap_y) {
+                Some(PointerTapAction::OpenLauncherApp { row, col }) => {
+                    Self::touch_debug_log(&format!(
+                        "touch tap -> launcher app row={} col={}",
+                        row, col
+                    ));
+                    for evt in self.align_selection(snapshot, row, col) {
+                        Self::touch_debug_log(&format!("touch align -> {:?}", evt));
+                        self.pending_events.push_back(evt);
+                    }
+                    Self::touch_debug_log("touch tap -> UiInputEvent::Open");
+                    self.pending_events.push_back(UiInputEvent::Open);
+                }
+                Some(PointerTapAction::BackButton) => {
+                    Self::touch_debug_log("touch tap -> UiInputEvent::Back");
+                    self.pending_events.push_back(UiInputEvent::Back);
+                }
+                None => {
+                    Self::touch_debug_log("touch tap candidate -> no hit");
+                }
+            }
+        }
+    }
+
+    fn align_selection(
+        &self,
+        snapshot: PointerUiSnapshot,
+        row: usize,
+        col: usize,
+    ) -> std::vec::IntoIter<UiInputEvent> {
+        let mut events = Vec::new();
+        if !matches!(snapshot.page, UiPage::Launcher) {
+            return events.into_iter();
+        }
+
+        for _ in row..snapshot.selected_row {
+            events.push(UiInputEvent::Up);
+        }
+        for _ in snapshot.selected_row..row {
+            events.push(UiInputEvent::Down);
+        }
+        for _ in col..snapshot.selected_col {
+            events.push(UiInputEvent::Left);
+        }
+        for _ in snapshot.selected_col..col {
+            events.push(UiInputEvent::Right);
+        }
+
+        events.into_iter()
+    }
+}
