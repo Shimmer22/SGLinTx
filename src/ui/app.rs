@@ -20,11 +20,23 @@ use super::{
     model::{AppId, UiFrame, UiModelEntry, UiPage},
 };
 
+const UI_ACTIVE_ANIMATION_WINDOW: Duration = Duration::from_millis(280);
+const UI_MAX_IDLE_SLEEP: Duration = Duration::from_millis(80);
+
 pub struct UiApp {
     frame: UiFrame,
 }
 
 impl UiApp {
+    fn update_field<T: PartialEq>(slot: &mut T, value: T) -> bool {
+        if *slot == value {
+            false
+        } else {
+            *slot = value;
+            true
+        }
+    }
+
     pub fn new() -> Self {
         let mut app = Self {
             frame: UiFrame::default(),
@@ -341,30 +353,37 @@ impl UiApp {
         self.publish_active_model(&active_model_tx);
 
         let frame_time = Duration::from_millis((1000 / fps.max(1)) as u64);
+        let idle_sleep = UI_MAX_IDLE_SLEEP.min(frame_time.saturating_mul(2));
         let mut frame_idx: u64 = 0;
+        let mut active_until = std::time::Instant::now() + UI_ACTIVE_ANIMATION_WINDOW;
+        let mut last_render = std::time::Instant::now()
+            .checked_sub(frame_time)
+            .unwrap_or_else(std::time::Instant::now);
 
         backend.init();
         super::debug_log("backend.init done");
 
         loop {
-            if let Some(status) = status_rx.try_read() {
-                self.frame.status = status;
+            let mut dirty = false;
+
+            while let Some(status) = status_rx.try_read() {
+                dirty |= Self::update_field(&mut self.frame.status, status);
             }
 
-            if let Some(cfg) = config_rx.try_read() {
-                self.frame.config = cfg;
+            while let Some(cfg) = config_rx.try_read() {
+                dirty |= Self::update_field(&mut self.frame.config, cfg);
             }
 
-            if let Some(adc_raw) = adc_raw_rx.try_read() {
-                self.frame.adc_raw = adc_raw;
+            while let Some(adc_raw) = adc_raw_rx.try_read() {
+                dirty |= Self::update_field(&mut self.frame.adc_raw, adc_raw);
             }
 
-            if let Some(mixer_out) = mixer_out_rx.try_read() {
-                self.frame.mixer_out = mixer_out;
+            while let Some(mixer_out) = mixer_out_rx.try_read() {
+                dirty |= Self::update_field(&mut self.frame.mixer_out, mixer_out);
             }
 
-            if let Some(elrs) = elrs_rx.try_read() {
-                self.frame.elrs = elrs;
+            while let Some(elrs) = elrs_rx.try_read() {
+                dirty |= Self::update_field(&mut self.frame.elrs, elrs);
             }
 
             if self.frame.cloud_connected
@@ -372,6 +391,7 @@ impl UiApp {
                     >= self.frame.cloud_last_sync_secs.saturating_add(5)
             {
                 self.frame.cloud_last_sync_secs = self.frame.status.unix_time_secs;
+                dirty = true;
             }
 
             while let Some(evt) = backend.poll_event() {
@@ -379,21 +399,41 @@ impl UiApp {
                     backend.shutdown();
                     return;
                 }
+                dirty = true;
             }
 
-            backend.render(&self.frame);
-            frame_idx = frame_idx.saturating_add(1);
-            if super::debug_enabled() && frame_idx % 120 == 0 {
-                super::debug_log(&format!(
-                    "render heartbeat frame={} page={:?} launcher_page={} selection=({}, {})",
-                    frame_idx,
-                    self.frame.page,
-                    self.frame.launcher_page,
-                    self.frame.selected_row,
-                    self.frame.selected_col
-                ));
+            let now = std::time::Instant::now();
+            if dirty {
+                active_until = now + UI_ACTIVE_ANIMATION_WINDOW;
             }
-            std::thread::sleep(frame_time);
+
+            let should_render = dirty
+                || now < active_until
+                || now.saturating_duration_since(last_render) >= idle_sleep;
+
+            if should_render {
+                backend.render(&self.frame);
+                last_render = std::time::Instant::now();
+                frame_idx = frame_idx.saturating_add(1);
+                if super::debug_enabled() && frame_idx % 120 == 0 {
+                    super::debug_log(&format!(
+                        "render heartbeat frame={} page={:?} launcher_page={} selection=({}, {}) active={}",
+                        frame_idx,
+                        self.frame.page,
+                        self.frame.launcher_page,
+                        self.frame.selected_row,
+                        self.frame.selected_col,
+                        now < active_until
+                    ));
+                }
+            }
+
+            let sleep_for = if std::time::Instant::now() < active_until {
+                frame_time
+            } else {
+                idle_sleep
+            };
+            std::thread::sleep(sleep_for);
         }
     }
 }

@@ -21,14 +21,14 @@ pub enum UiPage {
     App(AppId),
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UiModelEntry {
     pub id: String,
     pub name: String,
     pub protocol: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiFrame {
     pub page: UiPage,
     pub launcher_page: usize,

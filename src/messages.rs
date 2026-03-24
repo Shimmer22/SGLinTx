@@ -1,11 +1,11 @@
 use crate::config::ModelConfig;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AdcRawMsg {
     pub value: [i16; 4],
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SystemStatusMsg {
     pub remote_battery_percent: u8,
     pub aircraft_battery_percent: u8,
@@ -24,7 +24,7 @@ impl Default for SystemStatusMsg {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SystemConfigMsg {
     pub backlight_percent: u8,
     pub sound_percent: u8,

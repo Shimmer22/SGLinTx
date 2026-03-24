@@ -16,7 +16,7 @@ use crate::{
     CALIBRATE_FILENAME,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MixerOutMsg {
     pub thrust: u16,
     pub direction: u16,

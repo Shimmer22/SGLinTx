@@ -1,10 +1,35 @@
 use rpos::thread_logln;
 
 use linux_embedded_hal::I2cdev;
-use nb::block;
+use std::time::Duration;
 
 use crate::messages::AdcRawMsg;
 use ads1x1x::{channel, Ads1x1x, SlaveAddr};
+
+const ADC_POLL_INTERVAL: Duration = Duration::from_micros(500);
+
+fn read_channel<CH>(
+    adc: &mut Ads1x1x<
+        I2cdev,
+        ads1x1x::ic::Ads1115,
+        ads1x1x::ic::Resolution16Bit,
+        ads1x1x::mode::OneShot,
+    >,
+    mut channel: impl FnMut() -> CH,
+) -> i16
+where
+    CH: ads1x1x::ChannelId<
+        Ads1x1x<I2cdev, ads1x1x::ic::Ads1115, ads1x1x::ic::Resolution16Bit, ads1x1x::mode::OneShot>,
+    >,
+{
+    loop {
+        match adc.read(channel()) {
+            Ok(value) => return value >> 4,
+            Err(nb::Error::WouldBlock) => std::thread::sleep(ADC_POLL_INTERVAL),
+            Err(nb::Error::Other(err)) => panic!("adc read failed: {err:?}"),
+        }
+    }
+}
 
 fn adc_main(_argc: u32, _argv: *const &str) {
     let dev = I2cdev::new("/dev/i2c-0").unwrap();
@@ -20,10 +45,10 @@ fn adc_main(_argc: u32, _argv: *const &str) {
 
     loop {
         let value = [
-            block!(adc.read(channel::SingleA0)).unwrap() >> 4,
-            block!(adc.read(channel::SingleA1)).unwrap() >> 4,
-            block!(adc.read(channel::SingleA2)).unwrap() >> 4,
-            block!(adc.read(channel::SingleA3)).unwrap() >> 4,
+            read_channel(&mut adc, || channel::SingleA0),
+            read_channel(&mut adc, || channel::SingleA1),
+            read_channel(&mut adc, || channel::SingleA2),
+            read_channel(&mut adc, || channel::SingleA3),
         ];
 
         adc_raw_tx.send(AdcRawMsg { value });
