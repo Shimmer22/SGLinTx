@@ -9,6 +9,8 @@ pub(super) const TOP_BAR_HEIGHT: i32 = 44;
 pub(super) const LVGL_DRAW_BUF_PIXELS: usize = 800 * 480;
 
 pub(super) struct LvglUiObjects {
+    pub(super) debug_panel: *mut lvgl_sys::lv_obj_t,
+    pub(super) debug_label: *mut lvgl_sys::lv_obj_t,
     pub(super) status_label: *mut lvgl_sys::lv_obj_t,
     pub(super) clock_label: *mut lvgl_sys::lv_obj_t,
     pub(super) page_label: *mut lvgl_sys::lv_obj_t,
@@ -73,6 +75,7 @@ pub(super) struct LvglUiCore {
     last_launcher_panel_alt_pos: Option<(i32, i32)>,
     last_app_panel_pos: Option<(i32, i32)>,
     back_button_hidden: bool,
+    debug_overlay_hidden: bool,
 }
 
 impl LvglUiCore {
@@ -102,6 +105,7 @@ impl LvglUiCore {
             last_launcher_panel_alt_pos: None,
             last_app_panel_pos: None,
             back_button_hidden: true,
+            debug_overlay_hidden: true,
         }
     }
 
@@ -458,7 +462,49 @@ impl LvglUiCore {
                 lvgl_sys::_LV_COLOR_MAKE(180, 180, 185),
                 0,
             );
-            lvgl_sys::lv_obj_set_pos(status_label, Self::to_coord(8), Self::to_coord(10));
+            lvgl_sys::lv_obj_set_pos(status_label, Self::to_coord(104), Self::to_coord(10));
+
+            let debug_panel = lvgl_sys::lv_obj_create(root);
+            lvgl_sys::lv_obj_set_pos(debug_panel, Self::to_coord(6), Self::to_coord(6));
+            lvgl_sys::lv_obj_set_size(debug_panel, Self::to_coord(90), Self::to_coord(34));
+            lvgl_sys::lv_obj_set_style_radius(debug_panel, 10, 0);
+            lvgl_sys::lv_obj_set_style_bg_color(
+                debug_panel,
+                lvgl_sys::_LV_COLOR_MAKE(12, 14, 18),
+                0,
+            );
+            lvgl_sys::lv_obj_set_style_bg_opa(debug_panel, 216, 0);
+            lvgl_sys::lv_obj_set_style_border_width(debug_panel, 1, 0);
+            lvgl_sys::lv_obj_set_style_border_color(
+                debug_panel,
+                lvgl_sys::_LV_COLOR_MAKE(66, 72, 84),
+                0,
+            );
+            lvgl_sys::lv_obj_set_style_pad_top(debug_panel, 4, 0);
+            lvgl_sys::lv_obj_set_style_pad_bottom(debug_panel, 4, 0);
+            lvgl_sys::lv_obj_set_style_pad_left(debug_panel, 6, 0);
+            lvgl_sys::lv_obj_set_style_pad_right(debug_panel, 6, 0);
+            lvgl_sys::lv_obj_clear_flag(debug_panel, lvgl_sys::LV_OBJ_FLAG_SCROLLABLE);
+            lvgl_sys::lv_obj_add_flag(debug_panel, lvgl_sys::LV_OBJ_FLAG_HIDDEN);
+
+            let debug_label = lvgl_sys::lv_label_create(debug_panel);
+            lvgl_sys::lv_obj_set_style_text_color(
+                debug_label,
+                lvgl_sys::_LV_COLOR_MAKE(220, 226, 235),
+                0,
+            );
+            lvgl_sys::lv_obj_set_style_text_font(
+                debug_label,
+                &lvgl_sys::lv_font_montserrat_14 as *const _ as *const lvgl_sys::lv_font_t,
+                0,
+            );
+            lvgl_sys::lv_obj_align(
+                debug_label,
+                lvgl_sys::LV_ALIGN_CENTER as lvgl_sys::lv_align_t,
+                0,
+                0,
+            );
+            Self::set_label_text(debug_label, "FPS 0\nCPU --");
 
             let page_label = lvgl_sys::lv_label_create(root);
             lvgl_sys::lv_obj_set_style_text_color(
@@ -473,7 +519,7 @@ impl LvglUiCore {
             );
 
             let back_button = lvgl_sys::lv_obj_create(root);
-            lvgl_sys::lv_obj_set_pos(back_button, Self::to_coord(8), Self::to_coord(6));
+            lvgl_sys::lv_obj_set_pos(back_button, Self::to_coord(104), Self::to_coord(6));
             lvgl_sys::lv_obj_set_size(back_button, Self::to_coord(80), Self::to_coord(30));
             lvgl_sys::lv_obj_set_style_radius(back_button, 15, 0);
             lvgl_sys::lv_obj_set_style_bg_color(
@@ -886,6 +932,8 @@ impl LvglUiCore {
             lvgl_sys::lv_obj_set_width(app_hint_label, Self::to_coord(width - 28));
 
             self.ui = Some(LvglUiObjects {
+                debug_panel,
+                debug_label,
                 status_label,
                 clock_label,
                 page_label,
@@ -1120,6 +1168,26 @@ impl LvglUiCore {
         };
         let prev_frame = self.last_synced_frame.clone();
         let prev_frame = prev_frame.as_ref();
+
+        if prev_frame
+            .map(|prev| prev.debug != frame.debug)
+            .unwrap_or(true)
+        {
+            Self::set_hidden_if_changed(
+                ui.debug_panel,
+                !frame.debug.enabled,
+                &mut self.debug_overlay_hidden,
+            );
+            if frame.debug.enabled {
+                let cpu = frame
+                    .debug
+                    .cpu_percent
+                    .map(|value| format!("{value}%"))
+                    .unwrap_or_else(|| "--".to_string());
+                let debug = format!("FPS {}\nCPU {cpu}", frame.debug.fps);
+                Self::set_label_text(ui.debug_label, &debug);
+            }
+        }
 
         if prev_frame
             .map(|prev| prev.status != frame.status)

@@ -17,11 +17,154 @@ use super::{
     backend::LvglBackend,
     catalog::{app_at, page, PAGE_SPECS},
     input::UiInputEvent,
-    model::{AppId, UiFrame, UiModelEntry, UiPage},
+    model::{AppId, UiDebugStats, UiFrame, UiModelEntry, UiPage},
 };
 
 const UI_ACTIVE_ANIMATION_WINDOW: Duration = Duration::from_millis(280);
 const UI_MAX_IDLE_SLEEP: Duration = Duration::from_millis(80);
+const UI_DEBUG_SAMPLE_WINDOW: Duration = Duration::from_secs(1);
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+struct CpuSnapshot {
+    process_ticks: u64,
+    total_ticks: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct LinuxCpuUsageSampler {
+    prev: Option<CpuSnapshot>,
+    cpu_count: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxCpuUsageSampler {
+    fn new() -> Self {
+        Self {
+            prev: None,
+            cpu_count: std::thread::available_parallelism()
+                .map(|count| count.get() as u64)
+                .unwrap_or(1),
+        }
+    }
+
+    fn sample(&mut self) -> Option<u16> {
+        let snapshot = Self::read_snapshot()?;
+        let usage = self.prev.and_then(|prev| {
+            let proc_delta = snapshot.process_ticks.saturating_sub(prev.process_ticks);
+            let total_delta = snapshot.total_ticks.saturating_sub(prev.total_ticks);
+            if total_delta == 0 {
+                None
+            } else {
+                Some(
+                    ((proc_delta as f64) * 100.0 * self.cpu_count as f64 / total_delta as f64)
+                        .round()
+                        .clamp(0.0, u16::MAX as f64) as u16,
+                )
+            }
+        });
+        self.prev = Some(snapshot);
+        usage
+    }
+
+    fn read_snapshot() -> Option<CpuSnapshot> {
+        let process_ticks = Self::read_process_ticks()?;
+        let total_ticks = Self::read_total_ticks()?;
+        Some(CpuSnapshot {
+            process_ticks,
+            total_ticks,
+        })
+    }
+
+    fn read_process_ticks() -> Option<u64> {
+        let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+        let close_paren = stat.rfind(')')?;
+        let fields: Vec<&str> = stat.get(close_paren + 2..)?.split_whitespace().collect();
+        let utime = fields.get(11)?.parse::<u64>().ok()?;
+        let stime = fields.get(12)?.parse::<u64>().ok()?;
+        Some(utime.saturating_add(stime))
+    }
+
+    fn read_total_ticks() -> Option<u64> {
+        let stat = std::fs::read_to_string("/proc/stat").ok()?;
+        let cpu_line = stat.lines().find(|line| line.starts_with("cpu "))?;
+        cpu_line
+            .split_whitespace()
+            .skip(1)
+            .try_fold(0u64, |acc, field| {
+                field
+                    .parse::<u64>()
+                    .ok()
+                    .map(|value| acc.saturating_add(value))
+            })
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Default)]
+struct LinuxCpuUsageSampler;
+
+#[cfg(not(target_os = "linux"))]
+impl LinuxCpuUsageSampler {
+    fn new() -> Self {
+        Self
+    }
+
+    fn sample(&mut self) -> Option<u16> {
+        None
+    }
+}
+
+struct UiPerfSampler {
+    enabled: bool,
+    window_start: std::time::Instant,
+    frames_in_window: u32,
+    cpu_sampler: LinuxCpuUsageSampler,
+}
+
+impl UiPerfSampler {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            window_start: std::time::Instant::now(),
+            frames_in_window: 0,
+            cpu_sampler: LinuxCpuUsageSampler::new(),
+        }
+    }
+
+    fn initial_stats(&self) -> UiDebugStats {
+        UiDebugStats {
+            enabled: self.enabled,
+            fps: 0,
+            cpu_percent: None,
+        }
+    }
+
+    fn on_render(&mut self, stats: &mut UiDebugStats, now: std::time::Instant) {
+        if !self.enabled {
+            return;
+        }
+
+        self.frames_in_window = self.frames_in_window.saturating_add(1);
+        let elapsed = now.saturating_duration_since(self.window_start);
+        if elapsed < UI_DEBUG_SAMPLE_WINDOW {
+            return;
+        }
+
+        let secs = elapsed.as_secs_f64();
+        let fps = if secs > 0.0 {
+            ((self.frames_in_window as f64) / secs).round() as u16
+        } else {
+            0
+        };
+        stats.enabled = true;
+        stats.fps = fps;
+        stats.cpu_percent = self.cpu_sampler.sample();
+        self.window_start = now;
+        self.frames_in_window = 0;
+    }
+}
 
 pub struct UiApp {
     frame: UiFrame,
@@ -41,6 +184,7 @@ impl UiApp {
         let mut app = Self {
             frame: UiFrame::default(),
         };
+        app.frame.debug.enabled = super::debug_overlay_enabled();
         app.reload_models();
         app
     }
@@ -359,6 +503,8 @@ impl UiApp {
         let mut last_render = std::time::Instant::now()
             .checked_sub(frame_time)
             .unwrap_or_else(std::time::Instant::now);
+        let mut perf_sampler = UiPerfSampler::new(super::debug_overlay_enabled());
+        self.frame.debug = perf_sampler.initial_stats();
 
         backend.init();
         super::debug_log("backend.init done");
@@ -412,6 +558,7 @@ impl UiApp {
                 || now.saturating_duration_since(last_render) >= idle_sleep;
 
             if should_render {
+                perf_sampler.on_render(&mut self.frame.debug, now);
                 backend.render(&self.frame);
                 last_render = std::time::Instant::now();
                 frame_idx = frame_idx.saturating_add(1);

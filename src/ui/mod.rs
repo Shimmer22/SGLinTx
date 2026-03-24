@@ -14,6 +14,13 @@ pub fn debug_enabled() -> bool {
     ui_flag || common_flag
 }
 
+pub fn debug_overlay_enabled() -> bool {
+    let overlay_flag = std::env::var("LINTX_UI_DEBUG_OVERLAY")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
+        .unwrap_or(false);
+    overlay_flag || debug_enabled()
+}
+
 pub fn debug_log(msg: &str) {
     if debug_enabled() {
         eprintln!("[lintx-ui] {msg}");

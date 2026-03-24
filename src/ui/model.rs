@@ -28,6 +28,13 @@ pub struct UiModelEntry {
     pub protocol: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UiDebugStats {
+    pub enabled: bool,
+    pub fps: u16,
+    pub cpu_percent: Option<u16>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiFrame {
     pub page: UiPage,
@@ -44,6 +51,7 @@ pub struct UiFrame {
     pub cloud_connected: bool,
     pub cloud_last_sync_secs: u64,
     pub elrs: ElrsStateMsg,
+    pub debug: UiDebugStats,
 }
 
 impl Default for UiFrame {
@@ -68,6 +76,7 @@ impl Default for UiFrame {
             cloud_connected: false,
             cloud_last_sync_secs: 0,
             elrs: ElrsStateMsg::default(),
+            debug: UiDebugStats::default(),
         }
     }
 }
