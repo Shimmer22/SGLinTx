@@ -51,7 +51,7 @@ start_ui_fb() {
     LINTX_SOCKET_PATH="$SOCKET_PATH" \
     LINTX_FB_ROTATE="$FB_ROTATE" \
     LINTX_FB_SWAP_RB="$FB_SWAP_RB" \
-    "$BIN" -- ui_demo --backend fb --fb-device /dev/fb0 $touch_args --width "$UI_WIDTH" --height "$UI_HEIGHT" \
+    "$BIN" -- ui_demo --backend fb --fb-device /dev/fb0 $touch_args --width "$UI_WIDTH" --height "$UI_HEIGHT" --fps 60 \
     >"$LOG_DIR/ui.log" 2>&1 &
 }
 

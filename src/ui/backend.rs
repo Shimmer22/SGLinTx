@@ -14,6 +14,8 @@ use std::{
 const FBIOGET_VSCREENINFO: libc::c_ulong = 0x4600;
 #[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
 const FBIOGET_FSCREENINFO: libc::c_ulong = 0x4602;
+#[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
+const FBIOPAN_DISPLAY: libc::c_ulong = 0x4606;
 
 #[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
 #[repr(C)]
@@ -497,6 +499,7 @@ struct FbdevBackend {
 #[cfg(all(feature = "lvgl_ui", target_os = "linux"))]
 struct LinuxFramebuffer {
     file: std::fs::File,
+    var_info: LinuxFbVarScreeninfo,
     map: *mut u8,
     map_len: usize,
     shadow: Vec<u8>,
@@ -508,7 +511,9 @@ struct LinuxFramebuffer {
     bits_per_pixel: u32,
     bytes_per_pixel: usize,
     xoffset: u32,
-    yoffset: u32,
+    current_yoffset: u32,
+    render_yoffset: u32,
+    page_flip: bool,
     red: LinuxFbBitfield,
     green: LinuxFbBitfield,
     blue: LinuxFbBitfield,
@@ -2697,6 +2702,7 @@ impl LinuxFramebuffer {
         let finfo = unsafe { finfo.assume_init() };
         let vinfo = unsafe { vinfo.assume_init() };
         let bytes_per_pixel = vinfo.bits_per_pixel.div_ceil(8) as usize;
+        let page_flip = vinfo.yres_virtual >= vinfo.yres.saturating_mul(2) && finfo.ypanstep > 0;
         let map_len = finfo.smem_len as usize;
         let map = unsafe {
             libc::mmap(
@@ -2715,6 +2721,7 @@ impl LinuxFramebuffer {
 
         Ok(Self {
             file,
+            var_info: vinfo,
             map: map.cast(),
             map_len,
             shadow,
@@ -2726,7 +2733,9 @@ impl LinuxFramebuffer {
             bits_per_pixel: vinfo.bits_per_pixel,
             bytes_per_pixel,
             xoffset: vinfo.xoffset,
-            yoffset: vinfo.yoffset,
+            current_yoffset: vinfo.yoffset,
+            render_yoffset: vinfo.yoffset,
+            page_flip,
             red: vinfo.red,
             green: vinfo.green,
             blue: vinfo.blue,
@@ -2738,6 +2747,35 @@ impl LinuxFramebuffer {
                 .unwrap_or(0),
             swap_rb: std::env::var_os("LINTX_FB_SWAP_RB").is_some(),
         })
+    }
+
+    fn frame_bytes(&self) -> usize {
+        self.stride.saturating_mul(self.height as usize)
+    }
+
+    fn begin_frame(&mut self) {
+        self.dirty = None;
+        if !self.page_flip {
+            self.render_yoffset = self.current_yoffset;
+            return;
+        }
+
+        let next_yoffset = if self.current_yoffset >= self.height {
+            0
+        } else {
+            self.height
+        };
+        let frame_bytes = self.frame_bytes();
+        let src_offset = self.current_yoffset as usize * self.stride;
+        let dst_offset = next_yoffset as usize * self.stride;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.map.add(src_offset),
+                self.map.add(dst_offset),
+                frame_bytes,
+            );
+        }
+        self.render_yoffset = next_yoffset;
     }
 
     fn scale_channel(value: u8, length: u32) -> u32 {
@@ -2777,11 +2815,11 @@ impl LinuxFramebuffer {
 
     fn span_offset(&self, dst_y: u32, dst_x: u32, pixels: usize) -> io::Result<(usize, usize)> {
         let byte_len = pixels * self.bytes_per_pixel;
-        let offset = ((u64::from(dst_y) + u64::from(self.yoffset)) * self.stride as u64)
+        let offset = ((u64::from(dst_y) + u64::from(self.render_yoffset)) * self.stride as u64)
             + ((u64::from(dst_x) + u64::from(self.xoffset)) * self.bytes_per_pixel as u64)
             as u64;
         let end = offset as usize + byte_len;
-        if end > self.shadow.len() {
+        if end > self.map_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "framebuffer span out of range",
@@ -2799,12 +2837,43 @@ impl LinuxFramebuffer {
 
     fn write_span(&mut self, dst_y: u32, dst_x: u32, pixels: usize) -> io::Result<()> {
         let (offset, byte_len) = self.span_offset(dst_y, dst_x, pixels)?;
-        self.shadow[offset..offset + byte_len].copy_from_slice(&self.row_scratch[..byte_len]);
+        if self.page_flip {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.row_scratch.as_ptr(),
+                    self.map.add(offset),
+                    byte_len,
+                );
+            }
+        } else {
+            self.shadow[offset..offset + byte_len].copy_from_slice(&self.row_scratch[..byte_len]);
+        }
         self.mark_dirty(dst_x, dst_y, dst_x + pixels as u32 - 1, dst_y);
         Ok(())
     }
 
     fn present(&mut self) -> io::Result<()> {
+        if self.page_flip {
+            if self.render_yoffset != self.current_yoffset {
+                let mut next = self.var_info;
+                next.yoffset = self.render_yoffset;
+                let ret = unsafe {
+                    libc::ioctl(
+                        self.file.as_raw_fd(),
+                        FBIOPAN_DISPLAY as _,
+                        &mut next as *mut LinuxFbVarScreeninfo,
+                    )
+                };
+                if ret < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                self.current_yoffset = self.render_yoffset;
+                self.var_info.yoffset = self.render_yoffset;
+            }
+            self.dirty = None;
+            return Ok(());
+        }
+
         let Some((x1, y1, x2, y2)) = self.dirty.take() else {
             return Ok(());
         };
@@ -3019,6 +3088,7 @@ impl LvglBackend for FbdevBackend {
             .update_snapshot(frame, self.core.width, self.core.height);
         self.core.set_drag_offset(self.pointer.drag_offset_x());
         self.core.sync_ui(frame);
+        self.framebuffer.begin_frame();
         self.core.start_frame();
         if let Err(err) = self.framebuffer.present() {
             super::debug_log(&format!("FbdevBackend::present failed: {err}"));
