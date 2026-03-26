@@ -117,14 +117,9 @@ impl SdlBackend {
                 }
 
                 let color_raw: lvgl_sys::lv_color_t = color.into();
-                let full = unsafe { color_raw.full };
-                let r5 = ((full >> 11) & 0x1F) as u8;
-                let g6 = ((full >> 5) & 0x3F) as u8;
-                let b5 = (full & 0x1F) as u8;
-
-                let r8 = (r5 << 3) | (r5 >> 2);
-                let g8 = (g6 << 2) | (g6 >> 4);
-                let b8 = (b5 << 3) | (b5 >> 2);
+                let r8 = unsafe { lvgl_sys::_LV_COLOR_GET_R(color_raw) as u8 };
+                let g8 = unsafe { lvgl_sys::_LV_COLOR_GET_G(color_raw) as u8 };
+                let b8 = unsafe { lvgl_sys::_LV_COLOR_GET_B(color_raw) as u8 };
 
                 let offset = ((y as usize * width as usize) + x as usize) * 3;
                 fb[offset] = r8;
