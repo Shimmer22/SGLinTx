@@ -223,17 +223,73 @@ This is not a color conversion or pan bottleneck - it is the animation implement
 
 3. **Optimize rotated write path** - Since large-area writes are confirmed, SIMD or batch optimizations in `write_refresh()` could help.
 
+## Optimizations Applied (2026-03-26)
+
+### 1. Snapshot Scene System
+
+Implemented snapshot-based animation using `lv_snapshot_take()` to capture static bitmaps during transitions:
+
+- `SnapshotScene` enum tracks the current animation type (LauncherDrag, LauncherTransition, etc.)
+- `is_compatible_with()` method avoids unnecessary snapshot rebuilds when scenes are similar
+- `update_secondary_snapshot_for_drag()` efficiently updates only the secondary snapshot when alt_page changes
+- `ensure_snapshot_scene()` manages snapshot lifecycle with proper activation/deactivation
+- Debug logging added for snapshot state transitions
+
+**Result**: Snapshot system now correctly activates during page swipes. However, LVGL still redraws the snapshot image objects when their positions change, so the ~92% redraw area persists. The benefit is reduced LVGL internal rendering cost (no live object layout recalculation).
+
+### 2. Animation Frame Reduction
+
+Modified `animate_axis()` parameters in `lvgl_core.rs`:
+
+- Step factor: 0.28 → 0.45 (each frame moves 45% of remaining distance)
+- Snap threshold: 8 → 20 pixels (animation ends earlier)
+
+**Result**: Animation frames reduced from ~10-12 to ~7-8 per transition. User confirmed this is acceptable smoothness.
+
+### 3. Measured Improvement
+
+Before optimization:
+```
+fps=7.5-10.6, flush_ms=43-56ms, fullscreen_pct=73-83%
+```
+
+After optimization:
+```
+fps=9.5-11.2, flush_ms=26-49ms, fullscreen_pct=62-77%
+```
+
+Animation feels responsive and smooth with fewer frames.
+
+## Remaining Bottleneck Analysis
+
+The main remaining cost is pixel conversion and rotation in `write_refresh()`:
+
+1. **Per-pixel LUT lookup**: Each RGB565 pixel → 32-bit native format via `rgb565_to_native32_lut`
+2. **Coordinate rotation**: 270° rotation requires non-sequential memory access (cache-unfriendly)
+3. **Double write**: Both `frame_shadow` and mmap'd framebuffer receive writes
+
+For a 800x441 flush:
+- 352,800 pixels × (LUT lookup + byte copy + coordinate transform)
+- ~3.7ms per full-panel flush
+
+### Potential Future Optimizations (Not Yet Implemented)
+
+1. **SIMD batch conversion**: Process 4-8 pixels at once using NEON/SSE intrinsics
+2. **Tile-based rotation**: Process in cache-friendly 16x16 or 32x32 tiles
+3. **Skip frame_shadow write**: When not using page flipping, avoid redundant shadow buffer
+4. **Partial animation**: Only animate the cards area (~320px height) instead of full panel (~441px)
+
 ## Recommended Next Steps
 
 1. ~~Add per-flush rectangle logging for large updates.~~ (Done)
 
 2. ~~Confirm whether launcher swipe is causing near-full-screen redraw every frame.~~ (Confirmed: yes, ~92% per frame)
 
-3. Implement snapshot-based page transition animation to avoid live object movement.
+3. ~~Implement snapshot-based page transition animation.~~ (Done - system activates correctly)
 
-4. Slightly reduce animation frame count / increase step size to lower total frames during transition.
+4. ~~Reduce animation frame count.~~ (Done - 0.45 step, 20px snap threshold)
 
-5. Only after redraw area is reduced, consider optimizing the rotated write path in `src/ui/backend/fbdev.rs`.
+5. Consider optimizing the rotated write path in `src/ui/backend/fbdev.rs` if further improvement needed.
 
 6. If a native32 direct-write path is revisited later, validate memory byte order on hardware first with explicit test colors and alpha=`0xff`.
 
