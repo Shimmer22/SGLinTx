@@ -83,6 +83,42 @@ enum SnapshotScene {
     },
 }
 
+impl SnapshotScene {
+    /// Check if two scenes are compatible for reusing the primary snapshot.
+    /// This avoids rebuilding snapshots when only the secondary page changes during drag.
+    fn is_compatible_with(&self, other: &SnapshotScene) -> bool {
+        match (self, other) {
+            (
+                SnapshotScene::LauncherDrag {
+                    launcher_page: a, ..
+                },
+                SnapshotScene::LauncherDrag {
+                    launcher_page: b, ..
+                },
+            ) => a == b,
+            (
+                SnapshotScene::LauncherTransition {
+                    from_page: a1,
+                    to_page: a2,
+                },
+                SnapshotScene::LauncherTransition {
+                    from_page: b1,
+                    to_page: b2,
+                },
+            ) => a1 == b1 && a2 == b2,
+            _ => self == other,
+        }
+    }
+
+    /// Get the alt_page for LauncherDrag scenes
+    fn alt_page(&self) -> Option<usize> {
+        match self {
+            SnapshotScene::LauncherDrag { alt_page, .. } => *alt_page,
+            _ => None,
+        }
+    }
+}
+
 #[derive(Default)]
 struct SnapshotAnimationState {
     scene: Option<SnapshotScene>,
@@ -243,12 +279,15 @@ impl LvglUiCore {
         }
 
         let delta = target - *current;
-        if delta.abs() <= 8 {
+        // Snap threshold: jump directly to target if very close
+        if delta.abs() <= 20 {
             *current = target;
             return;
         }
 
-        let step = ((delta as f32) * 0.28).round() as i32;
+        // Aggressive step factor (0.45) for faster animation with fewer frames
+        // This reduces a full-screen transition from ~10 frames to ~5 frames
+        let step = ((delta as f32) * 0.45).round() as i32;
         *current += if step == 0 { delta.signum() } else { step };
     }
 
@@ -635,6 +674,10 @@ impl LvglUiCore {
         ui: &LvglUiObjects,
         scene: SnapshotScene,
     ) -> bool {
+        super::super::debug_log(&format!(
+            "rebuild_snapshot_scene: starting scene={:?}",
+            scene
+        ));
         self.prepare_snapshot_scene(frame, ui, scene);
         Self::free_snapshot_dsc(&mut self.snapshot.primary_dsc);
         Self::free_snapshot_dsc(&mut self.snapshot.secondary_dsc);
@@ -654,10 +697,18 @@ impl LvglUiCore {
         self.snapshot.primary_dsc = Self::take_snapshot(primary_obj);
         self.snapshot.secondary_dsc = secondary_obj.and_then(Self::take_snapshot);
         if self.snapshot.primary_dsc.is_none() {
+            super::super::debug_log("snapshot rebuild failed: primary_dsc is None");
             self.clear_snapshot_sources(ui);
             self.snapshot.scene = None;
             return false;
         }
+
+        super::super::debug_log(&format!(
+            "snapshot rebuild ok: scene={:?} primary={} secondary={}",
+            scene,
+            self.snapshot.primary_dsc.is_some(),
+            self.snapshot.secondary_dsc.is_some()
+        ));
 
         unsafe {
             lvgl_sys::lv_img_set_src(
@@ -681,6 +732,7 @@ impl LvglUiCore {
     }
 
     fn set_snapshot_overlay_active(&mut self, ui: &LvglUiObjects, active: bool) {
+        super::super::debug_log(&format!("snapshot overlay active={}", active));
         if active {
             Self::set_obj_hidden(ui.snapshot_layer, false);
             Self::set_obj_hidden(ui.launcher_panel, true);
@@ -696,15 +748,80 @@ impl LvglUiCore {
         self.snapshot.active = active;
     }
 
+    fn update_secondary_snapshot_for_drag(
+        &mut self,
+        _frame: &UiFrame,
+        ui: &LvglUiObjects,
+        alt_page: Option<usize>,
+    ) {
+        // Get the current alt_page from the stored scene
+        let current_alt = self.snapshot.scene.and_then(|s| s.alt_page());
+
+        if current_alt == alt_page {
+            return; // No change needed
+        }
+
+        // Update the secondary snapshot for the new alt_page
+        Self::free_snapshot_dsc(&mut self.snapshot.secondary_dsc);
+
+        if let Some(page_idx) = alt_page {
+            // Update the alt launcher panel content
+            self.update_launcher_panel(
+                page_idx,
+                None,
+                ui.branding_label_alt,
+                &ui.app_cards_alt,
+                &ui.app_icon_boxes_alt,
+                &ui.app_icon_labels_alt,
+                &ui.app_title_labels_alt,
+            );
+            self.snapshot.secondary_dsc = Self::take_snapshot(ui.launcher_panel_alt);
+        }
+
+        unsafe {
+            lvgl_sys::lv_img_set_src(
+                ui.snapshot_img_secondary,
+                self.snapshot
+                    .secondary_dsc
+                    .map(|ptr| ptr.cast::<core::ffi::c_void>())
+                    .unwrap_or(std::ptr::null_mut()),
+            );
+        }
+
+        // Update the scene to reflect the new alt_page
+        if let Some(SnapshotScene::LauncherDrag { launcher_page, .. }) = self.snapshot.scene {
+            self.snapshot.scene = Some(SnapshotScene::LauncherDrag {
+                launcher_page,
+                alt_page,
+            });
+        }
+    }
+
     fn ensure_snapshot_scene(
         &mut self,
         frame: &UiFrame,
         ui: &LvglUiObjects,
         scene: SnapshotScene,
     ) -> bool {
-        if self.snapshot.scene != Some(scene) && !self.rebuild_snapshot_scene(frame, ui, scene) {
-            return false;
+        let needs_rebuild = match &self.snapshot.scene {
+            None => true,
+            Some(existing) => !existing.is_compatible_with(&scene),
+        };
+
+        super::super::debug_log(&format!(
+            "ensure_snapshot_scene: scene={:?} current={:?} needs_rebuild={}",
+            scene, self.snapshot.scene, needs_rebuild
+        ));
+
+        if needs_rebuild {
+            if !self.rebuild_snapshot_scene(frame, ui, scene) {
+                return false;
+            }
+        } else if let SnapshotScene::LauncherDrag { alt_page, .. } = scene {
+            // Scene is compatible but alt_page might have changed during drag
+            self.update_secondary_snapshot_for_drag(frame, ui, alt_page);
         }
+
         if !self.snapshot.active {
             self.set_snapshot_overlay_active(ui, true);
         }
@@ -914,7 +1031,7 @@ impl LvglUiCore {
             Self::set_label_text(branding_label, "LinTX");
             lvgl_sys::lv_obj_set_style_text_color(
                 branding_label,
-                lvgl_sys::lv_color_t { full: 0xFFFF },
+                lvgl_sys::_LV_COLOR_MAKE(255, 255, 255),
                 0,
             );
             lvgl_sys::lv_obj_set_style_text_font(
@@ -1012,7 +1129,7 @@ impl LvglUiCore {
             Self::set_label_text(branding_label_alt, "LinTX");
             lvgl_sys::lv_obj_set_style_text_color(
                 branding_label_alt,
-                lvgl_sys::lv_color_t { full: 0xFFFF },
+                lvgl_sys::_LV_COLOR_MAKE(255, 255, 255),
                 0,
             );
             lvgl_sys::lv_obj_set_style_text_font(
@@ -1409,7 +1526,7 @@ impl LvglUiCore {
                         lvgl_sys::lv_obj_set_style_bg_opa(icon_box, 255, 0);
                         lvgl_sys::lv_obj_set_style_text_color(
                             title_label,
-                            lvgl_sys::lv_color_t { full: 0xFFFF },
+                            lvgl_sys::_LV_COLOR_MAKE(255, 255, 255),
                             0,
                         );
                         lvgl_sys::lv_obj_align(
@@ -1425,7 +1542,7 @@ impl LvglUiCore {
                             lvgl_sys::lv_obj_set_style_border_width(icon_box, 4, 0);
                             lvgl_sys::lv_obj_set_style_border_color(
                                 icon_box,
-                                lvgl_sys::lv_color_t { full: 0xFFFF },
+                                lvgl_sys::_LV_COLOR_MAKE(255, 255, 255),
                                 0,
                             );
                             lvgl_sys::lv_obj_set_style_border_opa(icon_box, 255, 0);
@@ -1626,6 +1743,12 @@ impl LvglUiCore {
         }
 
         let snapshot_scene = self.snapshot_scene(frame, prev_page);
+        if snapshot_scene.is_some() {
+            super::super::debug_log(&format!(
+                "snapshot_scene={:?} drag_offset={:?} transition_from={:?}",
+                snapshot_scene, self.drag_offset_x, self.launcher_transition_from
+            ));
+        }
 
         match frame.page {
             UiPage::Launcher => {

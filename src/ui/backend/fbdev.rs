@@ -99,6 +99,14 @@ struct LinuxFramebuffer {
     rotate_degrees: u16,
     swap_rb: bool,
     rgb565_to_native32_lut: Option<Box<[u32]>>,
+    last_pan_elapsed: std::time::Duration,
+    native32_format: Option<Native32Format>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Native32Format {
+    LvglArgb8888,
+    LvglArgb8888SwapRb,
 }
 
 impl Drop for LinuxFramebuffer {
@@ -192,21 +200,37 @@ pub(super) struct FbdevBackend {
 #[derive(Default)]
 struct FbdevPerfStats {
     enabled: bool,
+    /// Detailed per-flush rectangle logging (LINTX_UI_FLUSH_RECTS=1)
+    flush_rects_enabled: bool,
     window_start: Option<std::time::Instant>,
     frames: u32,
     flush_calls: u32,
     flush_pixels: u64,
+    flush_ns: u128,
     sync_ui_ns: u128,
     task_handler_ns: u128,
     present_ns: u128,
+    pan_calls: u32,
+    pan_ns: u128,
+    /// Track largest flush rect in current window for summary
+    max_flush_width: u32,
+    max_flush_height: u32,
+    max_flush_pixels: u64,
+    /// Track full-screen flush ratio (area >= 80% of screen)
+    fullscreen_flush_count: u32,
+    screen_pixels: u64,
 }
 
 impl FbdevPerfStats {
-    fn new() -> Self {
+    fn new(screen_width: u32, screen_height: u32) -> Self {
         Self {
             enabled: std::env::var("LINTX_UI_PERF_TRACE")
                 .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
                 .unwrap_or(false),
+            flush_rects_enabled: std::env::var("LINTX_UI_FLUSH_RECTS")
+                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
+                .unwrap_or(false),
+            screen_pixels: u64::from(screen_width) * u64::from(screen_height),
             ..Self::default()
         }
     }
@@ -227,15 +251,48 @@ impl FbdevPerfStats {
         if !self.enabled || x2 < x1 || y2 < y1 {
             return;
         }
-        let width = i64::from(x2) - i64::from(x1) + 1;
-        let height = i64::from(y2) - i64::from(y1) + 1;
-        if width <= 0 || height <= 0 {
+        let width = (i32::from(x2) - i32::from(x1) + 1).max(0) as u32;
+        let height = (i32::from(y2) - i32::from(y1) + 1).max(0) as u32;
+        if width == 0 || height == 0 {
             return;
         }
+        let pixels = u64::from(width) * u64::from(height);
+
         self.flush_calls = self.flush_calls.saturating_add(1);
-        self.flush_pixels = self
-            .flush_pixels
-            .saturating_add((width as u64).saturating_mul(height as u64));
+        self.flush_pixels = self.flush_pixels.saturating_add(pixels);
+
+        // Track max flush rect
+        if pixels > self.max_flush_pixels {
+            self.max_flush_width = width;
+            self.max_flush_height = height;
+            self.max_flush_pixels = pixels;
+        }
+
+        // Track full-screen flushes (>= 80% of screen area)
+        let threshold = self.screen_pixels * 80 / 100;
+        if pixels >= threshold {
+            self.fullscreen_flush_count = self.fullscreen_flush_count.saturating_add(1);
+        }
+
+        // Per-flush rectangle logging
+        if self.flush_rects_enabled {
+            let pct = if self.screen_pixels > 0 {
+                (pixels as f64 / self.screen_pixels as f64) * 100.0
+            } else {
+                0.0
+            };
+            super::super::debug_log(&format!(
+                "fb-flush rect=({},{})..({},{}) size={}x{} pixels={} pct={:.1}%",
+                x1, y1, x2, y2, width, height, pixels, pct
+            ));
+        }
+    }
+
+    fn record_flush_work(&mut self, elapsed: std::time::Duration) {
+        if !self.enabled {
+            return;
+        }
+        self.flush_ns = self.flush_ns.saturating_add(elapsed.as_nanos());
     }
 
     fn record_frame(
@@ -244,6 +301,7 @@ impl FbdevPerfStats {
         sync_ui: std::time::Duration,
         task_handler: std::time::Duration,
         present: std::time::Duration,
+        pan: std::time::Duration,
     ) {
         if !self.enabled {
             return;
@@ -253,6 +311,10 @@ impl FbdevPerfStats {
         self.sync_ui_ns = self.sync_ui_ns.saturating_add(sync_ui.as_nanos());
         self.task_handler_ns = self.task_handler_ns.saturating_add(task_handler.as_nanos());
         self.present_ns = self.present_ns.saturating_add(present.as_nanos());
+        if !pan.is_zero() {
+            self.pan_calls = self.pan_calls.saturating_add(1);
+            self.pan_ns = self.pan_ns.saturating_add(pan.as_nanos());
+        }
 
         let Some(start) = self.window_start else {
             return;
@@ -265,21 +327,39 @@ impl FbdevPerfStats {
         let secs = elapsed.as_secs_f64().max(0.001);
         let fps = self.frames as f64 / secs;
         let flush_mpix = self.flush_pixels as f64 / 1_000_000.0 / secs;
+        let fullscreen_pct = if self.flush_calls > 0 {
+            (self.fullscreen_flush_count as f64 / self.flush_calls as f64) * 100.0
+        } else {
+            0.0
+        };
         super::super::debug_log(&format!(
-            "fb-perf fps={fps:.1} flush_calls={} flush_mpix_s={flush_mpix:.2} sync_ui_ms={:.2} task_ms={:.2} present_ms={:.2}",
+            "fb-perf fps={fps:.1} flush_calls={} flush_mpix_s={flush_mpix:.2} flush_ms={:.2} sync_ui_ms={:.2} task_ms={:.2} present_ms={:.2} pan_calls={} pan_ms={:.2} max_rect={}x{} fullscreen_pct={:.0}%",
             self.flush_calls,
+            self.flush_ns as f64 / 1_000_000.0 / self.frames.max(1) as f64,
             self.sync_ui_ns as f64 / 1_000_000.0 / self.frames.max(1) as f64,
             self.task_handler_ns as f64 / 1_000_000.0 / self.frames.max(1) as f64,
             self.present_ns as f64 / 1_000_000.0 / self.frames.max(1) as f64,
+            self.pan_calls,
+            self.pan_ns as f64 / 1_000_000.0 / self.frames.max(1) as f64,
+            self.max_flush_width,
+            self.max_flush_height,
+            fullscreen_pct,
         ));
 
         self.window_start = Some(now);
         self.frames = 0;
         self.flush_calls = 0;
         self.flush_pixels = 0;
+        self.flush_ns = 0;
         self.sync_ui_ns = 0;
         self.task_handler_ns = 0;
         self.present_ns = 0;
+        self.pan_calls = 0;
+        self.pan_ns = 0;
+        self.max_flush_width = 0;
+        self.max_flush_height = 0;
+        self.max_flush_pixels = 0;
+        self.fullscreen_flush_count = 0;
     }
 }
 
@@ -537,7 +617,38 @@ impl LinuxFramebuffer {
                 .unwrap_or(0),
             swap_rb: std::env::var_os("LINTX_FB_SWAP_RB").is_some(),
             rgb565_to_native32_lut,
+            last_pan_elapsed: std::time::Duration::ZERO,
+            native32_format: Self::detect_native32_format(vinfo),
         })
+    }
+
+    fn detect_native32_format(vinfo: LinuxFbVarScreeninfo) -> Option<Native32Format> {
+        if vinfo.bits_per_pixel != 32
+            || vinfo.red.length != 8
+            || vinfo.green.length != 8
+            || vinfo.blue.length != 8
+            || vinfo.transp.length != 8
+        {
+            return None;
+        }
+
+        if vinfo.red.offset == 16
+            && vinfo.green.offset == 8
+            && vinfo.blue.offset == 0
+            && vinfo.transp.offset == 24
+        {
+            return Some(Native32Format::LvglArgb8888);
+        }
+
+        if vinfo.red.offset == 0
+            && vinfo.green.offset == 8
+            && vinfo.blue.offset == 16
+            && vinfo.transp.offset == 24
+        {
+            return Some(Native32Format::LvglArgb8888SwapRb);
+        }
+
+        None
     }
 
     fn build_rgb565_to_native32_lut(
@@ -576,6 +687,7 @@ impl LinuxFramebuffer {
 
     fn begin_frame(&mut self) {
         self.dirty = None;
+        self.last_pan_elapsed = std::time::Duration::ZERO;
         if !self.page_flip {
             self.render_yoffset = self.current_yoffset;
             return;
@@ -600,7 +712,39 @@ impl LinuxFramebuffer {
         ((u32::from(value) * max) + 127) / 255
     }
 
-    fn pack_pixel(&self, rgb565: u16) -> u32 {
+    fn pack_color(&self, color: lvgl_sys::lv_color_t) -> u32 {
+        if lvgl_sys::LV_COLOR_DEPTH == 32 {
+            let full = unsafe { color.full as u32 };
+            if let Some(format) = self.native32_format {
+                return match format {
+                    Native32Format::LvglArgb8888 => full,
+                    Native32Format::LvglArgb8888SwapRb => {
+                        (full & 0xFF00_FF00)
+                            | ((full & 0x00FF_0000) >> 16)
+                            | ((full & 0x0000_00FF) << 16)
+                    }
+                };
+            }
+
+            let mut r8 = ((full >> 16) & 0xFF) as u8;
+            let g8 = ((full >> 8) & 0xFF) as u8;
+            let mut b8 = (full & 0xFF) as u8;
+            if self.swap_rb {
+                std::mem::swap(&mut r8, &mut b8);
+            }
+
+            let mut pixel = 0u32;
+            pixel |= Self::scale_channel(r8, self.red.length) << self.red.offset;
+            pixel |= Self::scale_channel(g8, self.green.length) << self.green.offset;
+            pixel |= Self::scale_channel(b8, self.blue.length) << self.blue.offset;
+            if self.transp.length > 0 {
+                let alpha = ((full >> 24) & 0xFF) as u8;
+                pixel |= Self::scale_channel(alpha, self.transp.length) << self.transp.offset;
+            }
+            return pixel;
+        }
+
+        let rgb565 = unsafe { color.full } as u16;
         if let Some(lut) = self.rgb565_to_native32_lut.as_ref() {
             return lut[rgb565 as usize];
         }
@@ -696,6 +840,7 @@ impl LinuxFramebuffer {
             if self.render_yoffset != self.current_yoffset {
                 let mut next = self.var_info;
                 next.yoffset = self.render_yoffset;
+                let pan_start = std::time::Instant::now();
                 let ret = unsafe {
                     libc::ioctl(
                         self.file.as_raw_fd(),
@@ -703,6 +848,7 @@ impl LinuxFramebuffer {
                         &mut next as *mut LinuxFbVarScreeninfo,
                     )
                 };
+                self.last_pan_elapsed = pan_start.elapsed();
                 if ret < 0 {
                     return Err(io::Error::last_os_error());
                 }
@@ -730,6 +876,10 @@ impl LinuxFramebuffer {
             }
         }
         Ok(())
+    }
+
+    fn last_pan_elapsed(&self) -> std::time::Duration {
+        self.last_pan_elapsed
     }
 
     fn write_refresh<const N: usize>(
@@ -766,7 +916,7 @@ impl LinuxFramebuffer {
                         let src_col = (x - area_x1) as usize;
                         let idx = src_row * src_width + src_col;
                         let raw: lvgl_sys::lv_color_t = refresh.colors[idx].into();
-                        let pixel = self.pack_pixel(unsafe { raw.full }).to_ne_bytes();
+                        let pixel = self.pack_color(raw).to_ne_bytes();
                         let end = offset + bytes_per_pixel;
                         self.row_scratch[offset..end].copy_from_slice(&pixel[..bytes_per_pixel]);
                         offset = end;
@@ -786,7 +936,7 @@ impl LinuxFramebuffer {
                         let src_col = (x - area_x1) as usize;
                         let idx = src_row * src_width + src_col;
                         let raw: lvgl_sys::lv_color_t = refresh.colors[idx].into();
-                        let pixel = self.pack_pixel(unsafe { raw.full }).to_ne_bytes();
+                        let pixel = self.pack_color(raw).to_ne_bytes();
                         let end = offset + bytes_per_pixel;
                         self.row_scratch[offset..end].copy_from_slice(&pixel[..bytes_per_pixel]);
                         offset = end;
@@ -806,7 +956,7 @@ impl LinuxFramebuffer {
                         let src_col = (x - area_x1) as usize;
                         let idx = src_row * src_width + src_col;
                         let raw: lvgl_sys::lv_color_t = refresh.colors[idx].into();
-                        let pixel = self.pack_pixel(unsafe { raw.full }).to_ne_bytes();
+                        let pixel = self.pack_color(raw).to_ne_bytes();
                         let end = offset + bytes_per_pixel;
                         self.row_scratch[offset..end].copy_from_slice(&pixel[..bytes_per_pixel]);
                         offset = end;
@@ -826,7 +976,7 @@ impl LinuxFramebuffer {
                         let src_col = (x - area_x1) as usize;
                         let idx = src_row * src_width + src_col;
                         let raw: lvgl_sys::lv_color_t = refresh.colors[idx].into();
-                        let pixel = self.pack_pixel(unsafe { raw.full }).to_ne_bytes();
+                        let pixel = self.pack_color(raw).to_ne_bytes();
                         let end = offset + bytes_per_pixel;
                         self.row_scratch[offset..end].copy_from_slice(&pixel[..bytes_per_pixel]);
                         offset = end;
@@ -881,7 +1031,7 @@ impl FbdevBackend {
             framebuffer,
             touch_input,
             pointer: PointerInputAdapter::default(),
-            perf: FbdevPerfStats::new(),
+            perf: FbdevPerfStats::new(width, height),
         }
     }
 }
@@ -913,9 +1063,11 @@ impl LvglBackend for FbdevBackend {
                     refresh.area.x2,
                     refresh.area.y2,
                 );
+                let flush_start = std::time::Instant::now();
                 if let Err(err) = fb.write_refresh(refresh) {
                     super::super::debug_log(&format!("FbdevBackend::write_refresh failed: {err}"));
                 }
+                perf.record_flush_work(flush_start.elapsed());
             },
         )
         .expect("failed to register lvgl display");
@@ -954,8 +1106,14 @@ impl LvglBackend for FbdevBackend {
             super::super::debug_log(&format!("FbdevBackend::present failed: {err}"));
         }
         let present_elapsed = present_start.elapsed();
-        self.perf
-            .record_frame(now, sync_ui_elapsed, task_handler_elapsed, present_elapsed);
+        let pan_elapsed = self.framebuffer.last_pan_elapsed();
+        self.perf.record_frame(
+            now,
+            sync_ui_elapsed,
+            task_handler_elapsed,
+            present_elapsed,
+            pan_elapsed,
+        );
     }
 
     fn shutdown(&mut self) {
