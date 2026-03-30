@@ -258,22 +258,31 @@ impl LvglUiCore {
         -self.hidden_right()
     }
 
-    fn animate_axis(current: &mut i32, target: i32) {
+    fn animate_axis(current: &mut i32, target: i32, step_factor: f32, snap_threshold: i32) {
         if *current == target {
             return;
         }
 
         let delta = target - *current;
-        // Snap threshold: jump directly to target if very close
-        if delta.abs() <= 20 {
+        if delta.abs() <= snap_threshold {
             *current = target;
             return;
         }
 
-        // Aggressive step factor (0.45) for faster animation with fewer frames
-        // This reduces a full-screen transition from ~10 frames to ~5 frames
-        let step = ((delta as f32) * 0.45).round() as i32;
-        *current += if step == 0 { delta.signum() } else { step };
+        let min_step = (snap_threshold / 2).max(1);
+        let step = ((delta.abs() as f32) * step_factor)
+            .round()
+            .max(min_step as f32) as i32;
+        *current += step.min(delta.abs()) * delta.signum();
+    }
+
+    fn animate_launcher_axis(current: &mut i32, target: i32) {
+        Self::animate_axis(current, target, 0.52, 28);
+    }
+
+    fn animate_app_axis(current: &mut i32, target: i32) {
+        // Use a more aggressive curve so app enter/exit does not linger near the end points.
+        Self::animate_axis(current, target, 0.62, 36);
     }
 
     fn snapshot_scene(&self, frame: &UiFrame, _prev_page: Option<UiPage>) -> Option<SnapshotScene> {
@@ -290,12 +299,6 @@ impl LvglUiCore {
                     return Some(SnapshotScene::LauncherDrag {
                         launcher_page: frame.launcher_page,
                         alt_page,
-                    });
-                }
-                if let Some(from_page) = self.launcher_transition_from {
-                    return Some(SnapshotScene::LauncherTransition {
-                        from_page,
-                        to_page: frame.launcher_page,
                     });
                 }
                 None
@@ -787,29 +790,59 @@ impl LvglUiCore {
         self.snapshot.scene = None;
     }
 
-    fn layout_snapshot_launcher(
-        &self,
-        ui: &LvglUiObjects,
-        primary_x: i32,
-        secondary_x: Option<i32>,
-    ) {
-        unsafe {
-            lvgl_sys::lv_obj_set_pos(
-                ui.snapshot_img_primary,
-                Self::to_coord(primary_x),
-                Self::to_coord(TOP_BAR_HEIGHT),
-            );
-            if let Some(x) = secondary_x {
-                lvgl_sys::lv_obj_set_pos(
-                    ui.snapshot_img_secondary,
-                    Self::to_coord(x),
-                    Self::to_coord(TOP_BAR_HEIGHT),
-                );
+    fn layout_snapshot_launcher(&self, ui: &LvglUiObjects, secondary_x: Option<i32>) {
+        match self.snapshot.scene {
+            Some(SnapshotScene::LauncherDrag { .. }) => {
+                unsafe {
+                    lvgl_sys::lv_obj_set_pos(
+                        ui.snapshot_img_primary,
+                        Self::to_coord(0),
+                        Self::to_coord(TOP_BAR_HEIGHT),
+                    );
+                }
+                Self::set_obj_hidden(ui.snapshot_img_primary, self.snapshot.primary_dsc.is_none());
+
+                if let Some(x) = secondary_x.filter(|_| self.snapshot.secondary_dsc.is_some()) {
+                    unsafe {
+                        lvgl_sys::lv_obj_set_pos(
+                            ui.snapshot_img_secondary,
+                            Self::to_coord(x),
+                            Self::to_coord(TOP_BAR_HEIGHT),
+                        );
+                    }
+                    Self::set_obj_hidden(ui.snapshot_img_secondary, false);
+                } else {
+                    Self::set_obj_hidden(ui.snapshot_img_secondary, true);
+                }
+            }
+            Some(SnapshotScene::LauncherTransition { .. }) => {
+                unsafe {
+                    lvgl_sys::lv_obj_set_pos(
+                        ui.snapshot_img_secondary,
+                        Self::to_coord(0),
+                        Self::to_coord(TOP_BAR_HEIGHT),
+                    );
+                }
                 Self::set_obj_hidden(
                     ui.snapshot_img_secondary,
                     self.snapshot.secondary_dsc.is_none(),
                 );
-            } else {
+
+                if let Some(x) = secondary_x.filter(|_| self.snapshot.primary_dsc.is_some()) {
+                    unsafe {
+                        lvgl_sys::lv_obj_set_pos(
+                            ui.snapshot_img_primary,
+                            Self::to_coord(x),
+                            Self::to_coord(TOP_BAR_HEIGHT),
+                        );
+                    }
+                    Self::set_obj_hidden(ui.snapshot_img_primary, false);
+                } else {
+                    Self::set_obj_hidden(ui.snapshot_img_primary, true);
+                }
+            }
+            None => {
+                Self::set_obj_hidden(ui.snapshot_img_primary, true);
                 Self::set_obj_hidden(ui.snapshot_img_secondary, true);
             }
         }
@@ -1637,9 +1670,9 @@ impl LvglUiCore {
         {
             self.launcher_transition_from = Some(prev_launcher_page);
             self.current_launcher_x = if frame.launcher_page > prev_launcher_page {
-                hidden_right
+                (self.current_launcher_x + hidden_right).clamp(0, hidden_right)
             } else {
-                hidden_left
+                (self.current_launcher_x - hidden_right).clamp(hidden_left, 0)
             };
             self.target_launcher_x = 0;
         }
@@ -1656,8 +1689,11 @@ impl LvglUiCore {
             UiPage::Launcher => {
                 let mut alt_page = None;
                 let mut alt_x = hidden_right;
+                let mut launcher_main_page = frame.launcher_page;
+                let mut launcher_main_selected = Some((frame.selected_row, frame.selected_col));
+                let mut transition_completed = false;
                 if let Some(drag_x) = self.drag_offset_x {
-                    self.current_launcher_x = drag_x.clamp(hidden_left / 2, hidden_right / 2);
+                    self.current_launcher_x = drag_x.clamp(hidden_left, hidden_right);
                     self.target_launcher_x = self.current_launcher_x;
                     if drag_x < 0 && frame.launcher_page + 1 < PAGE_SPECS.len() {
                         alt_page = Some(frame.launcher_page + 1);
@@ -1668,20 +1704,26 @@ impl LvglUiCore {
                     }
                 } else {
                     self.target_launcher_x = 0;
-                    Self::animate_axis(&mut self.current_launcher_x, self.target_launcher_x);
+                    Self::animate_launcher_axis(
+                        &mut self.current_launcher_x,
+                        self.target_launcher_x,
+                    );
                     if let Some(from_page) = self.launcher_transition_from {
-                        alt_page = Some(from_page);
-                        alt_x = if frame.launcher_page > from_page {
-                            self.current_launcher_x - hidden_right
-                        } else {
-                            self.current_launcher_x + hidden_right
-                        };
+                        launcher_main_page = from_page;
+                        launcher_main_selected = None;
+                        alt_page = Some(frame.launcher_page);
+                        alt_x = self.current_launcher_x;
                         if self.current_launcher_x == self.target_launcher_x {
                             self.launcher_transition_from = None;
+                            launcher_main_page = frame.launcher_page;
+                            launcher_main_selected = Some((frame.selected_row, frame.selected_col));
+                            alt_page = None;
+                            alt_x = hidden_right;
+                            transition_completed = true;
                         }
                     }
                 }
-                Self::animate_axis(&mut self.current_app_x, self.target_app_x);
+                Self::animate_app_axis(&mut self.current_app_x, self.target_app_x);
 
                 let launcher_changed = prev_frame
                     .map(|prev| {
@@ -1690,15 +1732,32 @@ impl LvglUiCore {
                             || prev.selected_row != frame.selected_row
                             || prev.selected_col != frame.selected_col
                     })
-                    .unwrap_or(true);
+                    .unwrap_or(true)
+                    || transition_completed;
                 if launcher_changed {
-                    self.update_launcher(frame, &ui);
+                    self.update_launcher_panel(
+                        launcher_main_page,
+                        launcher_main_selected,
+                        ui.branding_label,
+                        &ui.app_cards,
+                        &ui.app_icon_boxes,
+                        &ui.app_icon_labels,
+                        &ui.app_title_labels,
+                    );
                 }
                 if let Some(page_idx) = alt_page.filter(|_| self.last_alt_launcher_page != alt_page)
                 {
+                    let alt_selected = if self.drag_offset_x.is_none()
+                        && self.launcher_transition_from.is_some()
+                        && page_idx == frame.launcher_page
+                    {
+                        Some((frame.selected_row, frame.selected_col))
+                    } else {
+                        None
+                    };
                     self.update_launcher_panel(
                         page_idx,
-                        None,
+                        alt_selected,
                         ui.branding_label_alt,
                         &ui.app_cards_alt,
                         &ui.app_icon_boxes_alt,
@@ -1709,22 +1768,21 @@ impl LvglUiCore {
                 self.last_alt_launcher_page = alt_page;
 
                 match snapshot_scene {
-                    Some(
-                        scene @ SnapshotScene::LauncherDrag { .. }
-                        | scene @ SnapshotScene::LauncherTransition { .. },
-                    ) => {
+                    Some(scene @ SnapshotScene::LauncherDrag { .. }) => {
                         if self.ensure_snapshot_scene(frame, &ui, scene) {
-                            self.layout_snapshot_launcher(
-                                &ui,
-                                self.current_launcher_x,
-                                alt_page.map(|_| alt_x),
-                            );
+                            self.layout_snapshot_launcher(&ui, alt_page.map(|_| alt_x));
                         } else {
                             self.teardown_snapshot_scene(&ui);
                             Self::set_obj_pos_if_changed(
                                 ui.launcher_panel,
                                 &mut self.last_launcher_panel_pos,
-                                self.current_launcher_x,
+                                if self.launcher_transition_from.is_some()
+                                    && self.drag_offset_x.is_none()
+                                {
+                                    0
+                                } else {
+                                    self.current_launcher_x
+                                },
                                 TOP_BAR_HEIGHT,
                             );
                             Self::set_obj_pos_if_changed(
@@ -1746,7 +1804,13 @@ impl LvglUiCore {
                         Self::set_obj_pos_if_changed(
                             ui.launcher_panel,
                             &mut self.last_launcher_panel_pos,
-                            self.current_launcher_x,
+                            if self.launcher_transition_from.is_some()
+                                && self.drag_offset_x.is_none()
+                            {
+                                0
+                            } else {
+                                self.current_launcher_x
+                            },
                             TOP_BAR_HEIGHT,
                         );
                         Self::set_obj_pos_if_changed(
@@ -1770,7 +1834,7 @@ impl LvglUiCore {
                     self.target_app_x = self.current_app_x;
                 } else {
                     self.target_app_x = 0;
-                    Self::animate_axis(&mut self.current_app_x, self.target_app_x);
+                    Self::animate_app_axis(&mut self.current_app_x, self.target_app_x);
                 }
 
                 if prev_frame
