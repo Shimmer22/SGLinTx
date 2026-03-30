@@ -525,6 +525,13 @@ impl EvdevTouchInput {
 }
 
 impl LinuxFramebuffer {
+    fn logical_extent(&self) -> (i32, i32) {
+        match self.rotate_degrees {
+            90 | 270 => (self.height as i32, self.width as i32),
+            _ => (self.width as i32, self.height as i32),
+        }
+    }
+
     fn open(path: &str) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let fd = file.as_raw_fd();
@@ -891,29 +898,45 @@ impl LinuxFramebuffer {
             return Ok(());
         }
 
-        let x1 = i32::from(area.x1).max(0);
-        let y1 = i32::from(area.y1).max(0);
-        let x2 = i32::from(area.x2);
-        let y2 = i32::from(area.y2);
+        let (logical_width, logical_height) = self.logical_extent();
+        let max_x = logical_width.saturating_sub(1);
+        let max_y = logical_height.saturating_sub(1);
+        if max_x < 0 || max_y < 0 {
+            return Ok(());
+        }
+
+        let area_x1 = i32::from(area.x1);
+        let area_y1 = i32::from(area.y1);
+        let area_x2 = i32::from(area.x2);
+        let area_y2 = i32::from(area.y2);
+
+        // Clip refresh area to visible framebuffer bounds to avoid span writes
+        // bleeding past the right/bottom edges on fb devices with stride padding.
+        // Use min/max intersection instead of clamp so fully off-screen areas stay empty
+        // instead of collapsing into a fake 1px update at the edge.
+        let x1 = area_x1.max(0);
+        let y1 = area_y1.max(0);
+        let x2 = area_x2.min(max_x);
+        let y2 = area_y2.min(max_y);
         if x2 < x1 || y2 < y1 {
             return Ok(());
         }
 
-        let src_width = (i32::from(area.x2) - i32::from(area.x1) + 1) as usize;
-        let area_x1 = i32::from(area.x1);
-        let area_y1 = i32::from(area.y1);
+        let src_width = (area_x2 - area_x1 + 1) as usize;
+        let src_x1 = (x1 - area_x1) as usize;
+        let src_y1 = (y1 - area_y1) as usize;
+        let src_x2 = (x2 - area_x1) as usize;
+        let src_y2 = (y2 - area_y1) as usize;
         let bytes_per_pixel = self.bytes_per_pixel;
         match self.rotate_degrees {
             90 => {
                 let span = (y2 - y1 + 1) as usize;
                 self.resize_row_scratch(span);
-                for x in x1..=x2 {
+                for (x, src_col) in (x1..=x2).zip(src_x1..=src_x2) {
                     let dst_y = x as u32;
                     let dst_x = (self.width as i32 - 1 - y2) as u32;
                     let mut offset = 0;
-                    for y in (y1..=y2).rev() {
-                        let src_row = (y - area_y1) as usize;
-                        let src_col = (x - area_x1) as usize;
+                    for src_row in (src_y1..=src_y2).rev() {
                         let idx = src_row * src_width + src_col;
                         let raw: lvgl_sys::lv_color_t = refresh.colors[idx].into();
                         let pixel = self.pack_color(raw).to_ne_bytes();
@@ -927,13 +950,11 @@ impl LinuxFramebuffer {
             180 => {
                 let span = (x2 - x1 + 1) as usize;
                 self.resize_row_scratch(span);
-                for y in y1..=y2 {
-                    let src_row = (y - area_y1) as usize;
+                for (y, src_row) in (y1..=y2).zip(src_y1..=src_y2) {
                     let dst_y = (self.height as i32 - 1 - y) as u32;
                     let dst_x = (self.width as i32 - 1 - x2) as u32;
                     let mut offset = 0;
-                    for x in (x1..=x2).rev() {
-                        let src_col = (x - area_x1) as usize;
+                    for src_col in (src_x1..=src_x2).rev() {
                         let idx = src_row * src_width + src_col;
                         let raw: lvgl_sys::lv_color_t = refresh.colors[idx].into();
                         let pixel = self.pack_color(raw).to_ne_bytes();
@@ -947,13 +968,11 @@ impl LinuxFramebuffer {
             270 => {
                 let span = (y2 - y1 + 1) as usize;
                 self.resize_row_scratch(span);
-                for x in x1..=x2 {
+                for (x, src_col) in (x1..=x2).zip(src_x1..=src_x2) {
                     let dst_y = (self.height as i32 - 1 - x) as u32;
                     let dst_x = y1 as u32;
                     let mut offset = 0;
-                    for y in y1..=y2 {
-                        let src_row = (y - area_y1) as usize;
-                        let src_col = (x - area_x1) as usize;
+                    for src_row in src_y1..=src_y2 {
                         let idx = src_row * src_width + src_col;
                         let raw: lvgl_sys::lv_color_t = refresh.colors[idx].into();
                         let pixel = self.pack_color(raw).to_ne_bytes();
@@ -967,13 +986,11 @@ impl LinuxFramebuffer {
             _ => {
                 let span = (x2 - x1 + 1) as usize;
                 self.resize_row_scratch(span);
-                for y in y1..=y2 {
-                    let src_row = (y - area_y1) as usize;
+                for (y, src_row) in (y1..=y2).zip(src_y1..=src_y2) {
                     let dst_y = y as u32;
                     let dst_x = x1 as u32;
                     let mut offset = 0;
-                    for x in x1..=x2 {
-                        let src_col = (x - area_x1) as usize;
+                    for src_col in src_x1..=src_x2 {
                         let idx = src_row * src_width + src_col;
                         let raw: lvgl_sys::lv_color_t = refresh.colors[idx].into();
                         let pixel = self.pack_color(raw).to_ne_bytes();

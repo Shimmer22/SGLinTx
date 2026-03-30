@@ -19,7 +19,6 @@ pub(super) enum PointerSwipeAction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PointerTapAction {
     OpenLauncherApp { row: usize, col: usize },
-    BackButton,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,16 +97,9 @@ impl PointerUiSnapshot {
         None
     }
 
-    fn hit_test_back_button(&self, x: i32, y: i32) -> bool {
-        !matches!(self.page, UiPage::Launcher) && x >= 8 && x < 88 && y >= 6 && y < 36
-    }
-
     fn tap_action(&self, x: i32, y: i32) -> Option<PointerTapAction> {
         if let Some((row, col)) = self.hit_test_launcher_app(x, y) {
             return Some(PointerTapAction::OpenLauncherApp { row, col });
-        }
-        if self.hit_test_back_button(x, y) {
-            return Some(PointerTapAction::BackButton);
         }
         None
     }
@@ -124,6 +116,7 @@ impl PointerUiSnapshot {
 
 impl PointerInputAdapter {
     const TAP_SLOP: i32 = 32;
+    const DRAG_PREVIEW_SLOP: i32 = 16;
 
     fn touch_debug_enabled() -> bool {
         std::env::var("LINTX_TOUCH_DEBUG")
@@ -146,9 +139,23 @@ impl PointerInputAdapter {
     }
 
     pub(super) fn drag_offset_x(&self) -> Option<i32> {
-        self.gesture
-            .pressed
-            .then_some(self.gesture.current.0 - self.gesture.start.0)
+        if !self.gesture.pressed {
+            return None;
+        }
+
+        let snapshot = self.snapshot?;
+        let dx = self.gesture.current.0 - self.gesture.start.0;
+        let dy = self.gesture.current.1 - self.gesture.start.1;
+
+        if dx.abs() < Self::DRAG_PREVIEW_SLOP || dx.abs() <= dy.abs() {
+            return None;
+        }
+
+        match snapshot.page {
+            UiPage::Launcher => Some(dx),
+            UiPage::App(_) if dx > 0 => Some(dx),
+            UiPage::App(_) => None,
+        }
     }
 
     pub(super) fn begin(&mut self, x: i32, y: i32) {
@@ -224,10 +231,6 @@ impl PointerInputAdapter {
                     }
                     Self::touch_debug_log("touch tap -> UiInputEvent::Open");
                     self.pending_events.push_back(UiInputEvent::Open);
-                }
-                Some(PointerTapAction::BackButton) => {
-                    Self::touch_debug_log("touch tap -> UiInputEvent::Back");
-                    self.pending_events.push_back(UiInputEvent::Back);
                 }
                 None => {
                     Self::touch_debug_log("touch tap candidate -> no hit");

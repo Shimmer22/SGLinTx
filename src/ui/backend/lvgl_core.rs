@@ -15,7 +15,6 @@ pub(super) struct LvglUiObjects {
     pub(super) status_label: *mut lvgl_sys::lv_obj_t,
     pub(super) clock_label: *mut lvgl_sys::lv_obj_t,
     pub(super) page_label: *mut lvgl_sys::lv_obj_t,
-    pub(super) back_button: *mut lvgl_sys::lv_obj_t,
     pub(super) launcher_panel: *mut lvgl_sys::lv_obj_t,
     pub(super) launcher_panel_alt: *mut lvgl_sys::lv_obj_t,
     pub(super) app_panel: *mut lvgl_sys::lv_obj_t,
@@ -68,18 +67,6 @@ enum SnapshotScene {
     LauncherTransition {
         from_page: usize,
         to_page: usize,
-    },
-    LauncherToApp {
-        launcher_page: usize,
-        app: AppId,
-    },
-    AppDrag {
-        launcher_page: usize,
-        app: AppId,
-    },
-    AppToLauncher {
-        launcher_page: usize,
-        app: AppId,
     },
 }
 
@@ -146,7 +133,6 @@ pub(super) struct LvglUiCore {
     last_launcher_panel_pos: Option<(i32, i32)>,
     last_launcher_panel_alt_pos: Option<(i32, i32)>,
     last_app_panel_pos: Option<(i32, i32)>,
-    back_button_hidden: bool,
     debug_overlay_hidden: bool,
     snapshot: SnapshotAnimationState,
 }
@@ -157,7 +143,7 @@ impl LvglUiCore {
     }
 
     pub(super) fn new(width: u32, height: u32) -> Self {
-        let hidden_right = width as i32 + 20;
+        let hidden_right = width as i32;
         Self {
             width,
             height,
@@ -177,7 +163,6 @@ impl LvglUiCore {
             last_launcher_panel_pos: None,
             last_launcher_panel_alt_pos: None,
             last_app_panel_pos: None,
-            back_button_hidden: true,
             debug_overlay_hidden: true,
             snapshot: SnapshotAnimationState::default(),
         }
@@ -266,7 +251,7 @@ impl LvglUiCore {
     }
 
     fn hidden_right(&self) -> i32 {
-        self.width as i32 + 20
+        self.width as i32
     }
 
     fn hidden_left(&self) -> i32 {
@@ -291,7 +276,7 @@ impl LvglUiCore {
         *current += if step == 0 { delta.signum() } else { step };
     }
 
-    fn snapshot_scene(&self, frame: &UiFrame, prev_page: Option<UiPage>) -> Option<SnapshotScene> {
+    fn snapshot_scene(&self, frame: &UiFrame, _prev_page: Option<UiPage>) -> Option<SnapshotScene> {
         match frame.page {
             UiPage::Launcher => {
                 if let Some(drag_x) = self.drag_offset_x {
@@ -313,29 +298,9 @@ impl LvglUiCore {
                         to_page: frame.launcher_page,
                     });
                 }
-                if let Some(UiPage::App(app)) = prev_page {
-                    return Some(SnapshotScene::AppToLauncher {
-                        launcher_page: frame.launcher_page,
-                        app,
-                    });
-                }
                 None
             }
-            UiPage::App(app) => {
-                if self.drag_offset_x.is_some() {
-                    return Some(SnapshotScene::AppDrag {
-                        launcher_page: frame.launcher_page,
-                        app,
-                    });
-                }
-                if matches!(prev_page, Some(UiPage::Launcher)) {
-                    return Some(SnapshotScene::LauncherToApp {
-                        launcher_page: frame.launcher_page,
-                        app,
-                    });
-                }
-                None
-            }
+            UiPage::App(_) => None,
         }
     }
 
@@ -389,7 +354,7 @@ impl LvglUiCore {
                     format!("Backlight: {}%", frame.config.backlight_percent),
                     format!("Sound: {}%", frame.config.sound_percent),
                 ],
-                hint: "UP/DOWN: Backlight   LEFT/RIGHT: Sound   ESC: Back".to_string(),
+                hint: "UP/DOWN: Backlight   LEFT/RIGHT: Sound   Swipe right: Back".to_string(),
             },
             AppId::Control => {
                 let left_avg =
@@ -417,7 +382,7 @@ impl LvglUiCore {
                         format!("Aileron: {}", frame.mixer_out.aileron),
                         format!("Elevator: {}", frame.mixer_out.elevator),
                     ],
-                    hint: "Use for ADC -> mixer chain validation   ESC: Back".to_string(),
+                    hint: "Use for ADC -> mixer chain validation   Swipe right: Back".to_string(),
                 }
             }
             AppId::Models => {
@@ -474,8 +439,9 @@ impl LvglUiCore {
                         list_lines[2].clone(),
                         list_lines[3].clone(),
                     ],
-                    hint: "UP/DOWN: Focus Profile   ENTER: Apply   Files: ./models   ESC: Back"
-                        .to_string(),
+                    hint:
+                        "UP/DOWN: Focus Profile   ENTER: Apply   Files: ./models   Swipe right: Back"
+                            .to_string(),
                 }
             }
             AppId::Cloud => {
@@ -519,7 +485,7 @@ impl LvglUiCore {
                             signal_grade(frame.status.signal_strength_percent)
                         ),
                     ],
-                    hint: "ENTER: Connect/Disconnect   ESC: Back".to_string(),
+                    hint: "ENTER: Connect/Disconnect   Swipe right: Back".to_string(),
                 }
             }
             AppId::Scripts => {
@@ -568,9 +534,10 @@ impl LvglUiCore {
                     },
                     list_lines,
                     hint: if frame.elrs.editor_active {
-                        "UP/DOWN: Char   LEFT/RIGHT: Move   ENTER: Save   ESC: Cancel".to_string()
+                        "UP/DOWN: Char   LEFT/RIGHT: Move   ENTER: Save   Swipe right: Cancel"
+                            .to_string()
                     } else {
-                        "UP/DOWN: Select   LEFT/RIGHT: Adjust   ENTER: Open/Apply   ]: Refresh   ESC: Back"
+                        "UP/DOWN: Select   LEFT/RIGHT: Adjust   ENTER: Open/Apply   ]: Refresh   Swipe right: Back"
                             .to_string()
                     },
                 }
@@ -593,7 +560,7 @@ impl LvglUiCore {
                         "No data".to_string(),
                         "No data".to_string(),
                     ],
-                    hint: "ESC: Back".to_string(),
+                    hint: "Swipe right: Back".to_string(),
                 }
             }
         }
@@ -651,20 +618,6 @@ impl LvglUiCore {
                     &ui.app_title_labels_alt,
                 );
             }
-            SnapshotScene::LauncherToApp { launcher_page, app }
-            | SnapshotScene::AppDrag { launcher_page, app }
-            | SnapshotScene::AppToLauncher { launcher_page, app } => {
-                self.update_launcher_panel(
-                    launcher_page,
-                    Some((frame.selected_row, frame.selected_col)),
-                    ui.branding_label,
-                    &ui.app_cards,
-                    &ui.app_icon_boxes,
-                    &ui.app_icon_labels,
-                    &ui.app_title_labels,
-                );
-                self.update_app_page(frame, ui, app);
-            }
         }
     }
 
@@ -689,9 +642,6 @@ impl LvglUiCore {
             SnapshotScene::LauncherTransition { .. } => {
                 (ui.launcher_panel, Some(ui.launcher_panel_alt))
             }
-            SnapshotScene::LauncherToApp { .. }
-            | SnapshotScene::AppDrag { .. }
-            | SnapshotScene::AppToLauncher { .. } => (ui.app_panel, Some(ui.launcher_panel)),
         };
 
         self.snapshot.primary_dsc = Self::take_snapshot(primary_obj);
@@ -865,25 +815,6 @@ impl LvglUiCore {
         }
     }
 
-    fn layout_snapshot_app(&self, ui: &LvglUiObjects, app_x: i32, launcher_x: i32) {
-        unsafe {
-            lvgl_sys::lv_obj_set_pos(
-                ui.snapshot_img_primary,
-                Self::to_coord(app_x),
-                Self::to_coord(TOP_BAR_HEIGHT),
-            );
-            lvgl_sys::lv_obj_set_pos(
-                ui.snapshot_img_secondary,
-                Self::to_coord(launcher_x),
-                Self::to_coord(TOP_BAR_HEIGHT),
-            );
-            Self::set_obj_hidden(
-                ui.snapshot_img_secondary,
-                self.snapshot.secondary_dsc.is_none(),
-            );
-        }
-    }
-
     pub(super) fn build_ui(&mut self) {
         let width = self.width as i32;
         let height = self.height as i32;
@@ -904,7 +835,7 @@ impl LvglUiCore {
                 lvgl_sys::_LV_COLOR_MAKE(180, 180, 185),
                 0,
             );
-            lvgl_sys::lv_obj_set_pos(status_label, Self::to_coord(104), Self::to_coord(10));
+            lvgl_sys::lv_obj_set_pos(status_label, Self::to_coord(8), Self::to_coord(10));
 
             let debug_panel = lvgl_sys::lv_obj_create(root);
             lvgl_sys::lv_obj_set_pos(debug_panel, Self::to_coord(6), Self::to_coord(6));
@@ -960,37 +891,6 @@ impl LvglUiCore {
                 Self::to_coord(10),
             );
 
-            let back_button = lvgl_sys::lv_obj_create(root);
-            lvgl_sys::lv_obj_set_pos(back_button, Self::to_coord(104), Self::to_coord(6));
-            lvgl_sys::lv_obj_set_size(back_button, Self::to_coord(80), Self::to_coord(30));
-            lvgl_sys::lv_obj_set_style_radius(back_button, 15, 0);
-            lvgl_sys::lv_obj_set_style_bg_color(
-                back_button,
-                lvgl_sys::_LV_COLOR_MAKE(56, 60, 68),
-                0,
-            );
-            lvgl_sys::lv_obj_set_style_border_width(back_button, 0, 0);
-            lvgl_sys::lv_obj_set_style_pad_top(back_button, 0, 0);
-            lvgl_sys::lv_obj_set_style_pad_bottom(back_button, 0, 0);
-            lvgl_sys::lv_obj_set_style_pad_left(back_button, 0, 0);
-            lvgl_sys::lv_obj_set_style_pad_right(back_button, 0, 0);
-            lvgl_sys::lv_obj_clear_flag(back_button, lvgl_sys::LV_OBJ_FLAG_SCROLLABLE);
-            lvgl_sys::lv_obj_add_flag(back_button, lvgl_sys::LV_OBJ_FLAG_HIDDEN);
-
-            let back_button_label = lvgl_sys::lv_label_create(back_button);
-            Self::set_label_text(back_button_label, "< Back");
-            lvgl_sys::lv_obj_set_style_text_color(
-                back_button_label,
-                lvgl_sys::_LV_COLOR_MAKE(255, 255, 255),
-                0,
-            );
-            lvgl_sys::lv_obj_align(
-                back_button_label,
-                lvgl_sys::LV_ALIGN_CENTER as lvgl_sys::lv_align_t,
-                0,
-                0,
-            );
-
             let clock_label = lvgl_sys::lv_label_create(root);
             lvgl_sys::lv_obj_set_style_text_color(
                 clock_label,
@@ -1015,6 +915,7 @@ impl LvglUiCore {
                 lvgl_sys::_LV_COLOR_MAKE(30, 30, 32),
                 0,
             );
+            lvgl_sys::lv_obj_set_style_bg_opa(launcher_panel, 255, 0);
             lvgl_sys::lv_obj_set_style_border_width(launcher_panel, 0, 0);
             lvgl_sys::lv_obj_set_style_radius(launcher_panel, 0, 0);
             lvgl_sys::lv_obj_set_style_pad_top(launcher_panel, 0, 0);
@@ -1100,7 +1001,7 @@ impl LvglUiCore {
             let launcher_panel_alt = lvgl_sys::lv_obj_create(root);
             lvgl_sys::lv_obj_set_pos(
                 launcher_panel_alt,
-                Self::to_coord(width + 20),
+                Self::to_coord(width),
                 Self::to_coord(TOP_BAR_HEIGHT),
             );
             lvgl_sys::lv_obj_set_size(
@@ -1113,6 +1014,7 @@ impl LvglUiCore {
                 lvgl_sys::_LV_COLOR_MAKE(30, 30, 32),
                 0,
             );
+            lvgl_sys::lv_obj_set_style_bg_opa(launcher_panel_alt, 255, 0);
             lvgl_sys::lv_obj_set_style_border_width(launcher_panel_alt, 0, 0);
             lvgl_sys::lv_obj_set_style_radius(launcher_panel_alt, 0, 0);
             lvgl_sys::lv_obj_set_style_pad_top(launcher_panel_alt, 0, 0);
@@ -1198,7 +1100,7 @@ impl LvglUiCore {
             let app_panel = lvgl_sys::lv_obj_create(root);
             lvgl_sys::lv_obj_set_pos(
                 app_panel,
-                Self::to_coord(width + 20),
+                Self::to_coord(width),
                 Self::to_coord(TOP_BAR_HEIGHT),
             );
             lvgl_sys::lv_obj_set_size(
@@ -1207,6 +1109,7 @@ impl LvglUiCore {
                 Self::to_coord(height - TOP_BAR_HEIGHT),
             );
             lvgl_sys::lv_obj_set_style_bg_color(app_panel, lvgl_sys::_LV_COLOR_MAKE(22, 24, 28), 0);
+            lvgl_sys::lv_obj_set_style_bg_opa(app_panel, 255, 0);
             lvgl_sys::lv_obj_set_style_border_width(app_panel, 0, 0);
             lvgl_sys::lv_obj_set_style_pad_top(app_panel, 0, 0);
             lvgl_sys::lv_obj_set_style_pad_bottom(app_panel, 0, 0);
@@ -1405,7 +1308,7 @@ impl LvglUiCore {
             lvgl_sys::lv_obj_add_flag(snapshot_img_secondary, lvgl_sys::LV_OBJ_FLAG_HIDDEN);
             lvgl_sys::lv_obj_set_pos(
                 snapshot_img_secondary,
-                Self::to_coord(width + 20),
+                Self::to_coord(width),
                 Self::to_coord(TOP_BAR_HEIGHT),
             );
 
@@ -1415,7 +1318,6 @@ impl LvglUiCore {
                 status_label,
                 clock_label,
                 page_label,
-                back_button,
                 launcher_panel,
                 launcher_panel_alt,
                 app_panel,
@@ -1781,8 +1683,6 @@ impl LvglUiCore {
                 }
                 Self::animate_axis(&mut self.current_app_x, self.target_app_x);
 
-                Self::set_hidden_if_changed(ui.back_button, true, &mut self.back_button_hidden);
-
                 let launcher_changed = prev_frame
                     .map(|prev| {
                         prev.page != frame.page
@@ -1841,31 +1741,6 @@ impl LvglUiCore {
                             );
                         }
                     }
-                    Some(scene @ SnapshotScene::AppToLauncher { .. }) => {
-                        if self.ensure_snapshot_scene(frame, &ui, scene) {
-                            self.layout_snapshot_app(&ui, self.current_app_x, 0);
-                        } else {
-                            self.teardown_snapshot_scene(&ui);
-                            Self::set_obj_pos_if_changed(
-                                ui.launcher_panel,
-                                &mut self.last_launcher_panel_pos,
-                                self.current_launcher_x,
-                                TOP_BAR_HEIGHT,
-                            );
-                            Self::set_obj_pos_if_changed(
-                                ui.app_panel,
-                                &mut self.last_app_panel_pos,
-                                self.current_app_x,
-                                TOP_BAR_HEIGHT,
-                            );
-                            Self::set_obj_pos_if_changed(
-                                ui.launcher_panel_alt,
-                                &mut self.last_launcher_panel_alt_pos,
-                                alt_page.map(|_| alt_x).unwrap_or(hidden_right),
-                                TOP_BAR_HEIGHT,
-                            );
-                        }
-                    }
                     _ => {
                         self.teardown_snapshot_scene(&ui);
                         Self::set_obj_pos_if_changed(
@@ -1891,18 +1766,13 @@ impl LvglUiCore {
             }
             UiPage::App(app) => {
                 if let Some(drag_x) = self.drag_offset_x {
-                    self.current_app_x = if drag_x > 0 {
-                        drag_x.clamp(0, hidden_right)
-                    } else {
-                        (drag_x / 4).clamp(hidden_left / 4, 0)
-                    };
+                    self.current_app_x = drag_x.clamp(0, hidden_right);
                     self.target_app_x = self.current_app_x;
                 } else {
                     self.target_app_x = 0;
                     Self::animate_axis(&mut self.current_app_x, self.target_app_x);
                 }
 
-                Self::set_hidden_if_changed(ui.back_button, false, &mut self.back_button_hidden);
                 if prev_frame
                     .map(|prev| {
                         prev.page != frame.page
@@ -1917,55 +1787,25 @@ impl LvglUiCore {
                 if prev_frame.map(|prev| prev != frame).unwrap_or(true) {
                     self.update_app_page(frame, &ui, app);
                 }
-                match snapshot_scene {
-                    Some(scene @ SnapshotScene::LauncherToApp { .. })
-                    | Some(scene @ SnapshotScene::AppDrag { .. }) => {
-                        if self.ensure_snapshot_scene(frame, &ui, scene) {
-                            self.layout_snapshot_app(&ui, self.current_app_x, 0);
-                        } else {
-                            self.teardown_snapshot_scene(&ui);
-                            Self::set_obj_pos_if_changed(
-                                ui.launcher_panel,
-                                &mut self.last_launcher_panel_pos,
-                                0,
-                                TOP_BAR_HEIGHT,
-                            );
-                            Self::set_obj_pos_if_changed(
-                                ui.launcher_panel_alt,
-                                &mut self.last_launcher_panel_alt_pos,
-                                hidden_right,
-                                TOP_BAR_HEIGHT,
-                            );
-                            Self::set_obj_pos_if_changed(
-                                ui.app_panel,
-                                &mut self.last_app_panel_pos,
-                                self.current_app_x,
-                                TOP_BAR_HEIGHT,
-                            );
-                        }
-                    }
-                    _ => {
-                        self.teardown_snapshot_scene(&ui);
-                        Self::set_obj_pos_if_changed(
-                            ui.launcher_panel,
-                            &mut self.last_launcher_panel_pos,
-                            0,
-                            TOP_BAR_HEIGHT,
-                        );
-                        Self::set_obj_pos_if_changed(
-                            ui.launcher_panel_alt,
-                            &mut self.last_launcher_panel_alt_pos,
-                            hidden_right,
-                            TOP_BAR_HEIGHT,
-                        );
-                        Self::set_obj_pos_if_changed(
-                            ui.app_panel,
-                            &mut self.last_app_panel_pos,
-                            self.current_app_x,
-                            TOP_BAR_HEIGHT,
-                        );
-                    }
-                }
+                self.teardown_snapshot_scene(&ui);
+                Self::set_obj_pos_if_changed(
+                    ui.launcher_panel,
+                    &mut self.last_launcher_panel_pos,
+                    0,
+                    TOP_BAR_HEIGHT,
+                );
+                Self::set_obj_pos_if_changed(
+                    ui.launcher_panel_alt,
+                    &mut self.last_launcher_panel_alt_pos,
+                    hidden_right,
+                    TOP_BAR_HEIGHT,
+                );
+                Self::set_obj_pos_if_changed(
+                    ui.app_panel,
+                    &mut self.last_app_panel_pos,
+                    self.current_app_x,
+                    TOP_BAR_HEIGHT,
+                );
                 self.last_alt_launcher_page = None;
             }
         }
