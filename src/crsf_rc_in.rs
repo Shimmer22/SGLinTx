@@ -1,11 +1,21 @@
-use crate::{client_process_args, messages::AdcRawMsg};
+use crate::{
+    client_process_args,
+    messages::{
+        publish_input_frame, publish_input_status, AdcRawMsg, InputFrameMsg, InputHealth,
+        InputSource, InputStatusMsg,
+    },
+};
 use clap::Parser;
 use crsf::{PacketParser, RcChannels};
 use rpos::{msg::get_new_tx_of_message, thread_logln};
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name="crsf_rc_in", about = "Read RC data from STM32 via CRSF Protocol", long_about = None)]
+#[command(
+    name="crsf_rc_in",
+    about = "Read RC data from an external CRSF source",
+    long_about = None
+)]
 struct Cli {
     #[arg(short, long, default_value_t = 420000)]
     // CRSF typically uses 420k, but can be 115200. Defaulting to standard CRSF.
@@ -14,48 +24,33 @@ struct Cli {
     dev_name: String,
 }
 
-fn handle_channels(channels: &RcChannels, tx: &rpos::channel::Sender<AdcRawMsg>) {
-    // CRSF channels are 0-1984 (11-bit), typically centered at 992.
-    // LinTx internal AdcRawMsg typically expects values.
-    // Let's assume AdcRawMsg expects raw values similar to what we got before.
-    // Previous code: [CH1_L, CH1_H] u16.
-    // Let's map CRSF channels [0..15] to AdcRawMsg.value array.
+fn handle_channels(
+    channels: &RcChannels,
+    frame_tx: &rpos::channel::Sender<InputFrameMsg>,
+    legacy_adc_tx: &rpos::channel::Sender<AdcRawMsg>,
+) {
+    let mut mapped_values = channels
+        .0
+        .iter()
+        .map(|channel| *channel as i16)
+        .collect::<Vec<_>>();
+    if mapped_values.len() >= 4 {
+        let aileron = mapped_values[0];
+        let elevator = mapped_values[1];
+        let thrust = mapped_values[2];
+        let direction = mapped_values[3];
+        mapped_values[0] = thrust;
+        mapped_values[1] = direction;
+        mapped_values[2] = aileron;
+        mapped_values[3] = elevator;
+    }
 
-    // Note: AdcRawMsg strictly has `value: [i16; 4]` based on previous analysis of stm32_serial.rs and adc.rs
-    // But we should probably expand AdcRawMsg to support more channels later.
-    // For now, we map the first 4 channels to the existing 4 slots to maintain compatibility.
-
-    let mut mapped_values = [0i16; 4];
-
-    // CRSF channel order is typically AETR (Aileron, Elevator, Throttle, Rudder) or TAER.
-    // Standard CRSF is AETR.
-    // LinTx mixer expects:
-    // Index 0: Thrust (Throttle)
-    // Index 1: Direction (Rudder)
-    // Index 2: Aileron
-    // Index 3: Elevator
-
-    // We need to know the channel mapping of the STM32 source.
-    // Assuming STM32 sends AETR (std CRSF):
-    // Ch 0: Aileron
-    // Ch 1: Elevator
-    // Ch 2: Throttle
-    // Ch 3: Rudder
-
-    // Mapping to LinTx AdcRawMsg (based on calibrate.rs/mixer.rs usage):
-    // AdcRawMsg[0] -> used for Thrust
-    // AdcRawMsg[1] -> used for Direction
-    // AdcRawMsg[2] -> used for Aileron
-    // AdcRawMsg[3] -> used for Elevator
-
-    mapped_values[2] = channels.0[0] as i16; // Aileron
-    mapped_values[3] = channels.0[1] as i16; // Elevator
-    mapped_values[0] = channels.0[2] as i16; // Throttle
-    mapped_values[1] = channels.0[3] as i16; // Rudder
-
-    tx.send(AdcRawMsg {
-        value: mapped_values,
-    });
+    publish_input_frame(
+        frame_tx,
+        Some(legacy_adc_tx),
+        InputSource::CrsfRcIn,
+        &mapped_values,
+    );
 }
 
 pub fn crsf_rc_in_main(argc: u32, argv: *const &str) {
@@ -76,8 +71,17 @@ pub fn crsf_rc_in_main(argc: u32, argv: *const &str) {
             );
 
             let adc_raw_tx = get_new_tx_of_message::<AdcRawMsg>("adc_raw").unwrap();
+            let input_frame_tx = get_new_tx_of_message::<InputFrameMsg>("input_frame").unwrap();
+            let input_status_tx = get_new_tx_of_message::<InputStatusMsg>("input_status").unwrap();
             let mut parser = PacketParser::<1024>::new(); // Internal buffer size
             let mut buf = [0u8; 1024];
+            publish_input_status(
+                &input_status_tx,
+                InputSource::CrsfRcIn,
+                InputHealth::Running,
+                format!("{} @ {} baud", args.dev_name, args.baudrate),
+                16,
+            );
 
             loop {
                 match port.read(&mut buf) {
@@ -86,7 +90,7 @@ pub fn crsf_rc_in_main(argc: u32, argv: *const &str) {
                         while let Some(packet) = parser.next_packet() {
                             match packet {
                                 Ok((_addr, crsf::Packet::RcChannels(channels))) => {
-                                    handle_channels(&channels, &adc_raw_tx);
+                                    handle_channels(&channels, &input_frame_tx, &adc_raw_tx);
                                 }
                                 Ok(_) => {
                                     // Ignore telemetry or other packets for now
@@ -110,6 +114,15 @@ pub fn crsf_rc_in_main(argc: u32, argv: *const &str) {
             }
         }
         Err(e) => {
+            if let Some(input_status_tx) = get_new_tx_of_message::<InputStatusMsg>("input_status") {
+                publish_input_status(
+                    &input_status_tx,
+                    InputSource::CrsfRcIn,
+                    InputHealth::Error,
+                    format!("open {} failed: {}", args.dev_name, e),
+                    16,
+                );
+            }
             thread_logln!("Failed to open serial port {}: {}", args.dev_name, e);
         }
     }

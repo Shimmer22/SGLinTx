@@ -19,6 +19,33 @@ impl TerminalBackend {
     }
 }
 
+fn format_channel_groups(channels: &[i16]) -> String {
+    if channels.is_empty() {
+        return "No input yet".to_string();
+    }
+
+    let mut lines = channels
+        .chunks(4)
+        .enumerate()
+        .take(2)
+        .map(|(group_idx, group)| {
+            let start = group_idx * 4;
+            group
+                .iter()
+                .enumerate()
+                .map(|(offset, value)| format!("CH{}:{}", start + offset + 1, value))
+                .collect::<Vec<_>>()
+                .join("  ")
+        })
+        .collect::<Vec<_>>();
+
+    if channels.len() > 8 {
+        lines.push(format!("... +{} more channels", channels.len() - 8));
+    }
+
+    lines.join("\n")
+}
+
 fn format_app_detail(frame: &UiFrame, app: AppId) -> String {
     match app {
         AppId::System => format!(
@@ -34,11 +61,12 @@ fn format_app_detail(frame: &UiFrame, app: AppId) -> String {
             frame.config.sound_percent,
         ),
         AppId::Control => format!(
-            "ADC Raw\nCH1:{}  CH2:{}\nCH3:{}  CH4:{}\n\nMixer Out (0..10000)\nThrust:{}\nDirection:{}\nAileron:{}\nElevator:{}\n\nUse this page to validate input chain.\nEsc Back",
-            frame.adc_raw.value[0],
-            frame.adc_raw.value[1],
-            frame.adc_raw.value[2],
-            frame.adc_raw.value[3],
+            "Input Source: {}\nStatus: {} ({})\nChannels: {}\n{}\n\nMixer Out (0..10000)\nThrust:{}\nDirection:{}\nAileron:{}\nElevator:{}\n\nUse this page to validate input chain.\nEsc Back",
+            frame.input_status.source.label(),
+            frame.input_status.health.label(),
+            frame.input_status.detail,
+            frame.input_frame.channels.len(),
+            format_channel_groups(&frame.input_frame.channels),
             frame.mixer_out.thrust,
             frame.mixer_out.direction,
             frame.mixer_out.aileron,

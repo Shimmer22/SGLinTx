@@ -15,7 +15,10 @@ sleep 2
 show_status
 
 cat <<'EOF'
-Mock GUI test started.
+ELRS mock GUI test started.
+This script validates the ELRS mock page only.
+It does not start any input source or mixer, so Control page will stay on default values.
+
 Controls on device:
 - Up/Down: select item
 - Enter: open folder / enter string edit / run action

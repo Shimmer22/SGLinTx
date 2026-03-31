@@ -12,7 +12,7 @@ use crate::{
         JoystickChannel::{self, *},
     },
     config::{store, ControlRole, ModelConfig, OutputLimits},
-    messages::{ActiveModelMsg, AdcRawMsg},
+    messages::{ActiveModelMsg, InputFrameMsg},
     CALIBRATE_FILENAME,
 };
 
@@ -24,10 +24,11 @@ pub struct MixerOutMsg {
     pub elevator: u16,
 }
 
-fn cal_mixout(channel: JoystickChannel, raw: &AdcRawMsg, cal_data: &CalibrationData) -> u16 {
+fn cal_mixout(channel: JoystickChannel, raw: &InputFrameMsg, cal_data: &CalibrationData) -> u16 {
     let channel_cal_info = &cal_data.channel_infos[channel as usize];
 
-    let raw_val = raw.value[channel_cal_info.index as usize]
+    let raw_val = raw
+        .channel_value(channel_cal_info.index as usize)
         .clamp(channel_cal_info.min, channel_cal_info.max) as i32;
 
     let mut ret = (raw_val - channel_cal_info.min as i32) as u32 * 10000
@@ -94,7 +95,7 @@ fn mixer_main(_argc: u32, _argv: *const &str) {
         return;
     };
 
-    let rx = rpos::msg::get_new_rx_of_message::<AdcRawMsg>("adc_raw").unwrap();
+    let rx = rpos::msg::get_new_rx_of_message::<InputFrameMsg>("input_frame").unwrap();
     let tx = rpos::msg::get_new_tx_of_message::<MixerOutMsg>("mixer_out").unwrap();
     let active_model = Arc::new(Mutex::new(load_initial_model()));
 
@@ -154,8 +155,9 @@ mod tests {
     fn test_cal_mixout() {
         let mut rng = thread_rng();
         let mut get_random_channel_value = || rng.gen_range(300..1400) as i16;
-        let mut adc_raw = AdcRawMsg {
-            value: [500, 100, 1600, get_random_channel_value()],
+        let mut input_frame = InputFrameMsg {
+            channels: vec![500, 100, 1600, get_random_channel_value()],
+            ..InputFrameMsg::default()
         };
         let mut cal_data = CalibrationData {
             channel_infos: [
@@ -193,27 +195,73 @@ mod tests {
         };
 
         assert_eq!(
-            cal_mixout(JoystickChannel::Thrust, &adc_raw, &cal_data),
+            cal_mixout(JoystickChannel::Thrust, &input_frame, &cal_data),
             ((500 - 200) as u32 * 10000 / (1500 - 200)) as u16
         );
         assert_eq!(
-            cal_mixout(JoystickChannel::Direction, &adc_raw, &cal_data),
+            cal_mixout(JoystickChannel::Direction, &input_frame, &cal_data),
             ((200 - 200) as u32 * 10000 / (1500 - 200)) as u16
         );
         assert_eq!(
-            cal_mixout(JoystickChannel::Aileron, &adc_raw, &cal_data),
+            cal_mixout(JoystickChannel::Aileron, &input_frame, &cal_data),
             ((1500 - 200) as u32 * 10000 / (1500 - 200)) as u16
         );
 
         for _ in 0..1000 {
-            assert!(cal_mixout(JoystickChannel::Elevator, &adc_raw, &cal_data) <= 10000);
-            adc_raw.value[3] = get_random_channel_value();
+            assert!(cal_mixout(JoystickChannel::Elevator, &input_frame, &cal_data) <= 10000);
+            input_frame.channels[3] = get_random_channel_value();
         }
 
         cal_data.channel_infos[0].rev = true;
         assert_eq!(
-            cal_mixout(JoystickChannel::Thrust, &adc_raw, &cal_data),
+            cal_mixout(JoystickChannel::Thrust, &input_frame, &cal_data),
             10000 - ((500 - 200) as u32 * 10000 / (1500 - 200)) as u16
+        );
+    }
+
+    #[test]
+    fn test_cal_mixout_uses_zero_for_missing_channels() {
+        let cal_data = CalibrationData {
+            channel_infos: vec![
+                ChannelInfo {
+                    name: "thrust".to_string(),
+                    index: 0,
+                    min: 0,
+                    max: 1000,
+                    rev: false,
+                },
+                ChannelInfo {
+                    name: "direction".to_string(),
+                    index: 1,
+                    min: 0,
+                    max: 1000,
+                    rev: false,
+                },
+                ChannelInfo {
+                    name: "aileron".to_string(),
+                    index: 2,
+                    min: 0,
+                    max: 1000,
+                    rev: false,
+                },
+                ChannelInfo {
+                    name: "elevator".to_string(),
+                    index: 3,
+                    min: 0,
+                    max: 1000,
+                    rev: false,
+                },
+            ],
+            channel_indexs: vec![0, 1, 2, 3],
+        };
+        let input_frame = InputFrameMsg {
+            channels: vec![300, 400],
+            ..InputFrameMsg::default()
+        };
+
+        assert_eq!(
+            cal_mixout(JoystickChannel::Aileron, &input_frame, &cal_data),
+            0
         );
     }
 

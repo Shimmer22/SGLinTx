@@ -1,11 +1,21 @@
-use crate::{client_process_args, messages::AdcRawMsg};
+use crate::{
+    client_process_args,
+    messages::{
+        publish_input_frame, publish_input_status, AdcRawMsg, InputFrameMsg, InputHealth,
+        InputSource, InputStatusMsg,
+    },
+};
 use clap::Parser;
 use crc::{Crc, CRC_8_DVB_S2};
 use rpos::{msg::get_new_tx_of_message, thread_logln};
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name="stm32_serial", about = "Read data from STM32 via Serial (CRSF-like)", long_about = None)]
+#[command(
+    name="stm32_serial",
+    about = "Read TX stick data forwarded by STM32 over the custom serial protocol",
+    long_about = None
+)]
 struct Cli {
     #[arg(short, long, default_value_t = 115200)]
     baudrate: u32,
@@ -28,13 +38,25 @@ pub fn stm32_serial_main(argc: u32, argv: *const &str) {
 
     let args = arg_ret.unwrap();
 
+    let input_status_tx = get_new_tx_of_message::<InputStatusMsg>("input_status").unwrap();
     let serial = serialport::new(&args.dev_name, args.baudrate);
-    let mut port = serial
-        .timeout(Duration::from_millis(10))
-        .open()
-        .expect("Failed to open serial port");
+    let mut port = match serial.timeout(Duration::from_millis(10)).open() {
+        Ok(port) => port,
+        Err(err) => {
+            publish_input_status(
+                &input_status_tx,
+                InputSource::Stm32Serial,
+                InputHealth::Error,
+                format!("open {} failed: {}", args.dev_name, err),
+                4,
+            );
+            thread_logln!("Failed to open serial port {}: {}", args.dev_name, err);
+            return;
+        }
+    };
 
     let adc_raw_tx = get_new_tx_of_message::<AdcRawMsg>("adc_raw").unwrap();
+    let input_frame_tx = get_new_tx_of_message::<InputFrameMsg>("input_frame").unwrap();
     let crc_alg = Crc::<u8>::new(&CRC_8_DVB_S2);
 
     let mut read_buffer = [0u8; 64];
@@ -43,6 +65,13 @@ pub fn stm32_serial_main(argc: u32, argv: *const &str) {
     let mut target_len = 0;
 
     thread_logln!("stm32_serial start on {}!", args.dev_name);
+    publish_input_status(
+        &input_status_tx,
+        InputSource::Stm32Serial,
+        InputHealth::Running,
+        format!("{} @ {} baud", args.dev_name, args.baudrate),
+        4,
+    );
 
     loop {
         match port.read(&mut read_buffer) {
@@ -74,7 +103,7 @@ pub fn stm32_serial_main(argc: u32, argv: *const &str) {
                                 let computed_crc = crc_alg.checksum(&payload[0..data_len - 1]);
 
                                 if computed_crc == received_crc {
-                                    handle_packet(&payload, &adc_raw_tx);
+                                    handle_packet(&payload, &input_frame_tx, &adc_raw_tx);
                                 } else {
                                     // CRC Error, don't log every time to avoid spamming if baudrate is wrong
                                 }
@@ -93,7 +122,11 @@ pub fn stm32_serial_main(argc: u32, argv: *const &str) {
     }
 }
 
-fn handle_packet(payload: &[u8], tx: &rpos::channel::Sender<AdcRawMsg>) {
+fn handle_packet(
+    payload: &[u8],
+    frame_tx: &rpos::channel::Sender<InputFrameMsg>,
+    legacy_adc_tx: &rpos::channel::Sender<AdcRawMsg>,
+) {
     if payload.is_empty() {
         return;
     }
@@ -114,7 +147,12 @@ fn handle_packet(payload: &[u8], tx: &rpos::channel::Sender<AdcRawMsg>) {
                             u16::from_le_bytes([payload[start], payload[start + 1]]) as i16;
                     }
                 }
-                tx.send(AdcRawMsg { value: channels });
+                publish_input_frame(
+                    frame_tx,
+                    Some(legacy_adc_tx),
+                    InputSource::Stm32Serial,
+                    &channels,
+                );
             }
         }
         _ => {

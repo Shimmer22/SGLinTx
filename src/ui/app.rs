@@ -8,7 +8,8 @@ use rpos::{
 use crate::{
     config::store,
     messages::{
-        ActiveModelMsg, AdcRawMsg, ElrsCommandMsg, ElrsStateMsg, SystemConfigMsg, SystemStatusMsg,
+        ActiveModelMsg, ElrsCommandMsg, ElrsStateMsg, InputFrameMsg, InputStatusMsg,
+        SystemConfigMsg, SystemStatusMsg,
     },
     mixer::MixerOutMsg,
 };
@@ -483,7 +484,8 @@ impl UiApp {
         super::debug_log(&format!("UiApp::run start fps={fps}"));
         let mut status_rx = get_new_rx_of_message::<SystemStatusMsg>("system_status").unwrap();
         let mut config_rx = get_new_rx_of_message::<SystemConfigMsg>("system_config").unwrap();
-        let mut adc_raw_rx = get_new_rx_of_message::<AdcRawMsg>("adc_raw").unwrap();
+        let mut input_status_rx = get_new_rx_of_message::<InputStatusMsg>("input_status").unwrap();
+        let mut input_frame_rx = get_new_rx_of_message::<InputFrameMsg>("input_frame").unwrap();
         let mut mixer_out_rx = get_new_rx_of_message::<MixerOutMsg>("mixer_out").unwrap();
         let mut elrs_rx = get_new_rx_of_message::<ElrsStateMsg>("elrs_state").unwrap();
         let config_tx = get_new_tx_of_message::<SystemConfigMsg>("system_config").unwrap();
@@ -521,8 +523,12 @@ impl UiApp {
                 dirty |= Self::update_field(&mut self.frame.config, cfg);
             }
 
-            while let Some(adc_raw) = adc_raw_rx.try_read() {
-                dirty |= Self::update_field(&mut self.frame.adc_raw, adc_raw);
+            while let Some(input_status) = input_status_rx.try_read() {
+                dirty |= Self::update_field(&mut self.frame.input_status, input_status);
+            }
+
+            while let Some(input_frame) = input_frame_rx.try_read() {
+                dirty |= Self::update_field(&mut self.frame.input_frame, input_frame);
             }
 
             while let Some(mixer_out) = mixer_out_rx.try_read() {

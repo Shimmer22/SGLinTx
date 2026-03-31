@@ -1,5 +1,5 @@
 use crate::{
-    messages::{AdcRawMsg, ElrsStateMsg, SystemConfigMsg, SystemStatusMsg},
+    messages::{ElrsStateMsg, InputFrameMsg, InputStatusMsg, SystemConfigMsg, SystemStatusMsg},
     mixer::MixerOutMsg,
 };
 
@@ -43,7 +43,8 @@ pub struct UiFrame {
     pub selected_col: usize,
     pub status: SystemStatusMsg,
     pub config: SystemConfigMsg,
-    pub adc_raw: AdcRawMsg,
+    pub input_status: InputStatusMsg,
+    pub input_frame: InputFrameMsg,
     pub mixer_out: MixerOutMsg,
     pub model_entries: Vec<UiModelEntry>,
     pub model_focus_idx: usize,
@@ -63,7 +64,8 @@ impl Default for UiFrame {
             selected_col: 0,
             status: SystemStatusMsg::default(),
             config: SystemConfigMsg::default(),
-            adc_raw: AdcRawMsg::default(),
+            input_status: InputStatusMsg::default(),
+            input_frame: InputFrameMsg::default(),
             mixer_out: MixerOutMsg {
                 thrust: 5000,
                 direction: 5000,

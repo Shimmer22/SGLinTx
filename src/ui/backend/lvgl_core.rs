@@ -360,32 +360,76 @@ impl LvglUiCore {
                 hint: "UP/DOWN: Backlight   LEFT/RIGHT: Sound   Swipe right: Back".to_string(),
             },
             AppId::Control => {
-                let left_avg =
-                    ((frame.adc_raw.value[0] as i32 + frame.adc_raw.value[1] as i32) / 2).max(0);
-                let right_avg =
-                    ((frame.adc_raw.value[2] as i32 + frame.adc_raw.value[3] as i32) / 2).max(0);
+                let left_group =
+                    &frame.input_frame.channels[..frame.input_frame.channels.len().min(4)];
+                let right_group = if frame.input_frame.channels.len() > 4 {
+                    &frame.input_frame.channels[4..frame.input_frame.channels.len().min(8)]
+                } else {
+                    &[]
+                };
+                let left_avg = if left_group.is_empty() {
+                    0
+                } else {
+                    left_group
+                        .iter()
+                        .map(|value| i32::from(value.abs()))
+                        .sum::<i32>()
+                        / left_group.len() as i32
+                };
+                let right_avg = if right_group.is_empty() {
+                    0
+                } else {
+                    right_group
+                        .iter()
+                        .map(|value| i32::from(value.abs()))
+                        .sum::<i32>()
+                        / right_group.len() as i32
+                };
                 AppTemplateData {
                     accent: spec.accent,
                     badge: "CONTROL".to_string(),
                     title: "Input Pipeline Monitor".to_string(),
-                    subtitle: "Sensor input and mixer output diagnostics".to_string(),
-                    metric_titles: ["ADC CH1/2".to_string(), "ADC CH3/4".to_string()],
+                    subtitle: "Unified input source and mixer diagnostics".to_string(),
+                    metric_titles: ["Source".to_string(), "Mixer".to_string()],
                     metric_values: [
-                        format!("{}/{}", frame.adc_raw.value[0], frame.adc_raw.value[1]),
-                        format!("{}/{}", frame.adc_raw.value[2], frame.adc_raw.value[3]),
+                        format!(
+                            "{} · {}",
+                            frame.input_status.source.label(),
+                            frame.input_status.health.label()
+                        ),
+                        format!(
+                            "{}/{}/{}/{}",
+                            frame.mixer_out.thrust,
+                            frame.mixer_out.direction,
+                            frame.mixer_out.aileron,
+                            frame.mixer_out.elevator
+                        ),
                     ],
                     metric_progress: [
                         Self::clamp_pct(left_avg * 100 / 2048),
                         Self::clamp_pct(right_avg * 100 / 2048),
                     ],
-                    list_title: "Mixer Out".to_string(),
+                    list_title: "Input Channels".to_string(),
                     list_lines: [
-                        format!("Thrust: {}", frame.mixer_out.thrust),
-                        format!("Direction: {}", frame.mixer_out.direction),
-                        format!("Aileron: {}", frame.mixer_out.aileron),
-                        format!("Elevator: {}", frame.mixer_out.elevator),
+                        format!("Detail: {}", frame.input_status.detail),
+                        format!("Count: {}", frame.input_frame.channels.len()),
+                        format!(
+                            "CH1-4: {}/{}/{}/{}",
+                            frame.input_frame.channel_value(0),
+                            frame.input_frame.channel_value(1),
+                            frame.input_frame.channel_value(2),
+                            frame.input_frame.channel_value(3),
+                        ),
+                        format!(
+                            "CH5-8: {}/{}/{}/{}",
+                            frame.input_frame.channel_value(4),
+                            frame.input_frame.channel_value(5),
+                            frame.input_frame.channel_value(6),
+                            frame.input_frame.channel_value(7),
+                        ),
                     ],
-                    hint: "Use for ADC -> mixer chain validation   Swipe right: Back".to_string(),
+                    hint: "Use for unified input -> mixer chain validation   Swipe right: Back"
+                        .to_string(),
                 }
             }
             AppId::Models => {

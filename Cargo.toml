@@ -43,6 +43,7 @@ rand = "0.8.4"
 build-data = "0"
 
 [patch.crates-io]
+joydev = { path = "third_party/joydev" }
 joydev-sys = { path = "third_party/joydev-sys" }
 lvgl-sys = { path = "third_party/lvgl-sys" }
 lvgl = { path = "third_party/lvgl" }

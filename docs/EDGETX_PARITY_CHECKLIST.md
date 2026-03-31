@@ -37,7 +37,7 @@
 | 能力 | LinTx 位置 | 状态 | 备注 |
 | --- | --- | --- | --- |
 | 模块化运行时 | `src/main.rs`、`rpos/src/module.rs`、`rpos/src/msg.rs` | 已实现 | 模块注册、消息总线、Unix socket client/server |
-| 输入采集 | `src/adc.rs`、`src/stm32_serial.rs`、`src/crsf_rc_in.rs`、`src/mock_joystick.rs`、`src/joy_dev.rs` | 已实现 | 统一汇总到 `AdcRawMsg` |
+| 输入采集 | `src/adc.rs`、`src/stm32_serial.rs`、`src/crsf_rc_in.rs`、`src/mock_joystick.rs`、`src/joy_dev.rs` | 已实现 | 当前已统一到 `InputFrameMsg`；其中 `stm32_serial` 更符合 TX 主输入链，`crsf_rc_in` 属于外部 CRSF 输入兼容源 |
 | 摇杆校准 | `src/calibrate.rs` | 已实现 | 生成 `joystick.toml` |
 | 基础混控 | `src/mixer.rs` | 部分实现 | 仅 4 通道线性归一化 |
 | CRSF/ELRS 发射链 | `src/elrs_tx.rs` | 部分实现 | `mixer_out -> CRSF RC -> 串口` |

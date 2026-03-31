@@ -3,7 +3,10 @@ use rpos::thread_logln;
 use linux_embedded_hal::I2cdev;
 use std::time::Duration;
 
-use crate::messages::AdcRawMsg;
+use crate::messages::{
+    publish_input_frame, publish_input_status, AdcRawMsg, InputFrameMsg, InputHealth, InputSource,
+    InputStatusMsg,
+};
 use ads1x1x::{channel, Ads1x1x, SlaveAddr};
 
 const ADC_POLL_INTERVAL: Duration = Duration::from_micros(500);
@@ -40,8 +43,18 @@ fn adc_main(_argc: u32, _argv: *const &str) {
     adc.set_data_rate(ads1x1x::DataRate16Bit::Sps860).unwrap();
 
     let adc_raw_tx = rpos::msg::get_new_tx_of_message::<AdcRawMsg>("adc_raw").unwrap();
+    let input_frame_tx = rpos::msg::get_new_tx_of_message::<InputFrameMsg>("input_frame").unwrap();
+    let input_status_tx =
+        rpos::msg::get_new_tx_of_message::<InputStatusMsg>("input_status").unwrap();
 
     thread_logln!("adc thread started!");
+    publish_input_status(
+        &input_status_tx,
+        InputSource::Adc,
+        InputHealth::Running,
+        "/dev/i2c-0",
+        4,
+    );
 
     loop {
         let value = [
@@ -51,7 +64,7 @@ fn adc_main(_argc: u32, _argv: *const &str) {
             read_channel(&mut adc, || channel::SingleA3),
         ];
 
-        adc_raw_tx.send(AdcRawMsg { value });
+        publish_input_frame(&input_frame_tx, Some(&adc_raw_tx), InputSource::Adc, &value);
     }
 }
 

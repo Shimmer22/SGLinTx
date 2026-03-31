@@ -5,6 +5,103 @@ pub struct AdcRawMsg {
     pub value: [i16; 4],
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InputSource {
+    Adc,
+    Stm32Serial,
+    CrsfRcIn,
+    JoyDev,
+    Mock,
+    #[default]
+    Unknown,
+}
+
+impl InputSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Adc => "ADC",
+            Self::Stm32Serial => "STM32 Serial",
+            Self::CrsfRcIn => "CRSF RC In",
+            Self::JoyDev => "joydev",
+            Self::Mock => "Mock",
+            Self::Unknown => "Unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InputHealth {
+    #[default]
+    Idle,
+    Running,
+    Error,
+}
+
+impl InputHealth {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "Idle",
+            Self::Running => "Running",
+            Self::Error => "Error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InputFrameMsg {
+    pub source: InputSource,
+    pub channels: Vec<i16>,
+}
+
+impl InputFrameMsg {
+    pub fn channel_value(&self, index: usize) -> i16 {
+        self.channels.get(index).copied().unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InputStatusMsg {
+    pub source: InputSource,
+    pub health: InputHealth,
+    pub detail: String,
+    pub channel_count: usize,
+}
+
+pub fn publish_input_frame(
+    frame_tx: &rpos::channel::Sender<InputFrameMsg>,
+    legacy_adc_tx: Option<&rpos::channel::Sender<AdcRawMsg>>,
+    source: InputSource,
+    channels: &[i16],
+) {
+    frame_tx.send(InputFrameMsg {
+        source,
+        channels: channels.to_vec(),
+    });
+
+    if let Some(tx) = legacy_adc_tx {
+        let mut value = [0i16; 4];
+        for (index, channel) in channels.iter().copied().enumerate().take(value.len()) {
+            value[index] = channel;
+        }
+        tx.send(AdcRawMsg { value });
+    }
+}
+
+pub fn publish_input_status(
+    status_tx: &rpos::channel::Sender<InputStatusMsg>,
+    source: InputSource,
+    health: InputHealth,
+    detail: impl Into<String>,
+    channel_count: usize,
+) {
+    status_tx.send(InputStatusMsg {
+        source,
+        health,
+        detail: detail.into(),
+        channel_count,
+    });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SystemStatusMsg {
     pub remote_battery_percent: u8,
@@ -113,9 +210,38 @@ pub enum ElrsCommandMsg {
 #[rpos::ctor::ctor]
 fn register() {
     rpos::msg::add_message::<AdcRawMsg>("adc_raw");
+    rpos::msg::add_message::<InputFrameMsg>("input_frame");
+    rpos::msg::add_message::<InputStatusMsg>("input_status");
     rpos::msg::add_message::<SystemStatusMsg>("system_status");
     rpos::msg::add_message::<SystemConfigMsg>("system_config");
     rpos::msg::add_message::<ActiveModelMsg>("active_model");
     rpos::msg::add_message::<ElrsStateMsg>("elrs_state");
     rpos::msg::add_message::<ElrsCommandMsg>("elrs_cmd");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InputFrameMsg, InputHealth, InputSource, InputStatusMsg};
+
+    #[test]
+    fn test_input_frame_channel_value_defaults_to_zero() {
+        let frame = InputFrameMsg {
+            source: InputSource::Mock,
+            channels: vec![100, 200],
+        };
+
+        assert_eq!(frame.channel_value(0), 100);
+        assert_eq!(frame.channel_value(1), 200);
+        assert_eq!(frame.channel_value(2), 0);
+    }
+
+    #[test]
+    fn test_input_status_default_is_idle_unknown() {
+        let status = InputStatusMsg::default();
+
+        assert_eq!(status.source, InputSource::Unknown);
+        assert_eq!(status.health, InputHealth::Idle);
+        assert_eq!(status.channel_count, 0);
+        assert!(status.detail.is_empty());
+    }
 }

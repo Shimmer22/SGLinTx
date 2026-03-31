@@ -1,4 +1,10 @@
-use crate::{client_process_args, messages::AdcRawMsg};
+use crate::{
+    client_process_args,
+    messages::{
+        publish_input_frame, publish_input_status, AdcRawMsg, InputFrameMsg, InputHealth,
+        InputSource, InputStatusMsg,
+    },
+};
 use clap::Parser;
 use rpos::{msg::get_new_tx_of_message, thread_logln};
 use serde::Deserialize;
@@ -154,6 +160,8 @@ pub fn mock_joystick_main(argc: u32, argv: *const &str) {
     };
 
     let adc_raw_tx = get_new_tx_of_message::<AdcRawMsg>("adc_raw").unwrap();
+    let input_frame_tx = get_new_tx_of_message::<InputFrameMsg>("input_frame").unwrap();
+    let input_status_tx = get_new_tx_of_message::<InputStatusMsg>("input_status").unwrap();
     let update_interval = Duration::from_millis(1000 / config.update_rate_hz as u64);
 
     thread_logln!(
@@ -161,37 +169,83 @@ pub fn mock_joystick_main(argc: u32, argv: *const &str) {
         config.mode,
         config.update_rate_hz
     );
+    let channel_count = match config.mode.as_str() {
+        "static" => config.static_config.channels.len(),
+        "sine" => config
+            .sine_config
+            .base
+            .len()
+            .max(config.sine_config.amplitude.len())
+            .max(config.sine_config.frequency_hz.len()),
+        "step" => config
+            .step_config
+            .values
+            .iter()
+            .map(|channels| channels.len())
+            .max()
+            .unwrap_or(0),
+        _ => config.static_config.channels.len(),
+    };
+    publish_input_status(
+        &input_status_tx,
+        InputSource::Mock,
+        InputHealth::Running,
+        format!("mode={} @ {}Hz", config.mode, config.update_rate_hz),
+        channel_count,
+    );
 
     match config.mode.as_str() {
-        "static" => run_static_mode(&config.static_config, &adc_raw_tx, update_interval),
-        "sine" => run_sine_mode(&config.sine_config, &adc_raw_tx, update_interval),
-        "step" => run_step_mode(&config.step_config, &adc_raw_tx, update_interval),
+        "static" => run_static_mode(
+            &config.static_config,
+            &input_frame_tx,
+            &adc_raw_tx,
+            update_interval,
+        ),
+        "sine" => run_sine_mode(
+            &config.sine_config,
+            &input_frame_tx,
+            &adc_raw_tx,
+            update_interval,
+        ),
+        "step" => run_step_mode(
+            &config.step_config,
+            &input_frame_tx,
+            &adc_raw_tx,
+            update_interval,
+        ),
         _ => {
             thread_logln!("Unknown mode: {}, falling back to static", config.mode);
-            run_static_mode(&config.static_config, &adc_raw_tx, update_interval);
+            run_static_mode(
+                &config.static_config,
+                &input_frame_tx,
+                &adc_raw_tx,
+                update_interval,
+            );
         }
     }
 }
 
 fn run_static_mode(
     config: &StaticConfig,
-    tx: &rpos::channel::Sender<AdcRawMsg>,
+    frame_tx: &rpos::channel::Sender<InputFrameMsg>,
+    legacy_adc_tx: &rpos::channel::Sender<AdcRawMsg>,
     interval: Duration,
 ) {
-    let mut channels = [0i16; 4];
-    for (i, &val) in config.channels.iter().enumerate().take(4) {
-        channels[i] = val;
-    }
-
+    let channels = config.channels.clone();
     thread_logln!("Static mode: channels = {:?}", channels);
 
     loop {
-        tx.send(AdcRawMsg { value: channels });
+        publish_input_frame(frame_tx, Some(legacy_adc_tx), InputSource::Mock, &channels);
         std::thread::sleep(interval);
     }
 }
 
-fn run_sine_mode(config: &SineConfig, tx: &rpos::channel::Sender<AdcRawMsg>, interval: Duration) {
+fn run_sine_mode(
+    config: &SineConfig,
+    frame_tx: &rpos::channel::Sender<InputFrameMsg>,
+    legacy_adc_tx: &rpos::channel::Sender<AdcRawMsg>,
+    interval: Duration,
+) {
     let mut time = 0.0f32;
     let dt = interval.as_secs_f32();
 
@@ -203,9 +257,14 @@ fn run_sine_mode(config: &SineConfig, tx: &rpos::channel::Sender<AdcRawMsg>, int
     );
 
     loop {
-        let mut channels = [0i16; 4];
+        let channel_count = config
+            .base
+            .len()
+            .max(config.amplitude.len())
+            .max(config.frequency_hz.len());
+        let mut channels = vec![0i16; channel_count];
 
-        for i in 0..4 {
+        for (i, channel) in channels.iter_mut().enumerate() {
             let base = config.base.get(i).copied().unwrap_or(0);
             let amplitude = config.amplitude.get(i).copied().unwrap_or(0);
             let frequency = config.frequency_hz.get(i).copied().unwrap_or(0.0);
@@ -213,10 +272,10 @@ fn run_sine_mode(config: &SineConfig, tx: &rpos::channel::Sender<AdcRawMsg>, int
             let sine_value = (2.0 * PI * frequency * time).sin();
             let value = base + (amplitude as f32 * sine_value) as i16;
 
-            channels[i] = value.clamp(-2048, 2047);
+            *channel = value.clamp(-2048, 2047);
         }
 
-        tx.send(AdcRawMsg { value: channels });
+        publish_input_frame(frame_tx, Some(legacy_adc_tx), InputSource::Mock, &channels);
 
         time += dt;
         if time > 1000.0 {
@@ -227,7 +286,12 @@ fn run_sine_mode(config: &SineConfig, tx: &rpos::channel::Sender<AdcRawMsg>, int
     }
 }
 
-fn run_step_mode(config: &StepConfig, tx: &rpos::channel::Sender<AdcRawMsg>, interval: Duration) {
+fn run_step_mode(
+    config: &StepConfig,
+    frame_tx: &rpos::channel::Sender<InputFrameMsg>,
+    legacy_adc_tx: &rpos::channel::Sender<AdcRawMsg>,
+    interval: Duration,
+) {
     if config.values.is_empty() {
         thread_logln!("Step mode: no values configured, exiting");
         return;
@@ -246,15 +310,15 @@ fn run_step_mode(config: &StepConfig, tx: &rpos::channel::Sender<AdcRawMsg>, int
 
     loop {
         let step_values = &config.values[step_index];
-        let mut channels = [0i16; 4];
-
-        for (i, &val) in step_values.iter().enumerate().take(4) {
-            channels[i] = val;
-        }
 
         // Send the same value multiple times for the step duration
         for _ in 0..steps_per_duration {
-            tx.send(AdcRawMsg { value: channels });
+            publish_input_frame(
+                frame_tx,
+                Some(legacy_adc_tx),
+                InputSource::Mock,
+                step_values,
+            );
             std::thread::sleep(interval);
         }
 

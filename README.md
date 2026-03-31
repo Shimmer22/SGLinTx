@@ -57,6 +57,8 @@ cd /root/lintx
 sh ./scripts/board/test_gui_mock.sh
 sh ./scripts/board/test_gui_crsf.sh /dev/ttyS3 420000
 sh ./scripts/board/test_gui_crsf_debug.sh /dev/ttyS3 420000
+sh ./scripts/board/test_input_mock.sh
+sh ./scripts/board/test_input_stm32.sh /dev/ttyS3 115200
 sh ./scripts/board/stop_lintx.sh
 ```
 
@@ -64,6 +66,8 @@ sh ./scripts/board/stop_lintx.sh
 - `test_gui_mock.sh`：启动 `server + elrs_agent(mock) + ui_demo(fb)`。
 - `test_gui_crsf.sh`：启动真实 ELRS/CRSF GUI 联调流程。
 - `test_gui_crsf_debug.sh`：在真实流程上额外打开 `LINTX_ELRS_DEBUG=1`。
+- `test_input_mock.sh`：启动 `server + mock_joystick + mixer + ui_demo(fb)`，用于输入链验证。
+- `test_input_stm32.sh`：启动 `server + stm32_serial + mixer + ui_demo(fb)`，用于当前 TX 主输入链验证。
 - `stop_lintx.sh`：停止板上的 `LinTx` 进程并清理 socket。
 - 板端 framebuffer 默认参数已经固化在脚本里：`800x480` 逻辑界面、`LINTX_FB_ROTATE=270`、`LINTX_FB_SWAP_RB=1`。
 
@@ -82,7 +86,8 @@ LinTx -- <模块名称> [模块参数]
 ### 可用模块及参数
 
 #### 1. `stm32_serial` (STM32 自定义串口协议)
-用于读取 STM32 发送的自定义协议遥控数据（0x5A 头）。
+用于读取 STM32 发送的自定义协议摇杆/输入数据（0x5A 头）。
+这条链路更符合当前 TX 主机方案：`STM32 采 ADC -> Linux 读取串口 -> mixer -> ELRS 发射`。
 - **参数**:
   - `<设备路径>`: (必选，位置参数) 串口设备路径，例如 `/dev/ttyS0`。
   - `--baudrate <波特率>`: (可选) 串口波特率，默认 `115200`。
@@ -92,7 +97,9 @@ LinTx -- <模块名称> [模块参数]
   ```
 
 #### 2. `crsf_rc_in` (CRSF 协议输入)
-用于读取标准 CRSF 协议的遥控数据。
+用于读取外部设备送入的标准 CRSF 遥控数据。
+这是兼容型输入源，适合接“上游 CRSF 发送端 / 其他遥控系统 / 外部测试源”。
+它不是当前 TX 设备的典型主输入链；如果你的摇杆数据来自 STM32 采样，应优先使用 `stm32_serial`。
 - **参数**:
   - `<设备路径>`: (必选，位置参数) 串口设备路径。
   - `--baudrate <波特率>`: (可选) 默认 `420000`。
