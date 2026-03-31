@@ -117,9 +117,10 @@ impl SdlBackend {
                 }
 
                 let color_raw: lvgl_sys::lv_color_t = color.into();
-                let r8 = unsafe { lvgl_sys::_LV_COLOR_GET_R(color_raw) as u8 };
-                let g8 = unsafe { lvgl_sys::_LV_COLOR_GET_G(color_raw) as u8 };
-                let b8 = unsafe { lvgl_sys::_LV_COLOR_GET_B(color_raw) as u8 };
+                let (mut r8, g8, mut b8) = Self::expand_lv_color(color_raw);
+                if Self::swap_rb_enabled() {
+                    std::mem::swap(&mut r8, &mut b8);
+                }
 
                 let offset = ((y as usize * width as usize) + x as usize) * 3;
                 fb[offset] = r8;
@@ -127,6 +128,35 @@ impl SdlBackend {
                 fb[offset + 2] = b8;
             }
         }
+    }
+
+    fn expand_channel(v: u8, max_in: u16) -> u8 {
+        (((v as u16) * 255 + (max_in / 2)) / max_in) as u8
+    }
+
+    fn expand_lv_color(color_raw: lvgl_sys::lv_color_t) -> (u8, u8, u8) {
+        let r = unsafe { lvgl_sys::_LV_COLOR_GET_R(color_raw) as u8 };
+        let g = unsafe { lvgl_sys::_LV_COLOR_GET_G(color_raw) as u8 };
+        let b = unsafe { lvgl_sys::_LV_COLOR_GET_B(color_raw) as u8 };
+        match lvgl_sys::LV_COLOR_DEPTH {
+            16 => (
+                Self::expand_channel(r, 31),
+                Self::expand_channel(g, 63),
+                Self::expand_channel(b, 31),
+            ),
+            8 => (
+                Self::expand_channel(r, 7),
+                Self::expand_channel(g, 7),
+                Self::expand_channel(b, 3),
+            ),
+            _ => (r, g, b),
+        }
+    }
+
+    fn swap_rb_enabled() -> bool {
+        std::env::var("LINTX_SDL_SWAP_RB")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
+            .unwrap_or(false)
     }
 }
 
@@ -221,6 +251,7 @@ impl LvglBackend for SdlBackend {
 
     fn poll_event(&mut self) -> Option<UiInputEvent> {
         use sdl2::event::Event;
+        use sdl2::event::WindowEvent;
         use sdl2::keyboard::Keycode;
 
         if let Some(evt) = self.pointer.pop_event() {
@@ -237,6 +268,10 @@ impl LvglBackend for SdlBackend {
         for event in event_pump.poll_iter() {
             match event {
                 Event::Quit { .. } => return Some(UiInputEvent::Quit),
+                Event::Window {
+                    win_event: WindowEvent::Close,
+                    ..
+                } => return Some(UiInputEvent::Quit),
                 Event::KeyDown {
                     keycode: Some(Keycode::Q),
                     ..

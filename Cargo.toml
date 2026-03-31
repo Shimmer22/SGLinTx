@@ -36,6 +36,9 @@ lua = ["dep:mlua"]
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 sdl2 = { version = "0.37.0", features = ["bundled"], optional = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+sdl2 = { version = "0.37.0", optional = true }
+
 [dev-dependencies]
 rand = "0.8.4"
 
