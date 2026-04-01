@@ -1,5 +1,8 @@
 use crate::{
-    messages::{ElrsStateMsg, InputFrameMsg, InputStatusMsg, SystemConfigMsg, SystemStatusMsg},
+    messages::{
+        ElrsFeedbackMsg, ElrsStateMsg, InputFrameMsg, InputStatusMsg, SystemConfigMsg,
+        SystemStatusMsg,
+    },
     mixer::MixerOutMsg,
 };
 
@@ -45,6 +48,7 @@ pub struct UiFrame {
     pub config: SystemConfigMsg,
     pub input_status: InputStatusMsg,
     pub input_frame: InputFrameMsg,
+    pub elrs_feedback: ElrsFeedbackMsg,
     pub mixer_out: MixerOutMsg,
     pub model_entries: Vec<UiModelEntry>,
     pub model_focus_idx: usize,
@@ -66,6 +70,7 @@ impl Default for UiFrame {
             config: SystemConfigMsg::default(),
             input_status: InputStatusMsg::default(),
             input_frame: InputFrameMsg::default(),
+            elrs_feedback: ElrsFeedbackMsg::default(),
             mixer_out: MixerOutMsg {
                 thrust: 5000,
                 direction: 5000,

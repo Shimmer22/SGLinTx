@@ -13,6 +13,13 @@
 
 - `TEMPLATE.md`：新功能单元验证模板
 - `UNIT_A_INPUT_SYSTEM.md`：功能单元 A 输入系统板级验证清单
+- `UNIT_A_INPUT_SYSTEM_COMPARE.md`：功能单元 A 与 EdgeTX 对照、差距与后续协作项
+
+板端输入验证常用脚本：
+
+- `scripts/board/test_input_mock.sh`
+- `scripts/board/test_input_stm32.sh`
+- `scripts/board/test_input_elrs_return.sh`
 
 推荐记录格式：
 

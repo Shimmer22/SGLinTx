@@ -21,7 +21,8 @@
 
 - 对当前 TX 设备，主输入链应优先理解为 `adc` 或 `stm32_serial`
 - `crsf_rc_in` 是兼容型输入源，用来接外部 CRSF 数据源，不是这台 TX 的典型板级主路径
-- `elrs_tx` 负责 `mixer_out -> CRSF RC` 发射，同时可在同串口解析 ELRS/CRSF 回传状态（链路质量、电池等），该能力属于输入相关状态链路，不替代主输入源
+- `rf_link_service` 负责 `mixer_out -> CRSF RC` 发射，同时在同串口解析 ELRS/CRSF 回传状态（链路质量、电池等），该能力属于输入相关状态链路，不替代主输入源
+- 兼容说明：当前仍保留 `elrs_tx` 命令别名，底层实现已收口到 `rf_link_service`
 
 ## 板级验证前提
 
@@ -112,31 +113,28 @@ LINTX_FB_ROTATE=270 LINTX_FB_SWAP_RB=1 ./LinTx -- ui_demo --backend fb --fb-devi
 - 通道值随遥杆动作变化
 - 通道值刷新稳定，没有卡死或明显跳变异常
 
-### B2. 验证 ELRS-TX 回传状态链（新增）
+### B2. 验证 RF 链路回传状态链（新增）
 
-目标：验证当前 `elrs_tx` 已接入“单串口收发”路径，可在发送 RC 的同时解析回传并更新 `system_status`。
+目标：验证当前 `rf_link_service` 已接入“单串口收发”路径，可在发送 RC 的同时解析回传并更新 `system_status` 与输入侧反馈状态。
 
-建议执行（板端）：
+建议执行（板端，推荐脚本）：
 
 ```bash
 cd /root/lintx
-./LinTx --server &
-./LinTx -- stm32_serial /dev/ttyS0 --baudrate 115200 &
-./LinTx -- mixer &
-./LinTx -- elrs_tx /dev/ttyS3 --baudrate 420000 &
-LINTX_FB_ROTATE=270 LINTX_FB_SWAP_RB=1 ./LinTx -- ui_demo --backend fb --fb-device /dev/fb0 --width 800 --height 480
+sh ./scripts/board/test_input_elrs_return.sh /dev/ttyS0 115200 /dev/ttyS3 420000
 ```
 
 检查：
 
 - Control 页面输入源仍是 `STM32 Serial`（或当前主输入源），不应变成 `CRSF RC In`
+- Control 页面可见 ELRS 反馈行（连接状态/Signal/Aircraft Battery）
 - Telemetry/System 区域中 `Signal` 会随链路变化
 - 若接收机有 CRSF `BATTERY_ID` 回传，`Aircraft Battery` 应有更新
 - `Mixer Out` 和发射链持续工作，不因回传解析卡住
 
 日志建议：
 
-- 给 `elrs_tx` 单独记录日志（如 `/tmp/lintx-elrs/elrs_tx.log`）
+- 给 `rf_link_service` 单独记录日志（如 `/tmp/lintx-elrs/rf_link_service.log`）
 - 若有串口抓包，同时记录 `ttyS3` 原始字节流，便于核对 `LINK_ID/LINK_RX_ID/BATTERY_ID`
 
 ### C. 验证 mixer 消费的已是统一输入帧
@@ -189,10 +187,10 @@ LINTX_FB_ROTATE=270 LINTX_FB_SWAP_RB=1 ./LinTx -- ui_demo --backend fb --fb-devi
 | A-08 | Mixer 能消费统一输入帧 | 启动 `mock_joystick + mixer + UI` | Mixer Out 正常变化 |  |  |
 | A-09 | UI Control 页面不再写死 ADC 语义 | 打开 Control 页面 | 展示 Input Source / Status / Channels |  |  |
 | A-10 | 错误设备路径时状态可观测 | 启动不存在的设备 | 输入状态进入 Error，并带 detail |  |  |
-| A-11 | ELRS 回传链路可工作（单串口收发） | 启动 `stm32_serial + mixer + elrs_tx + ui_demo` | 发射与回传可并行，UI 不冻结 |  |  |
+| A-11 | ELRS 回传链路可工作（单串口收发） | 启动 `stm32_serial + mixer + rf_link_service + ui_demo` | 发射与回传可并行，UI 不冻结 |  |  |
 | A-12 | 回传链路质量可见 | 在链路波动时观察 UI | Signal 值有变化 |  |  |
 | A-13 | 回传电池可见（若接收机上报） | 接入带电池遥测的接收机 | Aircraft Battery 可变化 |  |  |
-| A-14 | 主输入链语义不被回传链覆盖 | 同时运行主输入+elrs_tx | 输入源仍显示主输入（如 STM32） |  |  |
+| A-14 | 主输入链语义不被回传链覆盖 | 同时运行主输入+rf_link_service | 输入源仍显示主输入（如 STM32） |  |  |
 
 ## 测试记录
 
@@ -226,7 +224,8 @@ LINTX_FB_ROTATE=270 LINTX_FB_SWAP_RB=1 ./LinTx -- ui_demo --backend fb --fb-devi
 - `/tmp/lintx-elrs/elrs_crsf.log`
 - `/tmp/lintx-elrs/input_mock.log`
 - `/tmp/lintx-elrs/input_stm32.log`
-- `/tmp/lintx-elrs/elrs_tx.log`
+- `/tmp/lintx-elrs/rf_link_service.log`
+- `/tmp/lintx-elrs/elrs_tx.log`（仅命令别名兼容路径）
 
 如果是手工启动，也建议补记：
 
@@ -248,10 +247,10 @@ LINTX_FB_ROTATE=270 LINTX_FB_SWAP_RB=1 ./LinTx -- ui_demo --backend fb --fb-devi
 
 参考 [TODO.md](/home/shimmer/LinTx/LinTx_musl/TODO.md) 的功能单元 E/F，当前状态如下：
 
-1. 当前 `elrs_tx` 已具备“发射 + 回传解析”能力，`elrs_agent` 已移除。
-需要配合：按 TODO 落地 `rf_link_service`，将当前分散逻辑收口到统一服务。
+1. 当前已落地 `rf_link_service`（并保留 `elrs_tx` 别名），完成“单 UART、单服务”最小收口。
+需要配合：把 ELRS 参数树真实读写接入 `elrs_cmd`，当前仍是最小状态回显，不等于参数配置能力完成。
 
-2. 回传解析目前只覆盖最小状态字段（`LINK_ID`/`LINK_RX_ID`/`BATTERY_ID`）。
+2. 回传解析目前只覆盖最小状态字段（`LINK_ID`/`LINK_RX_ID`/`BATTERY_ID`）与输入侧 `elrs_feedback`。
 需要配合：补齐 `RF Mode`、`TX Power`、时间戳/新鲜度、连接状态机，并统一状态消息结构。
 
 3. UI 当前可显示基础状态，但“字段来源与缺失字段”提示不充分。
@@ -260,5 +259,18 @@ LINTX_FB_ROTATE=270 LINTX_FB_SWAP_RB=1 ./LinTx -- ui_demo --backend fb --fb-devi
 4. `remote_battery_percent` 尚无稳定真实来源接入。
 需要配合：确认来源（CRSF 可用字段、模块参数、或本机电池采样）后再接入。
 
-5. 板级验证脚本尚未统一覆盖 `elrs_tx` 回传路径。
-需要配合：新增标准脚本（例如 `test_input_elrs_return.sh`）并沉淀固定日志目录与验收项。
+5. 板级验证脚本已新增 `test_input_elrs_return.sh` 覆盖 `rf_link_service` 回传路径。
+需要配合：在 CI/自动化中纳入该脚本或等价步骤，避免只靠人工执行。
+
+## 本次更新说明（2026-04-01）
+
+- 完成项（可交付闭环）：
+  - 串口收发已统一到 `rf_link_service`，并保留 `elrs_tx` 命令兼容入口
+  - 输入监视链新增 ELRS 回传反馈显示（`elrs_feedback`）
+  - 新增板级脚本 `scripts/board/test_input_elrs_return.sh`
+- 非目标（本次不做）：
+  - 不实现完整 ELRS 参数树读写/目录导航/写入确认
+  - 不补齐全部遥测字段语义
+- 对应 TODO 单元 E 进度备注：
+  - 已完成“单 UART、单服务”架构前提
+  - 未完成“GUI/CLI 可完成参数浏览修改与 Bind”的能力闭环，需后续单元继续推进

@@ -412,7 +412,24 @@ impl LvglUiCore {
                     list_title: "Input Channels".to_string(),
                     list_lines: [
                         format!("Detail: {}", frame.input_status.detail),
-                        format!("Count: {}", frame.input_frame.channels.len()),
+                        format!(
+                            "ELRS FB: {} S:{} B:{}",
+                            if frame.elrs_feedback.connected {
+                                "on"
+                            } else {
+                                "off"
+                            },
+                            frame
+                                .elrs_feedback
+                                .signal_strength_percent
+                                .map(|v| format!("{}%", v))
+                                .unwrap_or_else(|| "--".to_string()),
+                            frame
+                                .elrs_feedback
+                                .aircraft_battery_percent
+                                .map(|v| format!("{}%", v))
+                                .unwrap_or_else(|| "--".to_string())
+                        ),
                         format!(
                             "CH1-4: {}/{}/{}/{}",
                             frame.input_frame.channel_value(0),
@@ -421,7 +438,8 @@ impl LvglUiCore {
                             frame.input_frame.channel_value(3),
                         ),
                         format!(
-                            "CH5-8: {}/{}/{}/{}",
+                            "Count:{} CH5-8:{}/{}/{}/{}",
+                            frame.input_frame.channels.len(),
                             frame.input_frame.channel_value(4),
                             frame.input_frame.channel_value(5),
                             frame.input_frame.channel_value(6),

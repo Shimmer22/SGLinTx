@@ -61,10 +61,25 @@ fn format_app_detail(frame: &UiFrame, app: AppId) -> String {
             frame.config.sound_percent,
         ),
         AppId::Control => format!(
-            "Input Source: {}\nStatus: {} ({})\nChannels: {}\n{}\n\nMixer Out (0..10000)\nThrust:{}\nDirection:{}\nAileron:{}\nElevator:{}\n\nUse this page to validate input chain.\nEsc Back",
+            "Input Source: {}\nStatus: {} ({})\nELRS Feedback: {}  Signal:{}  Aircraft Battery:{}\nChannels: {}\n{}\n\nMixer Out (0..10000)\nThrust:{}\nDirection:{}\nAileron:{}\nElevator:{}\n\nUse this page to validate input chain.\nEsc Back",
             frame.input_status.source.label(),
             frame.input_status.health.label(),
             frame.input_status.detail,
+            if frame.elrs_feedback.connected {
+                "connected"
+            } else {
+                "disconnected"
+            },
+            frame
+                .elrs_feedback
+                .signal_strength_percent
+                .map(|v| format!("{}%", v))
+                .unwrap_or_else(|| "--".to_string()),
+            frame
+                .elrs_feedback
+                .aircraft_battery_percent
+                .map(|v| format!("{}%", v))
+                .unwrap_or_else(|| "--".to_string()),
             frame.input_frame.channels.len(),
             format_channel_groups(&frame.input_frame.channels),
             frame.mixer_out.thrust,

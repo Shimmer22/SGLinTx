@@ -67,6 +67,15 @@ pub struct InputStatusMsg {
     pub channel_count: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ElrsFeedbackMsg {
+    pub connected: bool,
+    pub signal_strength_percent: Option<u8>,
+    pub aircraft_battery_percent: Option<u8>,
+    pub last_update_unix_secs: Option<u64>,
+    pub detail: String,
+}
+
 pub fn publish_input_frame(
     frame_tx: &rpos::channel::Sender<InputFrameMsg>,
     legacy_adc_tx: Option<&rpos::channel::Sender<AdcRawMsg>>,
@@ -212,6 +221,7 @@ fn register() {
     rpos::msg::add_message::<AdcRawMsg>("adc_raw");
     rpos::msg::add_message::<InputFrameMsg>("input_frame");
     rpos::msg::add_message::<InputStatusMsg>("input_status");
+    rpos::msg::add_message::<ElrsFeedbackMsg>("elrs_feedback");
     rpos::msg::add_message::<SystemStatusMsg>("system_status");
     rpos::msg::add_message::<SystemConfigMsg>("system_config");
     rpos::msg::add_message::<ActiveModelMsg>("active_model");

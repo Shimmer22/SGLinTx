@@ -1,4 +1,5 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::io::{Read, Write};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use crc::{Crc, CRC_8_DVB_S2};
@@ -9,7 +10,11 @@ use rpos::{
     thread_logln,
 };
 
-use crate::{client_process_args, messages::SystemStatusMsg, mixer::MixerOutMsg};
+use crate::{
+    client_process_args,
+    messages::{ElrsCommandMsg, ElrsFeedbackMsg, ElrsStateMsg, SystemStatusMsg},
+    mixer::MixerOutMsg,
+};
 
 const CRSF_SYNC: u8 = 0xC8;
 const CRSF_FRAME_BATTERY_ID: u8 = 0x08;
@@ -17,11 +22,13 @@ const CRSF_FRAME_LINK_ID: u8 = 0x14;
 const CRSF_FRAME_LINK_RX_ID: u8 = 0x1C;
 const CRSF_MAX_PACKET_SIZE: usize = 66;
 const CRSF_CRC: Crc<u8> = Crc::<u8>::new(&CRC_8_DVB_S2);
+const REOPEN_DELAY: Duration = Duration::from_millis(500);
+const TELEMETRY_STALE_AFTER: Duration = Duration::from_secs(2);
 
 #[derive(Parser)]
-#[command(name="erls_tx", about = None, long_about = None)]
+#[command(name = "rf_link_service", about = "Unified ELRS/CRSF RF link service", long_about = None)]
 struct Cli {
-    #[arg(short, long, default_value_t = 115200)]
+    #[arg(short, long, default_value_t = 420000)]
     baudrate: u32,
 
     dev_name: String,
@@ -36,11 +43,11 @@ fn new_rc_channel_packet(channel_vals: &[u16; 16]) -> RawPacket {
 fn gen_magic_packet() -> [u8; 8] {
     let mut data = [0; 8];
     let crc8_alg = Crc::<u8>::new(&CRC_8_DVB_S2);
-    data[0] = 0xEE; //ELRS_ADDRESS
+    data[0] = 0xEE;
     data[1] = 6;
-    data[2] = 0x2D; //TYPE_SETTINGS_WRITE
+    data[2] = 0x2D;
     data[3] = 0xEE;
-    data[4] = 0xEA; //  Radio Transmitter
+    data[4] = 0xEA;
     data[5] = 0x1;
     data[6] = 0x00;
     data[7] = crc8_alg.checksum(&data[2..7]);
@@ -48,72 +55,162 @@ fn gen_magic_packet() -> [u8; 8] {
 }
 
 #[inline]
-fn mxier_out_2_crsf(val: u16) -> u16 {
-    (val as u32
+fn mixer_out_to_crsf(value: u16) -> u16 {
+    (value as u32
         * (crsf::RcChannels::CHANNEL_VALUE_MAX - crsf::RcChannels::CHANNEL_VALUE_MIN) as u32
         / 10000
         + crsf::RcChannels::CHANNEL_VALUE_MIN as u32) as u16
 }
 
-fn elrs_tx_main(argc: u32, argv: *const &str) {
-    let arg_ret = client_process_args::<Cli>(argc, argv);
-    if arg_ret.is_none() {
-        return;
-    }
+fn rf_link_service_main(argc: u32, argv: *const &str) {
+    let args = match client_process_args::<Cli>(argc, argv) {
+        Some(v) => v,
+        None => return,
+    };
 
-    let args = arg_ret.unwrap();
-
-    let dev_name = &args.dev_name;
-    let serial = serialport::new(dev_name, args.baudrate);
-    let mut dev = serial.timeout(Duration::from_millis(1000)).open().unwrap();
-    let mut rx = get_new_rx_of_message::<MixerOutMsg>("mixer_out").unwrap();
+    let mut mixer_out_rx = get_new_rx_of_message::<MixerOutMsg>("mixer_out").unwrap();
+    let mut elrs_cmd_rx = get_new_rx_of_message::<ElrsCommandMsg>("elrs_cmd").unwrap();
     let system_status_tx = get_new_tx_of_message::<SystemStatusMsg>("system_status").unwrap();
+    let elrs_state_tx = get_new_tx_of_message::<ElrsStateMsg>("elrs_state").unwrap();
+    let elrs_feedback_tx = get_new_tx_of_message::<ElrsFeedbackMsg>("elrs_feedback").unwrap();
 
-    let magic_cmd = gen_magic_packet();
-    for _ in 0..10 {
-        dev.write(&magic_cmd).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-
-    thread_logln!("elrs_tx start!");
+    thread_logln!(
+        "rf_link_service start on {} @ {} baud",
+        args.dev_name,
+        args.baudrate
+    );
 
     SchedulePthread::new_simple(Box::new(move |_| {
         let mut status_state = TelemetryStatusState::default();
         let mut serial_buf = Vec::<u8>::new();
         let mut read_buf = [0u8; 256];
         let mut crsf_chn_values: [u16; 16] = [0; 16];
+        let mut last_state = ElrsStateMsg::default();
+
         loop {
-            if let Some(msg) = rx.try_read() {
-                crsf_chn_values[0] = mxier_out_2_crsf(msg.aileron);
-                crsf_chn_values[1] = mxier_out_2_crsf(msg.elevator);
-                crsf_chn_values[2] = mxier_out_2_crsf(msg.thrust);
-                crsf_chn_values[3] = mxier_out_2_crsf(msg.direction);
-                let raw_packet = new_rc_channel_packet(&crsf_chn_values);
-                if let Err(err) = dev.write(raw_packet.data()) {
-                    thread_logln!("elrs_tx write failed: {}", err);
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+            let serial =
+                serialport::new(&args.dev_name, args.baudrate).timeout(Duration::from_millis(20));
+            let mut dev = match serial.open() {
+                Ok(port) => port,
+                Err(err) => {
+                    let state =
+                        build_elrs_state(false, format!("open failed: {}", err), &status_state);
+                    elrs_feedback_tx.send(build_feedback(
+                        false,
+                        format!("open failed: {}", err),
+                        &status_state,
+                    ));
+                    if state != last_state {
+                        elrs_state_tx.send(state.clone());
+                        last_state = state;
+                    }
+                    thread_logln!("rf_link_service open failed on {}: {}", args.dev_name, err);
+                    std::thread::sleep(REOPEN_DELAY);
                     continue;
                 }
+            };
+
+            let magic_cmd = gen_magic_packet();
+            for _ in 0..10 {
+                if let Err(err) = dev.write_all(&magic_cmd) {
+                    thread_logln!("rf_link_service magic write failed: {}", err);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
 
-            match dev.read(&mut read_buf) {
-                Ok(n) if n > 0 => {
-                    serial_buf.extend_from_slice(&read_buf[..n]);
-                    for frame in extract_crsf_frames(&mut serial_buf) {
-                        if let Some(status) = status_state.consume_frame(&frame) {
-                            system_status_tx.send(status);
-                        }
+            let state = build_elrs_state(
+                true,
+                format!("{} @ {} baud", args.dev_name, args.baudrate),
+                &status_state,
+            );
+            elrs_feedback_tx.send(build_feedback(
+                true,
+                format!("{} @ {} baud", args.dev_name, args.baudrate),
+                &status_state,
+            ));
+            if state != last_state {
+                elrs_state_tx.send(state.clone());
+                last_state = state;
+            }
+
+            loop {
+                while let Some(msg) = mixer_out_rx.try_read() {
+                    crsf_chn_values[0] = mixer_out_to_crsf(msg.aileron);
+                    crsf_chn_values[1] = mixer_out_to_crsf(msg.elevator);
+                    crsf_chn_values[2] = mixer_out_to_crsf(msg.thrust);
+                    crsf_chn_values[3] = mixer_out_to_crsf(msg.direction);
+                    let raw_packet = new_rc_channel_packet(&crsf_chn_values);
+                    if let Err(err) = dev.write_all(raw_packet.data()) {
+                        thread_logln!("rf_link_service write failed: {}", err);
+                        break;
                     }
                 }
-                Ok(_) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(err) => {
-                    thread_logln!("elrs_tx read failed: {}", err);
-                    std::thread::sleep(std::time::Duration::from_millis(20));
+
+                while let Some(cmd) = elrs_cmd_rx.try_read() {
+                    let cmd_text = format!("cmd={:?}", cmd);
+                    let state = build_elrs_state(true, cmd_text, &status_state);
+                    if state != last_state {
+                        elrs_state_tx.send(state.clone());
+                        last_state = state;
+                    }
                 }
+
+                match dev.read(&mut read_buf) {
+                    Ok(n) if n > 0 => {
+                        serial_buf.extend_from_slice(&read_buf[..n]);
+                        for frame in extract_crsf_frames(&mut serial_buf) {
+                            if let Some(status) = status_state.consume_frame(&frame) {
+                                system_status_tx.send(status);
+                            }
+                        }
+                        elrs_feedback_tx.send(build_feedback(
+                            true,
+                            "telemetry rx".to_string(),
+                            &status_state,
+                        ));
+                        let state =
+                            build_elrs_state(true, "telemetry rx".to_string(), &status_state);
+                        if state != last_state {
+                            elrs_state_tx.send(state.clone());
+                            last_state = state;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(err) => {
+                        let state = build_elrs_state(
+                            false,
+                            format!("serial error: {}", err),
+                            &status_state,
+                        );
+                        elrs_feedback_tx.send(build_feedback(
+                            false,
+                            format!("serial error: {}", err),
+                            &status_state,
+                        ));
+                        if state != last_state {
+                            elrs_state_tx.send(state.clone());
+                            last_state = state;
+                        }
+                        thread_logln!("rf_link_service read failed: {}", err);
+                        break;
+                    }
+                }
+
+                if status_state.telemetry_is_stale() {
+                    let state =
+                        build_elrs_state(true, "waiting telemetry".to_string(), &status_state);
+                    if state != last_state {
+                        elrs_state_tx.send(state.clone());
+                        last_state = state;
+                    }
+                }
+
+                std::thread::sleep(Duration::from_millis(2));
             }
 
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            std::thread::sleep(REOPEN_DELAY);
         }
     }));
 }
@@ -123,6 +220,8 @@ struct TelemetryStatusState {
     remote_battery_percent: Option<u8>,
     aircraft_battery_percent: Option<u8>,
     signal_strength_percent: Option<u8>,
+    last_telemetry_at: Option<Instant>,
+    last_telemetry_unix_secs: Option<u64>,
 }
 
 impl TelemetryStatusState {
@@ -131,34 +230,36 @@ impl TelemetryStatusState {
             return None;
         }
 
+        let mut changed = false;
+
         match frame[2] {
-            // EdgeTX mapping: LINK_ID payload byte 2 is RX quality (percentage).
-            // Full packet index = 3(header offset) + 2 = 5.
             CRSF_FRAME_LINK_ID => {
                 if let Some(rx_quality) = frame.get(5).copied() {
                     self.signal_strength_percent = Some(rx_quality.min(100));
+                    changed = true;
                 }
             }
-            // EdgeTX mapping: LINK_RX_ID payload byte 1 carries RX RSSI percentage.
-            // Full packet index = 3(header offset) + 1 = 4.
             CRSF_FRAME_LINK_RX_ID => {
                 if let Some(rx_rssi_percent) = frame.get(4).copied() {
                     self.signal_strength_percent = Some(rx_rssi_percent.min(100));
+                    changed = true;
                 }
             }
-            // EdgeTX mapping: BATTERY_ID payload byte 7 is battery remaining percentage.
-            // Full packet index = 3(header offset) + 7 = 10.
             CRSF_FRAME_BATTERY_ID => {
                 if let Some(remaining) = frame.get(10).copied() {
                     self.aircraft_battery_percent = Some(remaining.min(100));
+                    changed = true;
                 }
             }
             _ => {}
         }
 
-        if self.signal_strength_percent.is_none() && self.aircraft_battery_percent.is_none() {
+        if !changed {
             return None;
         }
+
+        self.last_telemetry_at = Some(Instant::now());
+        self.last_telemetry_unix_secs = Some(now_unix_secs());
 
         Some(SystemStatusMsg {
             remote_battery_percent: self.remote_battery_percent.unwrap_or(100),
@@ -166,6 +267,87 @@ impl TelemetryStatusState {
             signal_strength_percent: self.signal_strength_percent.unwrap_or(100),
             unix_time_secs: now_unix_secs(),
         })
+    }
+
+    fn telemetry_is_stale(&self) -> bool {
+        match self.last_telemetry_at {
+            Some(last) => Instant::now().saturating_duration_since(last) > TELEMETRY_STALE_AFTER,
+            None => true,
+        }
+    }
+}
+
+fn build_elrs_state(
+    connected: bool,
+    status_text: String,
+    telemetry: &TelemetryStatusState,
+) -> ElrsStateMsg {
+    ElrsStateMsg {
+        connected,
+        busy: false,
+        can_leave: true,
+        path: "/".to_string(),
+        editor_active: false,
+        editor_label: String::new(),
+        editor_buffer: String::new(),
+        editor_cursor: 0,
+        module_name: "ELRS/CRSF".to_string(),
+        device_name: if connected {
+            "UART Connected".to_string()
+        } else {
+            "Disconnected".to_string()
+        },
+        version: "--".to_string(),
+        packet_rate: "--".to_string(),
+        telemetry_ratio: "--".to_string(),
+        tx_power: "--".to_string(),
+        status_text,
+        wifi_running: false,
+        selected_idx: 0,
+        params: vec![
+            crate::messages::ElrsParamEntry {
+                id: "signal".to_string(),
+                label: "Signal".to_string(),
+                value: telemetry
+                    .signal_strength_percent
+                    .map(|v| format!("{}%", v))
+                    .unwrap_or_else(|| "--".to_string()),
+                selectable: false,
+            },
+            crate::messages::ElrsParamEntry {
+                id: "aircraft_battery".to_string(),
+                label: "Aircraft Battery".to_string(),
+                value: telemetry
+                    .aircraft_battery_percent
+                    .map(|v| format!("{}%", v))
+                    .unwrap_or_else(|| "--".to_string()),
+                selectable: false,
+            },
+            crate::messages::ElrsParamEntry {
+                id: "telemetry_fresh".to_string(),
+                label: "Telemetry Fresh".to_string(),
+                value: if telemetry.telemetry_is_stale() {
+                    "stale".to_string()
+                } else {
+                    "fresh".to_string()
+                },
+                selectable: false,
+            },
+        ],
+    }
+}
+
+fn build_feedback(
+    connected: bool,
+    detail: String,
+    telemetry: &TelemetryStatusState,
+) -> ElrsFeedbackMsg {
+    ElrsFeedbackMsg {
+        connected,
+        signal_strength_percent: telemetry.signal_strength_percent,
+        aircraft_battery_percent: telemetry.aircraft_battery_percent,
+        last_update_unix_secs: telemetry.last_telemetry_unix_secs,
+        detail,
     }
 }
 
@@ -264,5 +446,6 @@ mod tests {
 
 #[rpos::ctor::ctor]
 fn register() {
-    rpos::module::Module::register("elrs_tx", elrs_tx_main);
+    rpos::module::Module::register("rf_link_service", rf_link_service_main);
+    rpos::module::Module::register("elrs_tx", rf_link_service_main);
 }

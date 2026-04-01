@@ -8,8 +8,8 @@ use rpos::{
 use crate::{
     config::store,
     messages::{
-        ActiveModelMsg, ElrsCommandMsg, ElrsStateMsg, InputFrameMsg, InputStatusMsg,
-        SystemConfigMsg, SystemStatusMsg,
+        ActiveModelMsg, ElrsCommandMsg, ElrsFeedbackMsg, ElrsStateMsg, InputFrameMsg,
+        InputStatusMsg, SystemConfigMsg, SystemStatusMsg,
     },
     mixer::MixerOutMsg,
 };
@@ -486,6 +486,8 @@ impl UiApp {
         let mut config_rx = get_new_rx_of_message::<SystemConfigMsg>("system_config").unwrap();
         let mut input_status_rx = get_new_rx_of_message::<InputStatusMsg>("input_status").unwrap();
         let mut input_frame_rx = get_new_rx_of_message::<InputFrameMsg>("input_frame").unwrap();
+        let mut elrs_feedback_rx =
+            get_new_rx_of_message::<ElrsFeedbackMsg>("elrs_feedback").unwrap();
         let mut mixer_out_rx = get_new_rx_of_message::<MixerOutMsg>("mixer_out").unwrap();
         let mut elrs_rx = get_new_rx_of_message::<ElrsStateMsg>("elrs_state").unwrap();
         let config_tx = get_new_tx_of_message::<SystemConfigMsg>("system_config").unwrap();
@@ -529,6 +531,10 @@ impl UiApp {
 
             while let Some(input_frame) = input_frame_rx.try_read() {
                 dirty |= Self::update_field(&mut self.frame.input_frame, input_frame);
+            }
+
+            while let Some(feedback) = elrs_feedback_rx.try_read() {
+                dirty |= Self::update_field(&mut self.frame.elrs_feedback, feedback);
             }
 
             while let Some(mixer_out) = mixer_out_rx.try_read() {
