@@ -16,6 +16,9 @@
    - 利用 Linux `/dev/input/js*` 抽象读取 USB 手柄/摇杆，将其映射为 `InputFrame`，便于桌面调试或 trainer 模式。
 5. `mock_joystick`（`src/mock_joystick.rs`）
    - 模拟输入源（`static`/`sine`/`step`），为验证输入链与 mixer/GUI 提供 deterministic 数据。
+6. `elrs_tx`（`src/elrs_tx.rs`）
+   - 发射侧从 `mixer_out` 生成 CRSF `RcChannels` 发往 ELRS 模块。
+   - 新增同串口回传解析：可读取 CRSF 回传帧并更新基础 `system_status`（当前覆盖链路质量与机载电池百分比）。
 
 ## 对应 EdgeTX 参考
 
@@ -26,6 +29,7 @@
 | `crsf_rc_in` | EdgeTX 的 CRSF/XSR 接收器 (`crossfire.cpp`、`tasks.cpp` 中周期任务) | EdgeTX 可以通过 CRSF 接收器获取通道，LinTx 的 `crsf_rc_in` 也直接解析 CRSF 帧并将前 N 通道注入输入链，相当于 EdgeTX 的接收器输入逻辑。|
 | `joy_dev` | EdgeTX 的 USB 手柄 + trainer 输入（`trainer.c`/`serial.c`） | EdgeTX 允许通过 trainer 端口或 USB 连接模拟摇杆；LinTx 的 `joy_dev` 提供类似的外部 joystick 源，适用于 PC 调试或 trainer 映射。|
 | `mock_joystick` | EdgeTX 的模拟输入（例如 `simulator.cpp` 测试桩） | EdgeTX 在调试时也会注入模拟数据；LinTx 的 mock 模块专门用于验证 `InputFrame -> mixer` 的数据流，代表 EdgeTX 的内置模拟手段。|
+| `elrs_tx`（回传部分） | EdgeTX 的 `pulses/crossfire.cpp` + `telemetry/crossfire.cpp` | EdgeTX 在同一 CRSF 物理链路上同时做通道发射与回传解析；LinTx 现在也在 `elrs_tx` 中实现了单串口收发并行的最小闭环。|
 
 ## 验证方法与现状
 
@@ -35,6 +39,7 @@
 | `adc` 真实采样 | `adc` + `ui_demo` | 检查模拟摇杆可见 | `./LinTx --server & ./LinTx -- adc & ./LinTx -- ui_demo --backend fb` | 对应 A-02 |
 | STM32 串口 | `stm32_serial` + mixer + UI | 确认 STM32 回传值在 Control 页面更新 | `scripts/board/test_input_stm32.sh /dev/ttyS0 115200` 或手工链启动 | 对应 A-03；2026-04-01 在 `10.85.35.1` 上实测 `ttyS0` 有效 |
 | CRSF 输入 | `crsf_rc_in` | 验证外部 RC 兼容输入 | `./LinTx --server & ./LinTx -- crsf_rc_in /dev/ttyS3 --baudrate 420000 & ./LinTx -- ui_demo --backend fb` | 对应 A-04，兼容 EdgeTX 的 CRSF 收发场景 |
+| ELRS 回传状态 | `elrs_tx` + `mixer` + 主输入源 | 验证同串口收发并行、基础回传状态可见 | `./LinTx --server & ./LinTx -- stm32_serial /dev/ttyS0 --baudrate 115200 & ./LinTx -- mixer & ./LinTx -- elrs_tx /dev/ttyS3 --baudrate 420000 & ./LinTx -- ui_demo --backend fb` | 对应 A-11~A-14；输入源仍应保持为主输入，不应被回传链覆盖 |
 | joydev 输入 | `joy_dev` | 检查 Linux 手柄/模拟器可见 | `./LinTx -- joy_dev /dev/input/js0` 配合 UI | 对应 A-05 |
 | 错误路径 | `stm32_serial/crsf_rc_in/joy_dev` | 状态从 `Running` 跳 `Error` 并带 detail | 用不存在的设备路径启动 | 对应 A-06、A-10 |
 
@@ -43,6 +48,22 @@
 - 输入链已统一为标准 `InputFrame`，EdgeTX 里对应的 `radio_diaganas`/`mixes`/`tasks` 接口仍可以通过配置文件自定义输入源和校准；LinTx 目前通过 `joystick.toml` 追踪校准，UI Control 页面也能实时显示 `channels` 与 `mixer_out`。
 - EdgeTX 的许多输入能力（模拟 ADC、UART 串口、trainer/模拟器）在 LinTx 都有映射，只是在协议拆分上更偏向“模块 + 虚拟 frame”的方式，便于桌面/板卡共用基础链路。
 - 当前验证主要依赖 `scripts/board/*` 脚本完成端到端链路，对应文档中列出的 A-01~A-10，尚未引入新测试用例。
+- 当前 `elrs_tx` 已能做最小回传解析，`elrs_agent` 已清理；系统层面仍未完成 TODO.md 里的 `rf_link_service` 收口。
+
+## 与 TODO.md 的差距（单元 A 相关）
+
+参考 [TODO.md](/home/shimmer/LinTx/LinTx_musl/TODO.md) 中“功能单元 A/E/F”，当前仍有以下缺口：
+
+1. 结构缺口：尚未落地 `input_service` / `rf_link_service` 的服务化收口。
+当前输入与 RF 仍是多个模块并行，尚不是统一服务边界。
+
+2. 服务边界缺口：虽已消除 `elrs_agent` 的串口竞争问题，但 `rf_link_service` 尚未落地。
+这与 TODO 中“统一链路服务”的目标仍不一致。
+
+3. 回传覆盖缺口：已接入链路质量和机载电池，但未完整覆盖 EdgeTX 常见链路字段。
+
+4. 验证流程缺口：板测脚本尚未把 `elrs_tx` 回传链路纳入固定流程。
+当前仍主要依赖手工启动命令。
 
 ## 缺失的 EdgeTX 来源
 
@@ -62,4 +83,4 @@ LinTx 当前只把五类实际硬件/模拟输入（`adc`、`stm32_serial`、`cr
 
 ## 结论
 
-LinTx 已把 ADC/STM32/CRSF/joydev/mock 五种输入源接入统一输入链，并在 Control 页面与 mixer 输出处可见，基本覆盖 EdgeTX 在模拟、串口、trainer、模拟器等物理输入能力。现有验证脚本完成了 mock、STM32、CRSF 等路径的 UI 可见性检验，下一步可以将这些链路进一步与 `model` 和 `mixer` 配置对齐，保证输入源的优先级和状态更透明，并逐步扩展到逻辑开关、遥测、定时器等 EdgeTX 的虚拟来源。
+LinTx 已把 ADC/STM32/CRSF/joydev/mock 五种输入源接入统一输入链，并在 Control 页面与 mixer 输出处可见，基本覆盖 EdgeTX 在模拟、串口、trainer、模拟器等物理输入能力。新增的 `elrs_tx` 回传解析已让“发射 + 回传状态”形成最小闭环，但离 TODO.md 目标中的统一 `rf_link_service`、完整遥测字段与固定验证脚本仍有距离。下一步应优先收口串口所有权并固定板级验证脚本，再补齐遥测字段与状态语义。
