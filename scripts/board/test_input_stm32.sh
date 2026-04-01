@@ -4,7 +4,7 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 . "$SCRIPT_DIR/board_common.sh"
 
-DEV_NAME="${1:-/dev/ttyS3}"
+DEV_NAME="${1:-/dev/ttyS0}"
 BAUDRATE="${2:-115200}"
 
 stop_lintx

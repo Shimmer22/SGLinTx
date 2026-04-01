@@ -86,17 +86,23 @@ LINTX_FB_ROTATE=270 LINTX_FB_SWAP_RB=1 ./LinTx -- ui_demo --backend fb --fb-devi
 
 ```bash
 cd /root/lintx
-sh ./scripts/board/test_input_stm32.sh /dev/ttyS3 115200
+sh ./scripts/board/test_input_stm32.sh /dev/ttyS0 115200
 ```
 
 或手工执行：
 
 ```bash
 ./LinTx --server &
-./LinTx -- stm32_serial /dev/ttyS3 --baudrate 115200 &
+./LinTx -- stm32_serial /dev/ttyS0 --baudrate 115200 &
 ./LinTx -- mixer &
 LINTX_FB_ROTATE=270 LINTX_FB_SWAP_RB=1 ./LinTx -- ui_demo --backend fb --fb-device /dev/fb0 --width 800 --height 480
 ```
+
+实测记录：
+
+- 2026-04-01 在 `10.85.35.1` 上，`/dev/ttyS0 @ 115200` 可稳定读到 STM32 帧
+- 同板上 `/dev/ttyS3` 未读到有效 STM32 数据
+- 实际帧格式与当前 Python 验证脚本一致：`0x5A + len(12) + type(0x01) + 4x u16 + reserve(u16) + crc8_dvb_s2`
 
 检查：
 
