@@ -15,6 +15,7 @@ use crate::{
 };
 
 use super::{
+    apps::{self, UiAppContext},
     backend::LvglBackend,
     catalog::{app_at, page, PAGE_SPECS},
     input::UiInputEvent,
@@ -239,10 +240,6 @@ impl UiApp {
         }
     }
 
-    fn publish_config(&self, config_tx: &Sender<SystemConfigMsg>) {
-        config_tx.send(self.frame.config);
-    }
-
     fn publish_active_model(&self, active_model_tx: &Sender<ActiveModelMsg>) {
         match store::load_active_model() {
             Ok(model) => active_model_tx.send(ActiveModelMsg { model }),
@@ -329,79 +326,12 @@ impl UiApp {
         active_model_tx: &Sender<ActiveModelMsg>,
         elrs_cmd_tx: &Sender<ElrsCommandMsg>,
     ) {
-        match app {
-            AppId::System => match event {
-                UiInputEvent::Up => {
-                    self.frame.config.backlight_percent = self
-                        .frame
-                        .config
-                        .backlight_percent
-                        .saturating_add(5)
-                        .min(100);
-                    self.publish_config(config_tx);
-                }
-                UiInputEvent::Down => {
-                    self.frame.config.backlight_percent =
-                        self.frame.config.backlight_percent.saturating_sub(5);
-                    self.publish_config(config_tx);
-                }
-                UiInputEvent::Left => {
-                    self.frame.config.sound_percent =
-                        self.frame.config.sound_percent.saturating_sub(5);
-                    self.publish_config(config_tx);
-                }
-                UiInputEvent::Right => {
-                    self.frame.config.sound_percent =
-                        self.frame.config.sound_percent.saturating_add(5).min(100);
-                    self.publish_config(config_tx);
-                }
-                _ => {}
-            },
-            AppId::Models => match event {
-                UiInputEvent::Up => {
-                    self.frame.model_focus_idx = self.frame.model_focus_idx.saturating_sub(1);
-                }
-                UiInputEvent::Down => {
-                    let max_idx = self.frame.model_entries.len().saturating_sub(1);
-                    self.frame.model_focus_idx = (self.frame.model_focus_idx + 1).min(max_idx);
-                }
-                UiInputEvent::Open => {
-                    if let Some(entry) = self.frame.model_entries.get(self.frame.model_focus_idx) {
-                        match store::set_active_model(&entry.id) {
-                            Ok(_) => {
-                                self.frame.model_active_idx = self.frame.model_focus_idx;
-                                self.publish_active_model(active_model_tx);
-                            }
-                            Err(err) => {
-                                super::debug_log(&format!("set_active_model failed: {err}"));
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            },
-            AppId::Cloud => {
-                if event == UiInputEvent::Open {
-                    self.frame.cloud_connected = !self.frame.cloud_connected;
-                    if self.frame.cloud_connected {
-                        self.frame.cloud_last_sync_secs = self.frame.status.unix_time_secs;
-                    }
-                }
-            }
-            AppId::Scripts => match event {
-                UiInputEvent::Back | UiInputEvent::PagePrev => {
-                    elrs_cmd_tx.send(ElrsCommandMsg::Back)
-                }
-                UiInputEvent::Up => elrs_cmd_tx.send(ElrsCommandMsg::SelectPrev),
-                UiInputEvent::Down => elrs_cmd_tx.send(ElrsCommandMsg::SelectNext),
-                UiInputEvent::Left => elrs_cmd_tx.send(ElrsCommandMsg::ValueDec),
-                UiInputEvent::Right => elrs_cmd_tx.send(ElrsCommandMsg::ValueInc),
-                UiInputEvent::Open => elrs_cmd_tx.send(ElrsCommandMsg::Activate),
-                UiInputEvent::PageNext => elrs_cmd_tx.send(ElrsCommandMsg::Refresh),
-                _ => {}
-            },
-            _ => {}
-        }
+        let ctx = UiAppContext {
+            config_tx,
+            active_model_tx,
+            elrs_cmd_tx,
+        };
+        apps::handle_event(app, &mut self.frame, event, &ctx);
     }
 
     fn apply_event(
@@ -414,16 +344,18 @@ impl UiApp {
         match event {
             UiInputEvent::Quit => return false,
             UiInputEvent::Back => {
-                if matches!(self.frame.page, UiPage::App(AppId::Scripts))
-                    && !self.frame.elrs.can_leave
-                {
-                    self.apply_event_in_app(
-                        AppId::Scripts,
-                        event,
-                        config_tx,
-                        active_model_tx,
-                        elrs_cmd_tx,
-                    );
+                if let UiPage::App(app) = self.frame.page {
+                    if apps::should_intercept_back(app, &self.frame) {
+                        self.apply_event_in_app(
+                            app,
+                            event,
+                            config_tx,
+                            active_model_tx,
+                            elrs_cmd_tx,
+                        );
+                    } else {
+                        self.frame.page = UiPage::Launcher;
+                    }
                 } else {
                     self.frame.page = UiPage::Launcher;
                 }

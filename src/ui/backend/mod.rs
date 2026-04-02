@@ -65,18 +65,6 @@ impl BackendKind {
     }
 }
 
-const MODEL_NAMES: [&str; 4] = ["Quad X", "Fixed Wing", "Rover", "Boat"];
-const MODEL_PROTOCOLS: [&str; 4] = ["CRSF 250Hz", "CRSF 150Hz", "PWM 100Hz", "PWM 50Hz"];
-
-fn battery_grade(v: u8) -> &'static str {
-    match v {
-        80..=100 => "GOOD",
-        50..=79 => "OK",
-        20..=49 => "LOW",
-        _ => "CRITICAL",
-    }
-}
-
 fn signal_grade(v: u8) -> &'static str {
     match v {
         75..=100 => "SOLID",

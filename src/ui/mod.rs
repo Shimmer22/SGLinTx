@@ -1,4 +1,5 @@
 pub mod app;
+pub mod apps;
 pub mod backend;
 pub mod catalog;
 pub mod input;

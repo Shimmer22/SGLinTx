@@ -106,10 +106,7 @@ impl Stm32FrameParser {
             return;
         }
 
-        let keep_from = self
-            .buffer
-            .len()
-            .saturating_sub(STM32_MAX_BUFFERED_BYTES);
+        let keep_from = self.buffer.len().saturating_sub(STM32_MAX_BUFFERED_BYTES);
         if let Some(sync_pos) = self.buffer[keep_from..]
             .iter()
             .position(|byte| *byte == STM32_SYNC_BYTE)
@@ -146,11 +143,7 @@ pub fn stm32_serial_main(argc: u32, argv: *const &str) {
                     4,
                 );
 
-                if let Err(err) = read_stm32_stream(
-                    &mut *port,
-                    &input_frame_tx,
-                    &adc_raw_tx,
-                ) {
+                if let Err(err) = read_stm32_stream(&mut *port, &input_frame_tx, &adc_raw_tx) {
                     publish_input_status(
                         &input_status_tx,
                         InputSource::Stm32Serial,
@@ -241,7 +234,11 @@ mod tests {
 
     fn build_frame(channels: [u16; STM32_JOYSTICK_CHANNEL_COUNT]) -> Vec<u8> {
         let crc_alg = Crc::<u8>::new(&CRC_8_DVB_S2);
-        let mut frame = vec![STM32_SYNC_BYTE, STM32_JOYSTICK_PAYLOAD_LEN as u8, STM32_JOYSTICK_MSG_TYPE];
+        let mut frame = vec![
+            STM32_SYNC_BYTE,
+            STM32_JOYSTICK_PAYLOAD_LEN as u8,
+            STM32_JOYSTICK_MSG_TYPE,
+        ];
         for channel in channels {
             frame.extend_from_slice(&channel.to_le_bytes());
         }
