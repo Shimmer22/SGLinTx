@@ -10,3 +10,8 @@ pub enum UiInputEvent {
     PageNext,
     Quit,
 }
+
+#[rpos::ctor::ctor]
+fn register_ui_input_message() {
+    rpos::msg::add_message::<UiInputEvent>("ui_input_event");
+}

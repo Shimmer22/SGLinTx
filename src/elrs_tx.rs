@@ -9,9 +9,11 @@ use rpos::{
     pthread_scheduler::SchedulePthread,
     thread_logln,
 };
+use serialport::{DataBits, FlowControl, Parity, StopBits};
 
 use crate::{
     client_process_args,
+    config::{store, ElrsUiConfig},
     messages::{ElrsCommandMsg, ElrsFeedbackMsg, ElrsStateMsg, SystemStatusMsg},
     mixer::MixerOutMsg,
 };
@@ -24,6 +26,11 @@ const CRSF_MAX_PACKET_SIZE: usize = 66;
 const CRSF_CRC: Crc<u8> = Crc::<u8>::new(&CRC_8_DVB_S2);
 const REOPEN_DELAY: Duration = Duration::from_millis(500);
 const TELEMETRY_STALE_AFTER: Duration = Duration::from_secs(2);
+const SERIAL_IO_TIMEOUT: Duration = Duration::from_millis(100);
+const WRITE_TIMEOUT_LOG_EVERY: u32 = 50;
+const DEFAULT_RF_UART: &str = "/dev/ttyS3";
+const ELRS_POWER_LEVELS_MW: [u16; 6] = [10, 25, 100, 250, 500, 1000];
+const EDITOR_CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789-_";
 
 #[derive(Parser)]
 #[command(name = "rf_link_service", about = "Unified ELRS/CRSF RF link service", long_about = None)]
@@ -31,6 +38,7 @@ struct Cli {
     #[arg(short, long, default_value_t = 420000)]
     baudrate: u32,
 
+    #[arg(default_value = DEFAULT_RF_UART)]
     dev_name: String,
 }
 
@@ -62,6 +70,299 @@ fn mixer_out_to_crsf(value: u16) -> u16 {
         + crsf::RcChannels::CHANNEL_VALUE_MIN as u32) as u16
 }
 
+#[derive(Debug, Clone)]
+struct EditorState {
+    buffer: Vec<u8>,
+    cursor: usize,
+}
+
+impl EditorState {
+    fn new(initial: &str) -> Self {
+        let mut buffer = initial.as_bytes().to_vec();
+        sanitize_editor_buffer(&mut buffer);
+        if buffer.is_empty() {
+            buffer.push(EDITOR_CHARSET[0]);
+        }
+        Self { buffer, cursor: 0 }
+    }
+
+    fn move_cursor(&mut self, delta: isize) {
+        if self.buffer.is_empty() {
+            self.cursor = 0;
+            return;
+        }
+
+        if delta.is_negative() {
+            self.cursor = self.cursor.saturating_sub(delta.unsigned_abs());
+        } else {
+            self.cursor = self
+                .cursor
+                .saturating_add(delta as usize)
+                .min(self.buffer.len().saturating_sub(1));
+        }
+    }
+
+    fn cycle_char(&mut self, delta: isize) {
+        if self.buffer.is_empty() {
+            self.buffer.push(EDITOR_CHARSET[0]);
+            self.cursor = 0;
+            return;
+        }
+
+        let current = self.buffer[self.cursor];
+        let current_idx = char_index(current).unwrap_or(0);
+        let len = EDITOR_CHARSET.len() as isize;
+        let next_idx = (current_idx as isize + delta).rem_euclid(len) as usize;
+        self.buffer[self.cursor] = EDITOR_CHARSET[next_idx];
+    }
+
+    fn as_string(&self) -> String {
+        String::from_utf8_lossy(&self.buffer).to_string()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ElrsUiState {
+    config: ElrsUiConfig,
+    selected_idx: usize,
+    editor: Option<EditorState>,
+}
+
+impl ElrsUiState {
+    const SELECTABLE_PARAM_COUNT: usize = 4;
+
+    fn load() -> Self {
+        let config = store::load_radio_config()
+            .map(|radio| radio.elrs)
+            .unwrap_or_default();
+        Self {
+            config,
+            selected_idx: 0,
+            editor: None,
+        }
+    }
+
+    fn editor_label(&self) -> &'static str {
+        "Bind Phrase"
+    }
+
+    fn handle_command(&mut self, cmd: ElrsCommandMsg) -> String {
+        if self.editor.is_some() {
+            return self.handle_editor_command(cmd);
+        }
+
+        match cmd {
+            ElrsCommandMsg::Back => "Back".to_string(),
+            ElrsCommandMsg::Refresh => self.reload_from_disk(),
+            ElrsCommandMsg::SelectPrev => {
+                self.selected_idx = self.selected_idx.saturating_sub(1);
+                self.current_item_status()
+            }
+            ElrsCommandMsg::SelectNext => {
+                let max_idx = Self::SELECTABLE_PARAM_COUNT.saturating_sub(1);
+                self.selected_idx = self.selected_idx.saturating_add(1).min(max_idx);
+                self.current_item_status()
+            }
+            ElrsCommandMsg::ValueDec => self.adjust_selected(-1),
+            ElrsCommandMsg::ValueInc => self.adjust_selected(1),
+            ElrsCommandMsg::Activate => self.activate_selected(),
+        }
+    }
+
+    fn handle_editor_command(&mut self, cmd: ElrsCommandMsg) -> String {
+        if self.editor.is_none() {
+            return "Edit unavailable".to_string();
+        }
+
+        match cmd {
+            ElrsCommandMsg::Back => {
+                self.editor = None;
+                "Bind phrase edit cancelled".to_string()
+            }
+            ElrsCommandMsg::SelectPrev => {
+                let editor = self.editor.as_mut().expect("editor checked");
+                editor.cycle_char(-1);
+                format!("Editing bind phrase: {}", editor.as_string())
+            }
+            ElrsCommandMsg::SelectNext => {
+                let editor = self.editor.as_mut().expect("editor checked");
+                editor.cycle_char(1);
+                format!("Editing bind phrase: {}", editor.as_string())
+            }
+            ElrsCommandMsg::ValueDec => {
+                let editor = self.editor.as_mut().expect("editor checked");
+                editor.move_cursor(-1);
+                format!("Cursor {}", editor.cursor.saturating_add(1))
+            }
+            ElrsCommandMsg::ValueInc => {
+                let editor = self.editor.as_mut().expect("editor checked");
+                editor.move_cursor(1);
+                format!("Cursor {}", editor.cursor.saturating_add(1))
+            }
+            ElrsCommandMsg::Activate => {
+                let Some(editor) = self.editor.as_ref() else {
+                    return "Edit unavailable".to_string();
+                };
+                self.config.bind_phrase = editor.as_string();
+                self.editor = None;
+                match self.persist() {
+                    Ok(()) => "Bind phrase saved".to_string(),
+                    Err(err) => format!("Bind phrase save failed: {err}"),
+                }
+            }
+            ElrsCommandMsg::Refresh => "Editing bind phrase".to_string(),
+        }
+    }
+
+    fn adjust_selected(&mut self, delta: isize) -> String {
+        match self.selected_idx {
+            0 => {
+                self.config.wifi_manual_on = !self.config.wifi_manual_on;
+                match self.persist() {
+                    Ok(()) => {
+                        if self.config.wifi_manual_on {
+                            "ELRS WiFi enabled".to_string()
+                        } else {
+                            "ELRS WiFi disabled".to_string()
+                        }
+                    }
+                    Err(err) => format!("WiFi config save failed: {err}"),
+                }
+            }
+            1 => {
+                self.config.bind_mode = !self.config.bind_mode;
+                match self.persist() {
+                    Ok(()) => {
+                        if self.config.bind_mode {
+                            "Bind mode entered".to_string()
+                        } else {
+                            "Bind mode exited".to_string()
+                        }
+                    }
+                    Err(err) => format!("Bind mode save failed: {err}"),
+                }
+            }
+            2 => {
+                self.config.tx_power_mw = shift_power_level(self.config.tx_power_mw, delta);
+                match self.persist() {
+                    Ok(()) => format!("TX power set to {}mW", self.config.tx_power_mw),
+                    Err(err) => format!("TX power save failed: {err}"),
+                }
+            }
+            3 => {
+                self.editor = Some(EditorState::new(&self.config.bind_phrase));
+                "Editing bind phrase".to_string()
+            }
+            _ => self.current_item_status(),
+        }
+    }
+
+    fn activate_selected(&mut self) -> String {
+        match self.selected_idx {
+            0..=2 => self.adjust_selected(1),
+            3 => {
+                self.editor = Some(EditorState::new(&self.config.bind_phrase));
+                "Editing bind phrase".to_string()
+            }
+            _ => self.current_item_status(),
+        }
+    }
+
+    fn current_item_status(&self) -> String {
+        match self.selected_idx {
+            0 => {
+                if self.config.wifi_manual_on {
+                    "Manual WiFi is ON".to_string()
+                } else {
+                    "Manual WiFi is OFF".to_string()
+                }
+            }
+            1 => {
+                if self.config.bind_mode {
+                    "Bind mode ACTIVE".to_string()
+                } else {
+                    "Bind mode IDLE".to_string()
+                }
+            }
+            2 => format!("TX power {}mW", self.config.tx_power_mw),
+            3 => "Bind phrase".to_string(),
+            _ => String::new(),
+        }
+    }
+
+    fn reload_from_disk(&mut self) -> String {
+        match store::load_radio_config() {
+            Ok(radio) => {
+                self.config = radio.elrs;
+                self.editor = None;
+                "ELRS config reloaded".to_string()
+            }
+            Err(err) => format!("ELRS config reload failed: {err}"),
+        }
+    }
+
+    fn persist(&self) -> Result<(), String> {
+        let mut radio = store::load_radio_config().map_err(|err| err.to_string())?;
+        radio.elrs = self.config.clone();
+        store::save_radio_config(&radio).map_err(|err| err.to_string())
+    }
+}
+
+fn sanitize_editor_buffer(buffer: &mut Vec<u8>) {
+    for ch in buffer.iter_mut() {
+        if char_index(*ch).is_none() {
+            *ch = EDITOR_CHARSET[0];
+        }
+    }
+    if buffer.len() > 32 {
+        buffer.truncate(32);
+    }
+}
+
+fn char_index(ch: u8) -> Option<usize> {
+    EDITOR_CHARSET.iter().position(|candidate| *candidate == ch)
+}
+
+fn shift_power_level(current: u16, delta: isize) -> u16 {
+    let current = normalize_power_level(current);
+    let idx = ELRS_POWER_LEVELS_MW
+        .iter()
+        .position(|power| *power == current)
+        .unwrap_or(0) as isize;
+    let next = (idx + delta).clamp(0, ELRS_POWER_LEVELS_MW.len() as isize - 1) as usize;
+    ELRS_POWER_LEVELS_MW[next]
+}
+
+fn normalize_power_level(raw: u16) -> u16 {
+    ELRS_POWER_LEVELS_MW
+        .iter()
+        .min_by_key(|level| level.abs_diff(raw))
+        .copied()
+        .unwrap_or(100)
+}
+
+fn write_packet_with_timeout_tolerance(
+    dev: &mut dyn serialport::SerialPort,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    let mut sent = 0usize;
+    while sent < payload.len() {
+        match dev.write(&payload[sent..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "serial write returned 0",
+                ))
+            }
+            Ok(n) => {
+                sent = sent.saturating_add(n);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
 fn rf_link_service_main(argc: u32, argv: *const &str) {
     let args = match client_process_args::<Cli>(argc, argv) {
         Some(v) => v,
@@ -82,24 +383,46 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
 
     SchedulePthread::new_simple(Box::new(move |_| {
         let mut status_state = TelemetryStatusState::default();
+        let mut ui_state = ElrsUiState::load();
         let mut serial_buf = Vec::<u8>::new();
         let mut read_buf = [0u8; 256];
         let mut crsf_chn_values: [u16; 16] = [0; 16];
         let mut last_state = ElrsStateMsg::default();
+        let mut write_timeout_count: u32 = 0;
 
         loop {
-            let serial =
-                serialport::new(&args.dev_name, args.baudrate).timeout(Duration::from_millis(20));
+            let serial = serialport::new(&args.dev_name, args.baudrate)
+                .timeout(SERIAL_IO_TIMEOUT)
+                .data_bits(DataBits::Eight)
+                .parity(Parity::None)
+                .stop_bits(StopBits::One)
+                .flow_control(FlowControl::None);
             let mut dev = match serial.open() {
                 Ok(port) => port,
                 Err(err) => {
-                    let state =
-                        build_elrs_state(false, format!("open failed: {}", err), &status_state);
-                    elrs_feedback_tx.send(build_feedback(
+                    let err_text = format!("open failed: {}", err);
+                    while let Some(cmd) = elrs_cmd_rx.try_read() {
+                        let cmd_status = ui_state.handle_command(cmd);
+                        let cmd_state = build_elrs_state(
+                            false,
+                            cmd_status,
+                            &status_state,
+                            &ui_state,
+                            &args.dev_name,
+                        );
+                        if cmd_state != last_state {
+                            elrs_state_tx.send(cmd_state.clone());
+                            last_state = cmd_state;
+                        }
+                    }
+                    let state = build_elrs_state(
                         false,
-                        format!("open failed: {}", err),
+                        err_text.clone(),
                         &status_state,
-                    ));
+                        &ui_state,
+                        &args.dev_name,
+                    );
+                    elrs_feedback_tx.send(build_feedback(false, err_text.clone(), &status_state));
                     if state != last_state {
                         elrs_state_tx.send(state.clone());
                         last_state = state;
@@ -112,17 +435,31 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
 
             let magic_cmd = gen_magic_packet();
             for _ in 0..10 {
-                if let Err(err) = dev.write_all(&magic_cmd) {
+                if let Err(err) = write_packet_with_timeout_tolerance(&mut *dev, &magic_cmd) {
+                    if err.kind() == std::io::ErrorKind::TimedOut {
+                        write_timeout_count = write_timeout_count.saturating_add(1);
+                        if write_timeout_count % WRITE_TIMEOUT_LOG_EVERY == 1 {
+                            thread_logln!(
+                                "rf_link_service magic write timeout on {} (count={})",
+                                args.dev_name,
+                                write_timeout_count
+                            );
+                        }
+                        continue;
+                    }
                     thread_logln!("rf_link_service magic write failed: {}", err);
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
 
+            let mut ui_status_text = format!("{} @ {} baud", args.dev_name, args.baudrate);
             let state = build_elrs_state(
                 true,
-                format!("{} @ {} baud", args.dev_name, args.baudrate),
+                ui_status_text.clone(),
                 &status_state,
+                &ui_state,
+                &args.dev_name,
             );
             elrs_feedback_tx.send(build_feedback(
                 true,
@@ -141,15 +478,36 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                     crsf_chn_values[2] = mixer_out_to_crsf(msg.thrust);
                     crsf_chn_values[3] = mixer_out_to_crsf(msg.direction);
                     let raw_packet = new_rc_channel_packet(&crsf_chn_values);
-                    if let Err(err) = dev.write_all(raw_packet.data()) {
+                    if let Err(err) =
+                        write_packet_with_timeout_tolerance(&mut *dev, raw_packet.data())
+                    {
+                        if err.kind() == std::io::ErrorKind::TimedOut {
+                            write_timeout_count = write_timeout_count.saturating_add(1);
+                            if write_timeout_count % WRITE_TIMEOUT_LOG_EVERY == 1 {
+                                thread_logln!(
+                                    "rf_link_service write timeout on {} (count={})",
+                                    args.dev_name,
+                                    write_timeout_count
+                                );
+                            }
+                            continue;
+                        }
+                        write_timeout_count = 0;
                         thread_logln!("rf_link_service write failed: {}", err);
                         break;
                     }
+                    write_timeout_count = 0;
                 }
 
                 while let Some(cmd) = elrs_cmd_rx.try_read() {
-                    let cmd_text = format!("cmd={:?}", cmd);
-                    let state = build_elrs_state(true, cmd_text, &status_state);
+                    ui_status_text = ui_state.handle_command(cmd);
+                    let state = build_elrs_state(
+                        true,
+                        ui_status_text.clone(),
+                        &status_state,
+                        &ui_state,
+                        &args.dev_name,
+                    );
                     if state != last_state {
                         elrs_state_tx.send(state.clone());
                         last_state = state;
@@ -169,8 +527,13 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                             "telemetry rx".to_string(),
                             &status_state,
                         ));
-                        let state =
-                            build_elrs_state(true, "telemetry rx".to_string(), &status_state);
+                        let state = build_elrs_state(
+                            true,
+                            ui_status_text.clone(),
+                            &status_state,
+                            &ui_state,
+                            &args.dev_name,
+                        );
                         if state != last_state {
                             elrs_state_tx.send(state.clone());
                             last_state = state;
@@ -183,6 +546,8 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                             false,
                             format!("serial error: {}", err),
                             &status_state,
+                            &ui_state,
+                            &args.dev_name,
                         );
                         elrs_feedback_tx.send(build_feedback(
                             false,
@@ -199,8 +564,13 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                 }
 
                 if status_state.telemetry_is_stale() {
-                    let state =
-                        build_elrs_state(true, "waiting telemetry".to_string(), &status_state);
+                    let state = build_elrs_state(
+                        true,
+                        ui_status_text.clone(),
+                        &status_state,
+                        &ui_state,
+                        &args.dev_name,
+                    );
                     if state != last_state {
                         elrs_state_tx.send(state.clone());
                         last_state = state;
@@ -281,16 +651,29 @@ fn build_elrs_state(
     connected: bool,
     status_text: String,
     telemetry: &TelemetryStatusState,
+    ui_state: &ElrsUiState,
+    dev_name: &str,
 ) -> ElrsStateMsg {
+    let editor_active = ui_state.editor.is_some();
+    let (editor_buffer, editor_cursor) = if let Some(editor) = ui_state.editor.as_ref() {
+        (editor.as_string(), editor.cursor)
+    } else {
+        (String::new(), 0)
+    };
+
     ElrsStateMsg {
         connected,
         busy: false,
-        can_leave: true,
-        path: "/".to_string(),
-        editor_active: false,
-        editor_label: String::new(),
-        editor_buffer: String::new(),
-        editor_cursor: 0,
+        can_leave: !editor_active,
+        path: dev_name.to_string(),
+        editor_active,
+        editor_label: if editor_active {
+            ui_state.editor_label().to_string()
+        } else {
+            String::new()
+        },
+        editor_buffer,
+        editor_cursor,
         module_name: "ELRS/CRSF".to_string(),
         device_name: if connected {
             "UART Connected".to_string()
@@ -300,11 +683,47 @@ fn build_elrs_state(
         version: "--".to_string(),
         packet_rate: "--".to_string(),
         telemetry_ratio: "--".to_string(),
-        tx_power: "--".to_string(),
+        tx_power: format!("{}mW", ui_state.config.tx_power_mw),
         status_text,
-        wifi_running: false,
-        selected_idx: 0,
+        wifi_running: ui_state.config.wifi_manual_on,
+        selected_idx: ui_state.selected_idx,
         params: vec![
+            crate::messages::ElrsParamEntry {
+                id: "wifi_manual".to_string(),
+                label: "Manual WiFi".to_string(),
+                value: if ui_state.config.wifi_manual_on {
+                    "ON".to_string()
+                } else {
+                    "OFF".to_string()
+                },
+                selectable: true,
+            },
+            crate::messages::ElrsParamEntry {
+                id: "bind_mode".to_string(),
+                label: "Bind Mode".to_string(),
+                value: if ui_state.config.bind_mode {
+                    "ACTIVE".to_string()
+                } else {
+                    "IDLE".to_string()
+                },
+                selectable: true,
+            },
+            crate::messages::ElrsParamEntry {
+                id: "tx_power".to_string(),
+                label: "TX Power".to_string(),
+                value: format!("{}mW", ui_state.config.tx_power_mw),
+                selectable: true,
+            },
+            crate::messages::ElrsParamEntry {
+                id: "bind_phrase".to_string(),
+                label: "Bind Phrase".to_string(),
+                value: if ui_state.config.bind_phrase.is_empty() {
+                    "(empty)".to_string()
+                } else {
+                    ui_state.config.bind_phrase.clone()
+                },
+                selectable: true,
+            },
             crate::messages::ElrsParamEntry {
                 id: "signal".to_string(),
                 label: "Signal".to_string(),
@@ -403,8 +822,8 @@ fn now_unix_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_frame_crc, extract_crsf_frames, TelemetryStatusState, CRSF_CRC,
-        CRSF_FRAME_BATTERY_ID, CRSF_FRAME_LINK_ID, CRSF_SYNC,
+        check_frame_crc, extract_crsf_frames, shift_power_level, EditorState, TelemetryStatusState,
+        CRSF_CRC, CRSF_FRAME_BATTERY_ID, CRSF_FRAME_LINK_ID, CRSF_SYNC,
     };
 
     fn build_frame(frame_type: u8, payload: &[u8]) -> Vec<u8> {
@@ -441,6 +860,26 @@ mod tests {
         let status2 = state.consume_frame(&batt).expect("battery status");
         assert_eq!(status2.signal_strength_percent, 75);
         assert_eq!(status2.aircraft_battery_percent, 44);
+    }
+
+    #[test]
+    fn test_shift_power_level_clamped() {
+        assert_eq!(shift_power_level(100, -1), 25);
+        assert_eq!(shift_power_level(100, 1), 250);
+        assert_eq!(shift_power_level(10, -1), 10);
+        assert_eq!(shift_power_level(1000, 1), 1000);
+        assert_eq!(shift_power_level(50, 1), 100);
+    }
+
+    #[test]
+    fn test_editor_state_cycle_and_cursor() {
+        let mut editor = EditorState::new("ab");
+        editor.move_cursor(1);
+        editor.cycle_char(1);
+        assert_eq!(editor.cursor, 1);
+        assert_eq!(editor.as_string(), "ac");
+        editor.move_cursor(-5);
+        assert_eq!(editor.cursor, 0);
     }
 }
 

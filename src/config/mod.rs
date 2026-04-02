@@ -16,6 +16,8 @@ pub struct RadioConfig {
     pub audio: AudioConfig,
     #[serde(default)]
     pub input: InputConfig,
+    #[serde(default)]
+    pub elrs: ElrsUiConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,6 +60,18 @@ pub struct InputConfig {
     pub calibration_profile: String,
     #[serde(default)]
     pub source_priority: Vec<InputSource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ElrsUiConfig {
+    #[serde(default)]
+    pub wifi_manual_on: bool,
+    #[serde(default)]
+    pub bind_mode: bool,
+    #[serde(default = "default_elrs_tx_power_mw")]
+    pub tx_power_mw: u16,
+    #[serde(default)]
+    pub bind_phrase: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -215,6 +229,7 @@ impl Default for RadioConfig {
             ui: UiConfig::default(),
             audio: AudioConfig::default(),
             input: InputConfig::default(),
+            elrs: ElrsUiConfig::default(),
         }
     }
 }
@@ -256,6 +271,17 @@ impl Default for InputConfig {
         Self {
             calibration_profile: "joystick.toml".to_string(),
             source_priority: vec![InputSource::Adc, InputSource::Crsf, InputSource::Mock],
+        }
+    }
+}
+
+impl Default for ElrsUiConfig {
+    fn default() -> Self {
+        Self {
+            wifi_manual_on: false,
+            bind_mode: false,
+            tx_power_mw: default_elrs_tx_power_mw(),
+            bind_phrase: String::new(),
         }
     }
 }
@@ -427,6 +453,10 @@ fn default_limit_min() -> i16 {
 
 fn default_limit_max() -> i16 {
     1000
+}
+
+fn default_elrs_tx_power_mw() -> u16 {
+    100
 }
 
 #[cfg(test)]

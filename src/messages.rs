@@ -196,11 +196,54 @@ impl Default for ElrsStateMsg {
             version: "--".to_string(),
             packet_rate: "--".to_string(),
             telemetry_ratio: "--".to_string(),
-            tx_power: "--".to_string(),
-            status_text: "Idle".to_string(),
+            tx_power: "100mW".to_string(),
+            status_text: "ELRS service not started".to_string(),
             wifi_running: false,
             selected_idx: 0,
-            params: Vec::new(),
+            params: vec![
+                ElrsParamEntry {
+                    id: "wifi_manual".to_string(),
+                    label: "Manual WiFi".to_string(),
+                    value: "OFF".to_string(),
+                    selectable: true,
+                },
+                ElrsParamEntry {
+                    id: "bind_mode".to_string(),
+                    label: "Bind Mode".to_string(),
+                    value: "IDLE".to_string(),
+                    selectable: true,
+                },
+                ElrsParamEntry {
+                    id: "tx_power".to_string(),
+                    label: "TX Power".to_string(),
+                    value: "100mW".to_string(),
+                    selectable: true,
+                },
+                ElrsParamEntry {
+                    id: "bind_phrase".to_string(),
+                    label: "Bind Phrase".to_string(),
+                    value: "(empty)".to_string(),
+                    selectable: true,
+                },
+                ElrsParamEntry {
+                    id: "signal".to_string(),
+                    label: "Signal".to_string(),
+                    value: "--".to_string(),
+                    selectable: false,
+                },
+                ElrsParamEntry {
+                    id: "aircraft_battery".to_string(),
+                    label: "Aircraft Battery".to_string(),
+                    value: "--".to_string(),
+                    selectable: false,
+                },
+                ElrsParamEntry {
+                    id: "telemetry_fresh".to_string(),
+                    label: "Telemetry Fresh".to_string(),
+                    value: "stale".to_string(),
+                    selectable: false,
+                },
+            ],
         }
     }
 }

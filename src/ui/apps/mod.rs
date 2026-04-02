@@ -60,7 +60,7 @@ pub const APP_SPECS: [AppSpec; 8] = [
     about::SPEC,
 ];
 
-const PAGE0_APPS: [AppId; 4] = [AppId::System, AppId::Control, AppId::Models, AppId::Cloud];
+const PAGE0_APPS: [AppId; 4] = [AppId::System, AppId::Control, AppId::Models, AppId::Scripts];
 const PAGE1_APPS: [AppId; 8] = [
     AppId::System,
     AppId::Control,

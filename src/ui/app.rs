@@ -422,6 +422,8 @@ impl UiApp {
             get_new_rx_of_message::<ElrsFeedbackMsg>("elrs_feedback").unwrap();
         let mut mixer_out_rx = get_new_rx_of_message::<MixerOutMsg>("mixer_out").unwrap();
         let mut elrs_rx = get_new_rx_of_message::<ElrsStateMsg>("elrs_state").unwrap();
+        let mut injected_input_rx =
+            get_new_rx_of_message::<UiInputEvent>("ui_input_event").unwrap();
         let config_tx = get_new_tx_of_message::<SystemConfigMsg>("system_config").unwrap();
         let active_model_tx = get_new_tx_of_message::<ActiveModelMsg>("active_model").unwrap();
         let elrs_cmd_tx = get_new_tx_of_message::<ElrsCommandMsg>("elrs_cmd").unwrap();
@@ -486,6 +488,14 @@ impl UiApp {
             }
 
             while let Some(evt) = backend.poll_event() {
+                if !self.apply_event(evt, &config_tx, &active_model_tx, &elrs_cmd_tx) {
+                    backend.shutdown();
+                    return;
+                }
+                dirty = true;
+            }
+
+            while let Some(evt) = injected_input_rx.try_read() {
                 if !self.apply_event(evt, &config_tx, &active_model_tx, &elrs_cmd_tx) {
                     backend.shutdown();
                     return;

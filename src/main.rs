@@ -26,6 +26,7 @@ mod stm32_serial;
 mod system_state_mock;
 mod ui;
 mod ui_demo;
+mod ui_emit_input;
 #[cfg(target_os = "linux")]
 mod usb_gamepad;
 
