@@ -57,6 +57,7 @@ cd /root/lintx
 sh ./scripts/board/test_gui_mock.sh
 sh ./scripts/board/test_gui_crsf.sh /dev/ttyS3 420000
 sh ./scripts/board/test_gui_crsf_debug.sh /dev/ttyS3 420000
+sh ./scripts/board/test_elrs_ui_config.sh /dev/ttyS2 115200 stm32 /dev/ttyS0 115200
 sh ./scripts/board/test_input_mock.sh
 sh ./scripts/board/test_input_stm32.sh /dev/ttyS3 115200
 sh ./scripts/board/stop_lintx.sh
@@ -66,10 +67,12 @@ sh ./scripts/board/stop_lintx.sh
 - `test_gui_mock.sh`：启动 `server + elrs_agent(mock) + ui_demo(fb)`。
 - `test_gui_crsf.sh`：启动真实 ELRS/CRSF GUI 联调流程。
 - `test_gui_crsf_debug.sh`：在真实流程上额外打开 `LINTX_ELRS_DEBUG=1`。
+- `test_elrs_ui_config.sh`：启动 `server + stm32_serial/mock + mixer + rf_link_service + ui_demo`，用于 ELRS 页面参数和 Bind 联调。推荐 `RF UART @ 115200`。
 - `test_input_mock.sh`：启动 `server + mock_joystick + mixer + ui_demo(fb)`，用于输入链验证。
 - `test_input_stm32.sh`：启动 `server + stm32_serial + mixer + ui_demo(fb)`，用于当前 TX 主输入链验证。
 - `stop_lintx.sh`：停止板上的 `LinTx` 进程并清理 socket。
 - 板端 framebuffer 默认参数已经固化在脚本里：`800x480` 逻辑界面、`LINTX_FB_ROTATE=270`、`LINTX_FB_SWAP_RB=1`。
+- `rf_link_service` 需要持续输入流（`stm32_serial` 或 `mock_joystick`）来持续发送 RC 通道；只有 bind 命令帧通常不足以建立稳定链路。
 
 ### 基本用法（Linux）
 ```bash

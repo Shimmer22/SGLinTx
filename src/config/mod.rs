@@ -70,7 +70,7 @@ pub struct ElrsUiConfig {
     pub bind_mode: bool,
     #[serde(default = "default_elrs_tx_power_mw")]
     pub tx_power_mw: u16,
-    #[serde(default)]
+    #[serde(default = "default_elrs_bind_phrase")]
     pub bind_phrase: String,
 }
 
@@ -281,9 +281,13 @@ impl Default for ElrsUiConfig {
             wifi_manual_on: false,
             bind_mode: false,
             tx_power_mw: default_elrs_tx_power_mw(),
-            bind_phrase: String::new(),
+            bind_phrase: default_elrs_bind_phrase(),
         }
     }
+}
+
+fn default_elrs_bind_phrase() -> String {
+    "654321".to_string()
 }
 
 impl Default for InputMapping {

@@ -6,8 +6,8 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 STM32_DEV_NAME="${1:-/dev/ttyS0}"
 STM32_BAUDRATE="${2:-115200}"
-RF_DEV_NAME="${3:-/dev/ttyS3}"
-RF_BAUDRATE="${4:-420000}"
+RF_DEV_NAME="${3:-/dev/ttyS2}"
+RF_BAUDRATE="${4:-115200}"
 
 stop_lintx
 start_server

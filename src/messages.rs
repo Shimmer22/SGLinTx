@@ -222,7 +222,7 @@ impl Default for ElrsStateMsg {
                 ElrsParamEntry {
                     id: "bind_phrase".to_string(),
                     label: "Bind Phrase".to_string(),
-                    value: "(empty)".to_string(),
+                    value: "654321".to_string(),
                     selectable: true,
                 },
                 ElrsParamEntry {

@@ -10,6 +10,7 @@ use crate::{
 
 const LOCAL_POWER_LEVELS_MW: [u16; 6] = [10, 25, 100, 250, 500, 1000];
 const LOCAL_EDITOR_CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789-_";
+const DEFAULT_BIND_PHRASE: &str = "654321";
 
 pub const SPEC: AppSpec = AppSpec {
     id: AppId::Scripts,
@@ -35,7 +36,7 @@ impl Default for LocalElrsConfig {
             wifi_manual_on: false,
             bind_mode: false,
             tx_power_mw: 100,
-            bind_phrase: String::new(),
+            bind_phrase: DEFAULT_BIND_PHRASE.to_string(),
         }
     }
 }
@@ -231,7 +232,7 @@ fn apply_local_adjust(frame: &mut UiFrame, cfg: &mut LocalElrsConfig, delta: isi
             frame.elrs.can_leave = false;
             frame.elrs.editor_label = "Bind Phrase".to_string();
             frame.elrs.editor_buffer = if cfg.bind_phrase.is_empty() {
-                "a".to_string()
+                DEFAULT_BIND_PHRASE.to_string()
             } else {
                 cfg.bind_phrase.clone()
             };
@@ -291,7 +292,7 @@ fn apply_local_state(frame: &mut UiFrame, cfg: &LocalElrsConfig, status: Option<
             id: "bind_phrase".to_string(),
             label: "Bind Phrase".to_string(),
             value: if cfg.bind_phrase.is_empty() {
-                "(empty)".to_string()
+                DEFAULT_BIND_PHRASE.to_string()
             } else {
                 cfg.bind_phrase.clone()
             },
@@ -320,12 +321,19 @@ fn apply_local_state(frame: &mut UiFrame, cfg: &LocalElrsConfig, status: Option<
 
 fn load_local_config() -> LocalElrsConfig {
     match store::load_radio_config() {
-        Ok(radio) => LocalElrsConfig {
-            wifi_manual_on: radio.elrs.wifi_manual_on,
-            bind_mode: radio.elrs.bind_mode,
-            tx_power_mw: normalize_power_level(radio.elrs.tx_power_mw),
-            bind_phrase: radio.elrs.bind_phrase,
-        },
+        Ok(radio) => {
+            let bind_phrase = if radio.elrs.bind_phrase.is_empty() {
+                DEFAULT_BIND_PHRASE.to_string()
+            } else {
+                radio.elrs.bind_phrase
+            };
+            LocalElrsConfig {
+                wifi_manual_on: radio.elrs.wifi_manual_on,
+                bind_mode: radio.elrs.bind_mode,
+                tx_power_mw: normalize_power_level(radio.elrs.tx_power_mw),
+                bind_phrase,
+            }
+        }
         Err(_) => LocalElrsConfig::default(),
     }
 }

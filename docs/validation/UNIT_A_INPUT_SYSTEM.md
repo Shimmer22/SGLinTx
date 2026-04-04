@@ -121,7 +121,7 @@ LINTX_FB_ROTATE=270 LINTX_FB_SWAP_RB=1 ./LinTx -- ui_demo --backend fb --fb-devi
 
 ```bash
 cd /root/lintx
-sh ./scripts/board/test_input_elrs_return.sh /dev/ttyS0 115200 /dev/ttyS3 420000
+sh ./scripts/board/test_input_elrs_return.sh /dev/ttyS0 115200 /dev/ttyS3 115200
 ```
 
 检查：
@@ -131,6 +131,7 @@ sh ./scripts/board/test_input_elrs_return.sh /dev/ttyS0 115200 /dev/ttyS3 420000
 - Telemetry/System 区域中 `Signal` 会随链路变化
 - 若接收机有 CRSF `BATTERY_ID` 回传，`Aircraft Battery` 应有更新
 - `Mixer Out` 和发射链持续工作，不因回传解析卡住
+- 建议保持主输入在线（`stm32_serial` 或 `mock_joystick`），确保 `rf_link_service` 有持续 RC 通道流
 
 日志建议：
 

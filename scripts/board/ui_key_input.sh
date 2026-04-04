@@ -4,12 +4,6 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 . "$SCRIPT_DIR/board_common.sh"
 
-TTY_DEV="/dev/tty"
-if [ ! -r "$TTY_DEV" ]; then
-    echo "Cannot access $TTY_DEV. Please run in an interactive SSH terminal." >&2
-    exit 1
-fi
-
 cat <<'EOF_INFO'
 Attach terminal key injector.
 
@@ -23,10 +17,33 @@ Use keys in this SSH session:
 Press q to stop.
 EOF_INFO
 
-emit_event() {
-    event="$1"
-    LINTX_SOCKET_PATH="$SOCKET_PATH" "$BIN" -- ui_emit_input --event "$event" >/dev/null 2>&1 || true
+TTY_DEV="/dev/tty"
+UI_FIFO_PATH="${UI_FIFO_PATH:-/tmp/lintx-ui-input.fifo}"
+if [ ! -r "$TTY_DEV" ]; then
+    echo "Cannot access $TTY_DEV. Please run in an interactive SSH terminal." >&2
+    exit 1
+fi
+
+LINTX_SOCKET_PATH="$SOCKET_PATH" "$BIN" --detach -- ui_input_fifo --pipe-path "$UI_FIFO_PATH" \
+    >"$LOG_DIR/ui_input_fifo.log" 2>&1 || true
+
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -p "$UI_FIFO_PATH" ] && break
+    sleep 0.1
+done
+if [ ! -p "$UI_FIFO_PATH" ]; then
+    echo "FIFO not ready: $UI_FIFO_PATH" >&2
+    exit 1
+fi
+
+ORIG_STTY=$(stty -g <"$TTY_DEV")
+restore_tty() {
+    stty "$ORIG_STTY" <"$TTY_DEV" || true
 }
+trap restore_tty EXIT INT TERM
+stty raw -echo <"$TTY_DEV"
+
+exec 3>"$UI_FIFO_PATH"
 
 read_char() {
     dd if="$TTY_DEV" bs=1 count=1 2>/dev/null || true
@@ -35,16 +52,13 @@ read_char() {
 read_char_timeout() {
     stty -echo -icanon min 0 time "$1" <"$TTY_DEV"
     c=$(dd if="$TTY_DEV" bs=1 count=1 2>/dev/null || true)
-    stty -echo -icanon min 1 time 0 <"$TTY_DEV"
+    stty raw -echo <"$TTY_DEV"
     printf '%s' "$c"
 }
 
-ORIG_STTY=$(stty -g <"$TTY_DEV")
-restore_tty() {
-    stty "$ORIG_STTY" <"$TTY_DEV" || true
+send_evt() {
+    printf '%s\n' "$1" >&3
 }
-trap restore_tty EXIT INT TERM
-stty -echo -icanon min 1 time 0 <"$TTY_DEV"
 
 ESC=$(printf '\033')
 CR=$(printf '\r')
@@ -54,47 +68,28 @@ while :; do
     ch=$(read_char)
     [ -n "$ch" ] || continue
     case "$ch" in
-        q|Q)
-            emit_event quit
-            break
-            ;;
-        "$CR"|"$LF")
-            emit_event open
-            ;;
-        '[')
-            emit_event page-prev
-            ;;
-        ']')
-            emit_event page-next
-            ;;
-        w|W|k|K)
-            emit_event up
-            ;;
-        s|S|j|J)
-            emit_event down
-            ;;
-        a|A|h|H)
-            emit_event left
-            ;;
-        d|D|l|L)
-            emit_event right
-            ;;
-        b|B)
-            emit_event back
-            ;;
+        q|Q) send_evt quit; break ;;
+        "$CR"|"$LF") send_evt open ;;
+        '[') send_evt page-prev ;;
+        ']') send_evt page-next ;;
+        w|W|k|K) send_evt up ;;
+        s|S|j|J) send_evt down ;;
+        a|A|h|H) send_evt left ;;
+        d|D|l|L) send_evt right ;;
+        b|B) send_evt back ;;
         "$ESC")
             second=$(read_char_timeout 1)
             if [ -z "$second" ]; then
-                emit_event back
+                send_evt back
                 continue
             fi
             if [ "$second" = "[" ] || [ "$second" = "O" ]; then
                 third=$(read_char_timeout 1)
                 case "$third" in
-                    A) emit_event up ;;
-                    B) emit_event down ;;
-                    C) emit_event right ;;
-                    D) emit_event left ;;
+                    A) send_evt up ;;
+                    B) send_evt down ;;
+                    C) send_evt right ;;
+                    D) send_evt left ;;
                 esac
             fi
             ;;

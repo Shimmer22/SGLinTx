@@ -1,4 +1,6 @@
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
@@ -14,11 +16,11 @@ use serialport::{DataBits, FlowControl, Parity, StopBits};
 use crate::{
     client_process_args,
     config::{store, ElrsUiConfig},
+    elrs::{ElrsOperation, ElrsProtocolRuntime, CRSF_SYNC},
     messages::{ElrsCommandMsg, ElrsFeedbackMsg, ElrsStateMsg, SystemStatusMsg},
     mixer::MixerOutMsg,
 };
 
-const CRSF_SYNC: u8 = 0xC8;
 const CRSF_FRAME_BATTERY_ID: u8 = 0x08;
 const CRSF_FRAME_LINK_ID: u8 = 0x14;
 const CRSF_FRAME_LINK_RX_ID: u8 = 0x1C;
@@ -28,14 +30,25 @@ const REOPEN_DELAY: Duration = Duration::from_millis(500);
 const TELEMETRY_STALE_AFTER: Duration = Duration::from_secs(2);
 const SERIAL_IO_TIMEOUT: Duration = Duration::from_millis(100);
 const WRITE_TIMEOUT_LOG_EVERY: u32 = 50;
-const DEFAULT_RF_UART: &str = "/dev/ttyS3";
+const ELRS_STATE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const DEFAULT_RF_UART: &str = "/dev/ttyS2";
+const DEFAULT_RF_LOG_PATH: &str = "/tmp/lintx-elrs/rf_link_service.log";
+const DEFAULT_BIND_PHRASE: &str = "654321";
 const ELRS_POWER_LEVELS_MW: [u16; 6] = [10, 25, 100, 250, 500, 1000];
 const EDITOR_CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789-_";
+
+macro_rules! rf_logln {
+    ($($arg:tt)*) => {{
+        let message = format!($($arg)*);
+        thread_logln!("{}", message);
+        append_rf_log_line(&message);
+    }};
+}
 
 #[derive(Parser)]
 #[command(name = "rf_link_service", about = "Unified ELRS/CRSF RF link service", long_about = None)]
 struct Cli {
-    #[arg(short, long, default_value_t = 420000)]
+    #[arg(short, long, default_value_t = 115200)]
     baudrate: u32,
 
     #[arg(default_value = DEFAULT_RF_UART)]
@@ -78,7 +91,12 @@ struct EditorState {
 
 impl EditorState {
     fn new(initial: &str) -> Self {
-        let mut buffer = initial.as_bytes().to_vec();
+        let seed = if initial.is_empty() {
+            DEFAULT_BIND_PHRASE
+        } else {
+            initial
+        };
+        let mut buffer = seed.as_bytes().to_vec();
         sanitize_editor_buffer(&mut buffer);
         if buffer.is_empty() {
             buffer.push(EDITOR_CHARSET[0]);
@@ -125,6 +143,7 @@ impl EditorState {
 struct ElrsUiState {
     config: ElrsUiConfig,
     selected_idx: usize,
+    bind_active: bool,
     editor: Option<EditorState>,
 }
 
@@ -132,12 +151,16 @@ impl ElrsUiState {
     const SELECTABLE_PARAM_COUNT: usize = 4;
 
     fn load() -> Self {
-        let config = store::load_radio_config()
+        let mut config = store::load_radio_config()
             .map(|radio| radio.elrs)
             .unwrap_or_default();
+        if config.bind_phrase.is_empty() {
+            config.bind_phrase = DEFAULT_BIND_PHRASE.to_string();
+        }
         Self {
             config,
             selected_idx: 0,
+            bind_active: false,
             editor: None,
         }
     }
@@ -146,7 +169,12 @@ impl ElrsUiState {
         "Bind Phrase"
     }
 
-    fn handle_command(&mut self, cmd: ElrsCommandMsg) -> String {
+    fn handle_command(
+        &mut self,
+        cmd: ElrsCommandMsg,
+        protocol: &mut ElrsProtocolRuntime,
+        connected: bool,
+    ) -> String {
         if self.editor.is_some() {
             return self.handle_editor_command(cmd);
         }
@@ -163,9 +191,9 @@ impl ElrsUiState {
                 self.selected_idx = self.selected_idx.saturating_add(1).min(max_idx);
                 self.current_item_status()
             }
-            ElrsCommandMsg::ValueDec => self.adjust_selected(-1),
-            ElrsCommandMsg::ValueInc => self.adjust_selected(1),
-            ElrsCommandMsg::Activate => self.activate_selected(),
+            ElrsCommandMsg::ValueDec => self.adjust_selected(-1, protocol, connected),
+            ElrsCommandMsg::ValueInc => self.adjust_selected(1, protocol, connected),
+            ElrsCommandMsg::Activate => self.activate_selected(protocol, connected),
         }
     }
 
@@ -214,7 +242,12 @@ impl ElrsUiState {
         }
     }
 
-    fn adjust_selected(&mut self, delta: isize) -> String {
+    fn adjust_selected(
+        &mut self,
+        delta: isize,
+        protocol: &mut ElrsProtocolRuntime,
+        connected: bool,
+    ) -> String {
         match self.selected_idx {
             0 => {
                 self.config.wifi_manual_on = !self.config.wifi_manual_on;
@@ -230,16 +263,12 @@ impl ElrsUiState {
                 }
             }
             1 => {
-                self.config.bind_mode = !self.config.bind_mode;
-                match self.persist() {
-                    Ok(()) => {
-                        if self.config.bind_mode {
-                            "Bind mode entered".to_string()
-                        } else {
-                            "Bind mode exited".to_string()
-                        }
-                    }
-                    Err(err) => format!("Bind mode save failed: {err}"),
+                if !connected {
+                    "Bind unavailable: module offline".to_string()
+                } else {
+                    let status = protocol.request(ElrsOperation::EnterBind);
+                    self.bind_active = protocol.bind_active();
+                    status.message().to_string()
                 }
             }
             2 => {
@@ -257,9 +286,13 @@ impl ElrsUiState {
         }
     }
 
-    fn activate_selected(&mut self) -> String {
+    fn activate_selected(
+        &mut self,
+        protocol: &mut ElrsProtocolRuntime,
+        connected: bool,
+    ) -> String {
         match self.selected_idx {
-            0..=2 => self.adjust_selected(1),
+            0..=2 => self.adjust_selected(1, protocol, connected),
             3 => {
                 self.editor = Some(EditorState::new(&self.config.bind_phrase));
                 "Editing bind phrase".to_string()
@@ -278,7 +311,7 @@ impl ElrsUiState {
                 }
             }
             1 => {
-                if self.config.bind_mode {
+                if self.bind_active {
                     "Bind mode ACTIVE".to_string()
                 } else {
                     "Bind mode IDLE".to_string()
@@ -294,7 +327,11 @@ impl ElrsUiState {
         match store::load_radio_config() {
             Ok(radio) => {
                 self.config = radio.elrs;
+                if self.config.bind_phrase.is_empty() {
+                    self.config.bind_phrase = DEFAULT_BIND_PHRASE.to_string();
+                }
                 self.editor = None;
+                self.bind_active = false;
                 "ELRS config reloaded".to_string()
             }
             Err(err) => format!("ELRS config reload failed: {err}"),
@@ -363,6 +400,36 @@ fn write_packet_with_timeout_tolerance(
     Ok(())
 }
 
+fn rf_log_path() -> String {
+    std::env::var("LINTX_RF_LOG_PATH").unwrap_or_else(|_| DEFAULT_RF_LOG_PATH.to_string())
+}
+
+fn append_rf_log_line(message: &str) {
+    let path = rf_log_path();
+    if let Some(parent) = Path::new(&path).parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            eprintln!(
+                "[rf_link_service] failed to create log directory {}: {}",
+                parent.display(),
+                err
+            );
+            return;
+        }
+    }
+
+    match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut file) => {
+            let _ = writeln!(file, "[{}] {}", now_unix_secs(), message);
+        }
+        Err(err) => {
+            eprintln!(
+                "[rf_link_service] failed to open log file {}: {}",
+                path, err
+            );
+        }
+    }
+}
+
 fn rf_link_service_main(argc: u32, argv: *const &str) {
     let args = match client_process_args::<Cli>(argc, argv) {
         Some(v) => v,
@@ -375,7 +442,7 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
     let elrs_state_tx = get_new_tx_of_message::<ElrsStateMsg>("elrs_state").unwrap();
     let elrs_feedback_tx = get_new_tx_of_message::<ElrsFeedbackMsg>("elrs_feedback").unwrap();
 
-    thread_logln!(
+    rf_logln!(
         "rf_link_service start on {} @ {} baud",
         args.dev_name,
         args.baudrate
@@ -384,11 +451,13 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
     SchedulePthread::new_simple(Box::new(move |_| {
         let mut status_state = TelemetryStatusState::default();
         let mut ui_state = ElrsUiState::load();
+        let mut protocol = ElrsProtocolRuntime::default();
         let mut serial_buf = Vec::<u8>::new();
         let mut read_buf = [0u8; 256];
         let mut crsf_chn_values: [u16; 16] = [0; 16];
         let mut last_state = ElrsStateMsg::default();
         let mut write_timeout_count: u32 = 0;
+        let mut last_state_heartbeat_at: Option<Instant> = Some(Instant::now());
 
         loop {
             let serial = serialport::new(&args.dev_name, args.baudrate)
@@ -400,9 +469,16 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
             let mut dev = match serial.open() {
                 Ok(port) => port,
                 Err(err) => {
+                    protocol.clear_ephemeral();
+                    ui_state.bind_active = false;
                     let err_text = format!("open failed: {}", err);
                     while let Some(cmd) = elrs_cmd_rx.try_read() {
-                        let cmd_status = ui_state.handle_command(cmd);
+                        let cmd_status = ui_state.handle_command(cmd, &mut protocol, false);
+                        rf_logln!(
+                            "rf_link_service command while offline: {:?} -> {}",
+                            cmd,
+                            cmd_status
+                        );
                         let cmd_state = build_elrs_state(
                             false,
                             cmd_status,
@@ -427,11 +503,17 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                         elrs_state_tx.send(state.clone());
                         last_state = state;
                     }
-                    thread_logln!("rf_link_service open failed on {}: {}", args.dev_name, err);
+                    rf_logln!("rf_link_service open failed on {}: {}", args.dev_name, err);
                     std::thread::sleep(REOPEN_DELAY);
                     continue;
                 }
             };
+
+            rf_logln!(
+                "rf_link_service serial open ok on {} @ {} baud",
+                args.dev_name,
+                args.baudrate
+            );
 
             let magic_cmd = gen_magic_packet();
             for _ in 0..10 {
@@ -439,7 +521,7 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                     if err.kind() == std::io::ErrorKind::TimedOut {
                         write_timeout_count = write_timeout_count.saturating_add(1);
                         if write_timeout_count % WRITE_TIMEOUT_LOG_EVERY == 1 {
-                            thread_logln!(
+                            rf_logln!(
                                 "rf_link_service magic write timeout on {} (count={})",
                                 args.dev_name,
                                 write_timeout_count
@@ -447,11 +529,15 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                         }
                         continue;
                     }
-                    thread_logln!("rf_link_service magic write failed: {}", err);
+                    rf_logln!("rf_link_service magic write failed: {}", err);
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
+            rf_logln!(
+                "rf_link_service initial magic sequence sent on {}",
+                args.dev_name
+            );
 
             let mut ui_status_text = format!("{} @ {} baud", args.dev_name, args.baudrate);
             let state = build_elrs_state(
@@ -470,13 +556,13 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                 elrs_state_tx.send(state.clone());
                 last_state = state;
             }
-
             loop {
                 while let Some(msg) = mixer_out_rx.try_read() {
                     crsf_chn_values[0] = mixer_out_to_crsf(msg.aileron);
                     crsf_chn_values[1] = mixer_out_to_crsf(msg.elevator);
                     crsf_chn_values[2] = mixer_out_to_crsf(msg.thrust);
                     crsf_chn_values[3] = mixer_out_to_crsf(msg.direction);
+
                     let raw_packet = new_rc_channel_packet(&crsf_chn_values);
                     if let Err(err) =
                         write_packet_with_timeout_tolerance(&mut *dev, raw_packet.data())
@@ -484,7 +570,7 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                         if err.kind() == std::io::ErrorKind::TimedOut {
                             write_timeout_count = write_timeout_count.saturating_add(1);
                             if write_timeout_count % WRITE_TIMEOUT_LOG_EVERY == 1 {
-                                thread_logln!(
+                                rf_logln!(
                                     "rf_link_service write timeout on {} (count={})",
                                     args.dev_name,
                                     write_timeout_count
@@ -493,14 +579,20 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                             continue;
                         }
                         write_timeout_count = 0;
-                        thread_logln!("rf_link_service write failed: {}", err);
+                        rf_logln!("rf_link_service write failed: {}", err);
                         break;
                     }
                     write_timeout_count = 0;
                 }
 
                 while let Some(cmd) = elrs_cmd_rx.try_read() {
-                    ui_status_text = ui_state.handle_command(cmd);
+                    ui_status_text = ui_state.handle_command(cmd, &mut protocol, true);
+                    rf_logln!(
+                        "rf_link_service command while online: {:?} -> {} (bind_active={})",
+                        cmd,
+                        ui_status_text,
+                        protocol.bind_active()
+                    );
                     let state = build_elrs_state(
                         true,
                         ui_status_text.clone(),
@@ -514,11 +606,62 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                     }
                 }
 
+                if let Some(frame) = protocol.poll_outgoing_frame(Instant::now()) {
+                    if let Some((current, total)) = protocol.bind_progress() {
+                        rf_logln!(
+                            "rf_link_service sending bind frame {}/{} on {}: {:02X?}",
+                            current,
+                            total,
+                            args.dev_name,
+                            frame
+                        );
+                    }
+                    if let Err(err) = write_packet_with_timeout_tolerance(&mut *dev, &frame) {
+                        if err.kind() == std::io::ErrorKind::TimedOut {
+                            write_timeout_count = write_timeout_count.saturating_add(1);
+                            if write_timeout_count % WRITE_TIMEOUT_LOG_EVERY == 1 {
+                                rf_logln!(
+                                    "rf_link_service bind write timeout on {} (count={})",
+                                    args.dev_name,
+                                    write_timeout_count
+                                );
+                            }
+                        } else {
+                            protocol.clear_ephemeral();
+                            ui_state.bind_active = false;
+                            rf_logln!("rf_link_service bind write failed: {}", err);
+                            break;
+                        }
+                    }
+                    ui_state.bind_active = protocol.bind_active();
+                    if let Some(status) = protocol.take_status_text() {
+                        ui_status_text = status;
+                        let state = build_elrs_state(
+                            true,
+                            ui_status_text.clone(),
+                            &status_state,
+                            &ui_state,
+                            &args.dev_name,
+                        );
+                        if state != last_state {
+                            elrs_state_tx.send(state.clone());
+                            last_state = state;
+                        }
+                    }
+                }
+
                 match dev.read(&mut read_buf) {
                     Ok(n) if n > 0 => {
                         serial_buf.extend_from_slice(&read_buf[..n]);
                         for frame in extract_crsf_frames(&mut serial_buf) {
                             if let Some(status) = status_state.consume_frame(&frame) {
+                                rf_logln!(
+                                    "rf_link_service telemetry frame type=0x{:02X} signal={} battery={} stale={}",
+                                    frame.get(2).copied().unwrap_or_default(),
+                                    status.signal_strength_percent,
+                                    status.aircraft_battery_percent,
+                                    status_state.telemetry_is_stale()
+                                );
                                 system_status_tx.send(status);
                             }
                         }
@@ -542,6 +685,8 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                     Ok(_) => {}
                     Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}
                     Err(err) => {
+                        protocol.clear_ephemeral();
+                        ui_state.bind_active = false;
                         let state = build_elrs_state(
                             false,
                             format!("serial error: {}", err),
@@ -558,12 +703,15 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                             elrs_state_tx.send(state.clone());
                             last_state = state;
                         }
-                        thread_logln!("rf_link_service read failed: {}", err);
+                        rf_logln!("rf_link_service read failed: {}", err);
                         break;
                     }
                 }
 
                 if status_state.telemetry_is_stale() {
+                    if !protocol.bind_active() && ui_status_text == format!("{} @ {} baud", args.dev_name, args.baudrate) {
+                        ui_status_text = "waiting receiver link".to_string();
+                    }
                     let state = build_elrs_state(
                         true,
                         ui_status_text.clone(),
@@ -575,6 +723,23 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                         elrs_state_tx.send(state.clone());
                         last_state = state;
                     }
+                }
+
+                let now = Instant::now();
+                let heartbeat_due = last_state_heartbeat_at
+                    .map(|last| now.saturating_duration_since(last) >= ELRS_STATE_HEARTBEAT_INTERVAL)
+                    .unwrap_or(true);
+                if heartbeat_due {
+                    let heartbeat = build_elrs_state(
+                        true,
+                        ui_status_text.clone(),
+                        &status_state,
+                        &ui_state,
+                        &args.dev_name,
+                    );
+                    elrs_state_tx.send(heartbeat.clone());
+                    last_state = heartbeat;
+                    last_state_heartbeat_at = Some(now);
                 }
 
                 std::thread::sleep(Duration::from_millis(2));
@@ -701,7 +866,7 @@ fn build_elrs_state(
             crate::messages::ElrsParamEntry {
                 id: "bind_mode".to_string(),
                 label: "Bind Mode".to_string(),
-                value: if ui_state.config.bind_mode {
+                value: if ui_state.bind_active {
                     "ACTIVE".to_string()
                 } else {
                     "IDLE".to_string()
@@ -718,7 +883,7 @@ fn build_elrs_state(
                 id: "bind_phrase".to_string(),
                 label: "Bind Phrase".to_string(),
                 value: if ui_state.config.bind_phrase.is_empty() {
-                    "(empty)".to_string()
+                    DEFAULT_BIND_PHRASE.to_string()
                 } else {
                     ui_state.config.bind_phrase.clone()
                 },

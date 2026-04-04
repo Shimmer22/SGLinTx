@@ -11,6 +11,8 @@ mod calibrate;
 mod config;
 mod crsf_rc_in;
 #[cfg(target_os = "linux")]
+mod elrs;
+#[cfg(target_os = "linux")]
 mod elrs_tx;
 #[cfg(target_os = "linux")]
 mod gampad;
@@ -27,6 +29,10 @@ mod system_state_mock;
 mod ui;
 mod ui_demo;
 mod ui_emit_input;
+#[cfg(target_os = "linux")]
+mod ui_input_fifo;
+#[cfg(target_os = "linux")]
+mod ui_key_input;
 #[cfg(target_os = "linux")]
 mod usb_gamepad;
 

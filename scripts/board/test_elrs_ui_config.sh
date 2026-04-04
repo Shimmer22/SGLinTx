@@ -4,8 +4,8 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 . "$SCRIPT_DIR/board_common.sh"
 
-RF_DEV_NAME="${1:-/dev/ttyS3}"
-RF_BAUDRATE="${2:-420000}"
+RF_DEV_NAME="${1:-/dev/ttyS2}"
+RF_BAUDRATE="${2:-115200}"
 INPUT_MODE="${3:-mock}" # mock | stm32
 STM32_DEV_NAME="${4:-/dev/ttyS0}"
 STM32_BAUDRATE="${5:-115200}"
@@ -55,5 +55,5 @@ Open launcher page "ELRS" (Scripts app), then test:
 Tips:
 - Refresh key: ']' (PageNext)
 - Config persists in radio.toml -> [elrs]
-- Default RF UART is /dev/ttyS3
+- Default RF UART is /dev/ttyS2
 EOF
