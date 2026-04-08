@@ -27,7 +27,9 @@ pub(super) struct LvglUiObjects {
     pub(super) app_metric_values: [*mut lvgl_sys::lv_obj_t; 2],
     pub(super) app_metric_bars: [*mut lvgl_sys::lv_obj_t; 2],
     pub(super) app_list_title: *mut lvgl_sys::lv_obj_t,
-    pub(super) app_list_lines: [*mut lvgl_sys::lv_obj_t; 4],
+    pub(super) app_list_row_cards: [*mut lvgl_sys::lv_obj_t; 4],
+    pub(super) app_list_row_keys: [*mut lvgl_sys::lv_obj_t; 4],
+    pub(super) app_list_row_vals: [*mut lvgl_sys::lv_obj_t; 4],
     pub(super) app_hint_label: *mut lvgl_sys::lv_obj_t,
     pub(super) branding_label: *mut lvgl_sys::lv_obj_t,
     pub(super) branding_label_alt: *mut lvgl_sys::lv_obj_t,
@@ -1217,11 +1219,11 @@ impl LvglUiCore {
             );
 
             let app_header_card = lvgl_sys::lv_obj_create(app_panel);
-            lvgl_sys::lv_obj_set_pos(app_header_card, Self::to_coord(14), Self::to_coord(14));
+            lvgl_sys::lv_obj_set_pos(app_header_card, Self::to_coord(14), Self::to_coord(12));
             lvgl_sys::lv_obj_set_size(
                 app_header_card,
                 Self::to_coord(width - 28),
-                Self::to_coord(92),
+                Self::to_coord(76),
             );
             lvgl_sys::lv_obj_set_style_bg_color(
                 app_header_card,
@@ -1229,7 +1231,7 @@ impl LvglUiCore {
                 0,
             );
             lvgl_sys::lv_obj_set_style_bg_opa(app_header_card, 240, 0);
-            lvgl_sys::lv_obj_set_style_radius(app_header_card, 16, 0);
+            lvgl_sys::lv_obj_set_style_radius(app_header_card, 12, 0);
             lvgl_sys::lv_obj_set_style_border_width(app_header_card, 0, 0);
             lvgl_sys::lv_obj_clear_flag(app_header_card, lvgl_sys::LV_OBJ_FLAG_SCROLLABLE);
             lvgl_sys::lv_obj_set_scrollbar_mode(
@@ -1248,7 +1250,7 @@ impl LvglUiCore {
                 &lvgl_sys::lv_font_montserrat_14 as *const _ as *const lvgl_sys::lv_font_t,
                 0,
             );
-            lvgl_sys::lv_obj_set_pos(app_badge_label, Self::to_coord(14), Self::to_coord(6));
+            lvgl_sys::lv_obj_align(app_badge_label, lvgl_sys::LV_ALIGN_TOP_RIGHT as u8, Self::to_coord(-14), Self::to_coord(14));
 
             let app_title_label = lvgl_sys::lv_label_create(app_header_card);
             lvgl_sys::lv_obj_set_style_text_color(
@@ -1261,7 +1263,7 @@ impl LvglUiCore {
                 &lvgl_sys::lv_font_montserrat_20 as *const _ as *const lvgl_sys::lv_font_t,
                 0,
             );
-            lvgl_sys::lv_obj_set_pos(app_title_label, Self::to_coord(14), Self::to_coord(22));
+            lvgl_sys::lv_obj_set_pos(app_title_label, Self::to_coord(14), Self::to_coord(-4));
 
             let app_subtitle_label = lvgl_sys::lv_label_create(app_header_card);
             lvgl_sys::lv_obj_set_style_text_color(
@@ -1269,7 +1271,12 @@ impl LvglUiCore {
                 lvgl_sys::_LV_COLOR_MAKE(200, 200, 200),
                 0,
             );
-            lvgl_sys::lv_obj_set_pos(app_subtitle_label, Self::to_coord(14), Self::to_coord(50));
+            lvgl_sys::lv_obj_set_style_text_font(
+                app_subtitle_label,
+                &lvgl_sys::lv_font_montserrat_14 as *const _ as *const lvgl_sys::lv_font_t,
+                0,
+            );
+            lvgl_sys::lv_obj_set_pos(app_subtitle_label, Self::to_coord(14), Self::to_coord(24));
             lvgl_sys::lv_obj_set_width(app_subtitle_label, Self::to_coord(width - 56));
 
             let mut app_metric_cards = [std::ptr::null_mut(); 2];
@@ -1281,10 +1288,10 @@ impl LvglUiCore {
                 let card = lvgl_sys::lv_obj_create(app_panel);
                 let card_w = ((width - 42) / 2).max(120);
                 let x = 14 + i as i32 * (card_w + 14);
-                lvgl_sys::lv_obj_set_pos(card, Self::to_coord(x), Self::to_coord(122));
-                lvgl_sys::lv_obj_set_size(card, Self::to_coord(card_w), Self::to_coord(110));
-                lvgl_sys::lv_obj_set_style_radius(card, 14, 0);
-                lvgl_sys::lv_obj_set_style_bg_color(card, lvgl_sys::_LV_COLOR_MAKE(34, 36, 42), 0);
+                lvgl_sys::lv_obj_set_pos(card, Self::to_coord(x), Self::to_coord(100));
+                lvgl_sys::lv_obj_set_size(card, Self::to_coord(card_w), Self::to_coord(76));
+                lvgl_sys::lv_obj_set_style_radius(card, 12, 0);
+                lvgl_sys::lv_obj_set_style_bg_color(card, lvgl_sys::_LV_COLOR_MAKE(30, 32, 38), 0);
                 lvgl_sys::lv_obj_set_style_bg_opa(card, 255, 0);
                 lvgl_sys::lv_obj_set_style_border_width(card, 0, 0);
                 lvgl_sys::lv_obj_clear_flag(card, lvgl_sys::LV_OBJ_FLAG_SCROLLABLE);
@@ -1296,10 +1303,15 @@ impl LvglUiCore {
                 let title = lvgl_sys::lv_label_create(card);
                 lvgl_sys::lv_obj_set_style_text_color(
                     title,
-                    lvgl_sys::_LV_COLOR_MAKE(168, 176, 188),
+                    lvgl_sys::_LV_COLOR_MAKE(140, 148, 160),
                     0,
                 );
-                lvgl_sys::lv_obj_set_pos(title, Self::to_coord(10), Self::to_coord(10));
+                lvgl_sys::lv_obj_set_style_text_font(
+                    title,
+                    &lvgl_sys::lv_font_montserrat_14 as *const _ as *const lvgl_sys::lv_font_t,
+                    0,
+                );
+                lvgl_sys::lv_obj_set_pos(title, Self::to_coord(10), Self::to_coord(-4));
 
                 let value = lvgl_sys::lv_label_create(card);
                 lvgl_sys::lv_obj_set_style_text_color(
@@ -1312,20 +1324,20 @@ impl LvglUiCore {
                     &lvgl_sys::lv_font_montserrat_20 as *const _ as *const lvgl_sys::lv_font_t,
                     0,
                 );
-                lvgl_sys::lv_obj_set_pos(value, Self::to_coord(10), Self::to_coord(36));
+                lvgl_sys::lv_obj_set_pos(value, Self::to_coord(10), Self::to_coord(20));
 
                 let bar = lvgl_sys::lv_bar_create(card);
-                lvgl_sys::lv_obj_set_pos(bar, Self::to_coord(10), Self::to_coord(82));
-                lvgl_sys::lv_obj_set_size(bar, Self::to_coord(card_w - 20), Self::to_coord(12));
+                lvgl_sys::lv_obj_set_pos(bar, Self::to_coord(10), Self::to_coord(58));
+                lvgl_sys::lv_obj_set_size(bar, Self::to_coord(card_w - 20), Self::to_coord(6));
                 lvgl_sys::lv_bar_set_range(bar, 0, 100);
                 lvgl_sys::lv_bar_set_value(bar, 0, lvgl_sys::lv_anim_enable_t_LV_ANIM_OFF);
-                lvgl_sys::lv_obj_set_style_bg_color(bar, lvgl_sys::_LV_COLOR_MAKE(56, 58, 64), 0);
+                lvgl_sys::lv_obj_set_style_bg_color(bar, lvgl_sys::_LV_COLOR_MAKE(40, 44, 50), 0);
                 lvgl_sys::lv_obj_set_style_bg_color(
                     bar,
                     lvgl_sys::_LV_COLOR_MAKE(120, 196, 255),
                     lvgl_sys::LV_PART_INDICATOR,
                 );
-                lvgl_sys::lv_obj_set_style_radius(bar, 6, 0);
+                lvgl_sys::lv_obj_set_style_radius(bar, 3, 0);
 
                 app_metric_cards[i] = card;
                 app_metric_titles[i] = title;
@@ -1336,26 +1348,71 @@ impl LvglUiCore {
             let app_list_title = lvgl_sys::lv_label_create(app_panel);
             lvgl_sys::lv_obj_set_style_text_color(
                 app_list_title,
-                lvgl_sys::_LV_COLOR_MAKE(174, 182, 196),
+                lvgl_sys::_LV_COLOR_MAKE(150, 160, 174),
                 0,
             );
-            lvgl_sys::lv_obj_set_pos(app_list_title, Self::to_coord(14), Self::to_coord(248));
+            lvgl_sys::lv_obj_set_style_text_font(
+                app_list_title,
+                &lvgl_sys::lv_font_montserrat_14 as *const _ as *const lvgl_sys::lv_font_t,
+                0,
+            );
+            lvgl_sys::lv_obj_set_pos(app_list_title, Self::to_coord(14), Self::to_coord(188));
 
-            let mut app_list_lines = [std::ptr::null_mut(); 4];
-            for (i, line) in app_list_lines.iter_mut().enumerate() {
-                let row = lvgl_sys::lv_label_create(app_panel);
+            let mut app_list_row_cards = [std::ptr::null_mut(); 4];
+            let mut app_list_row_keys = [std::ptr::null_mut(); 4];
+            let mut app_list_row_vals = [std::ptr::null_mut(); 4];
+
+            let row_height = 36;
+            let row_spacing = 8;
+            for i in 0..4 {
+                let row_card = lvgl_sys::lv_obj_create(app_panel);
+                let y = 212 + i as i32 * (row_height + row_spacing);
+                lvgl_sys::lv_obj_set_pos(row_card, Self::to_coord(14), Self::to_coord(y));
+                lvgl_sys::lv_obj_set_size(row_card, Self::to_coord(width - 28), Self::to_coord(row_height));
+                lvgl_sys::lv_obj_set_style_radius(row_card, 8, 0);
+                lvgl_sys::lv_obj_set_style_bg_color(row_card, lvgl_sys::_LV_COLOR_MAKE(34, 36, 42), 0);
+                lvgl_sys::lv_obj_set_style_bg_opa(row_card, 255, 0);
+                lvgl_sys::lv_obj_set_style_border_width(row_card, 1, 0);
+                lvgl_sys::lv_obj_set_style_border_color(row_card, lvgl_sys::_LV_COLOR_MAKE(34, 36, 42), 0);
+                lvgl_sys::lv_obj_clear_flag(row_card, lvgl_sys::LV_OBJ_FLAG_SCROLLABLE);
+                lvgl_sys::lv_obj_set_scrollbar_mode(
+                    row_card,
+                    lvgl_sys::LV_SCROLLBAR_MODE_OFF as lvgl_sys::lv_scrollbar_mode_t,
+                );
+
+                let key_label = lvgl_sys::lv_label_create(row_card);
                 lvgl_sys::lv_obj_set_style_text_color(
-                    row,
-                    lvgl_sys::_LV_COLOR_MAKE(228, 232, 238),
+                    key_label,
+                    lvgl_sys::_LV_COLOR_MAKE(180, 186, 196),
                     0,
                 );
-                lvgl_sys::lv_obj_set_pos(
-                    row,
-                    Self::to_coord(14),
-                    Self::to_coord(274 + i as i32 * 28),
+                lvgl_sys::lv_obj_set_style_text_font(
+                    key_label,
+                    &lvgl_sys::lv_font_montserrat_14 as *const _ as *const lvgl_sys::lv_font_t,
+                    0,
                 );
-                lvgl_sys::lv_obj_set_width(row, Self::to_coord(width - 28));
-                *line = row;
+                lvgl_sys::lv_label_set_long_mode(key_label, lvgl_sys::LV_LABEL_LONG_CLIP as lvgl_sys::lv_label_long_mode_t);
+                lvgl_sys::lv_obj_set_width(key_label, Self::to_coord((width - 60) / 2));
+                lvgl_sys::lv_obj_align(key_label, lvgl_sys::LV_ALIGN_LEFT_MID as u8, Self::to_coord(12), 0);
+
+                let val_label = lvgl_sys::lv_label_create(row_card);
+                lvgl_sys::lv_obj_set_style_text_color(
+                    val_label,
+                    lvgl_sys::_LV_COLOR_MAKE(255, 255, 255),
+                    0,
+                );
+                lvgl_sys::lv_obj_set_style_text_font(
+                    val_label,
+                    &lvgl_sys::lv_font_montserrat_14 as *const _ as *const lvgl_sys::lv_font_t,
+                    0,
+                );
+                lvgl_sys::lv_label_set_long_mode(val_label, lvgl_sys::LV_LABEL_LONG_CLIP as lvgl_sys::lv_label_long_mode_t);
+                lvgl_sys::lv_obj_set_width(val_label, Self::to_coord((width - 60) / 2));
+                lvgl_sys::lv_obj_align(val_label, lvgl_sys::LV_ALIGN_RIGHT_MID as u8, Self::to_coord(-12), 0);
+
+                app_list_row_cards[i] = row_card;
+                app_list_row_keys[i] = key_label;
+                app_list_row_vals[i] = val_label;
             }
 
             let app_hint_label = lvgl_sys::lv_label_create(app_panel);
@@ -1425,7 +1482,9 @@ impl LvglUiCore {
                 app_metric_values,
                 app_metric_bars,
                 app_list_title,
-                app_list_lines,
+                app_list_row_cards,
+                app_list_row_keys,
+                app_list_row_vals,
                 app_hint_label,
                 branding_label,
                 branding_label_alt,
@@ -1635,7 +1694,81 @@ impl LvglUiCore {
 
         Self::set_label_text(ui.app_list_title, &data.list_title);
         for i in 0..4 {
-            Self::set_label_text(ui.app_list_lines[i], &data.list_lines[i]);
+            let line = &data.list_lines[i];
+            let mut is_selected = false;
+            let mut text = line.as_str();
+
+            let mut is_active = false;
+            text = text.trim_start();
+            if text.starts_with("[A]") {
+                is_active = true;
+                text = text[3..].trim_start();
+            }
+            if text.starts_with(">") {
+                is_selected = true;
+                text = text[1..].trim_start();
+            }
+            
+            let mut formatted_text = String::new();
+            if is_active {
+                formatted_text.push_str("[A] ");
+            }
+            formatted_text.push_str(text);
+            let text = formatted_text.as_str();
+
+            if text.is_empty() {
+                unsafe {
+                    lvgl_sys::lv_obj_add_flag(ui.app_list_row_cards[i], lvgl_sys::LV_OBJ_FLAG_HIDDEN);
+                }
+            } else {
+                unsafe {
+                    lvgl_sys::lv_obj_clear_flag(ui.app_list_row_cards[i], lvgl_sys::LV_OBJ_FLAG_HIDDEN);
+                    if is_selected {
+                        lvgl_sys::lv_obj_set_style_border_color(
+                            ui.app_list_row_cards[i],
+                            lvgl_sys::_LV_COLOR_MAKE(data.accent.0, data.accent.1, data.accent.2),
+                            0,
+                        );
+                        lvgl_sys::lv_obj_set_style_bg_color(
+                            ui.app_list_row_cards[i],
+                            lvgl_sys::_LV_COLOR_MAKE(
+                                data.accent.0 / 3,
+                                data.accent.1 / 3,
+                                data.accent.2 / 3,
+                            ),
+                            0,
+                        );
+                    } else {
+                        lvgl_sys::lv_obj_set_style_border_color(
+                            ui.app_list_row_cards[i],
+                            lvgl_sys::_LV_COLOR_MAKE(34, 36, 42),
+                            0,
+                        );
+                        lvgl_sys::lv_obj_set_style_bg_color(
+                            ui.app_list_row_cards[i],
+                            lvgl_sys::_LV_COLOR_MAKE(34, 36, 42),
+                            0,
+                        );
+                    }
+                }
+
+                if let Some(colon_idx) = text.find(':') {
+                    let key = text[..colon_idx].trim();
+                    let val = text[colon_idx + 1..].trim();
+                    Self::set_label_text(ui.app_list_row_keys[i], key);
+                    Self::set_label_text(ui.app_list_row_vals[i], val);
+                    unsafe {
+                        lvgl_sys::lv_obj_clear_flag(ui.app_list_row_vals[i], lvgl_sys::LV_OBJ_FLAG_HIDDEN);
+                        lvgl_sys::lv_obj_align(ui.app_list_row_keys[i], lvgl_sys::LV_ALIGN_LEFT_MID as u8, Self::to_coord(12), 0);
+                    }
+                } else {
+                    Self::set_label_text(ui.app_list_row_keys[i], text);
+                    unsafe {
+                        lvgl_sys::lv_obj_add_flag(ui.app_list_row_vals[i], lvgl_sys::LV_OBJ_FLAG_HIDDEN);
+                        lvgl_sys::lv_obj_align(ui.app_list_row_keys[i], lvgl_sys::LV_ALIGN_CENTER as u8, 0, 0);
+                    }
+                }
+            }
         }
         Self::set_label_text(ui.app_hint_label, &data.hint);
     }
