@@ -24,8 +24,8 @@ pub static SCRIPTS_APP: ScriptsApp = ScriptsApp;
 
 #[derive(Debug, Clone)]
 struct LocalElrsConfig {
+    rf_output_enabled: bool,
     wifi_manual_on: bool,
-    bind_mode: bool,
     tx_power_mw: u16,
     bind_phrase: String,
 }
@@ -33,8 +33,8 @@ struct LocalElrsConfig {
 impl Default for LocalElrsConfig {
     fn default() -> Self {
         Self {
+            rf_output_enabled: false,
             wifi_manual_on: false,
-            bind_mode: false,
             tx_power_mw: 100,
             bind_phrase: DEFAULT_BIND_PHRASE.to_string(),
         }
@@ -171,7 +171,7 @@ fn handle_local_event(frame: &mut UiFrame, event: UiInputEvent) -> bool {
                 true
             }
             UiInputEvent::Down => {
-                frame.elrs.selected_idx = frame.elrs.selected_idx.saturating_add(1).min(3);
+                frame.elrs.selected_idx = frame.elrs.selected_idx.saturating_add(1).min(4);
                 true
             }
             UiInputEvent::Left => {
@@ -196,30 +196,33 @@ fn handle_local_event(frame: &mut UiFrame, event: UiInputEvent) -> bool {
 fn apply_local_adjust(frame: &mut UiFrame, cfg: &mut LocalElrsConfig, delta: isize) {
     let status = match frame.elrs.selected_idx {
         0 => {
+            cfg.rf_output_enabled = !cfg.rf_output_enabled;
+            if save_local_config(cfg).is_ok() {
+                if cfg.rf_output_enabled {
+                    "RF output enabled"
+                } else {
+                    "RF output disabled"
+                }
+            } else {
+                "RF output save failed"
+            }
+        }
+        1 => {
             cfg.wifi_manual_on = !cfg.wifi_manual_on;
             if save_local_config(cfg).is_ok() {
                 if cfg.wifi_manual_on {
-                    "ELRS WiFi enabled"
+                    "WiFi command armed"
                 } else {
-                    "ELRS WiFi disabled"
+                    "WiFi command cleared"
                 }
             } else {
                 "WiFi config save failed"
             }
         }
-        1 => {
-            cfg.bind_mode = !cfg.bind_mode;
-            if save_local_config(cfg).is_ok() {
-                if cfg.bind_mode {
-                    "Bind mode entered"
-                } else {
-                    "Bind mode exited"
-                }
-            } else {
-                "Bind mode save failed"
-            }
-        }
         2 => {
+            "Bind feedback requires rf_link_service"
+        }
+        3 => {
             cfg.tx_power_mw = shift_power_level(cfg.tx_power_mw, delta);
             if save_local_config(cfg).is_ok() {
                 "TX power updated"
@@ -227,7 +230,7 @@ fn apply_local_adjust(frame: &mut UiFrame, cfg: &mut LocalElrsConfig, delta: isi
                 "TX power save failed"
             }
         }
-        3 => {
+        4 => {
             frame.elrs.editor_active = true;
             frame.elrs.can_leave = false;
             frame.elrs.editor_label = "Bind Phrase".to_string();
@@ -251,6 +254,8 @@ fn apply_local_state(frame: &mut UiFrame, cfg: &LocalElrsConfig, status: Option<
     frame.elrs.version = "--".to_string();
     frame.elrs.path = "/".to_string();
     frame.elrs.connected = false;
+    frame.elrs.rf_output_enabled = cfg.rf_output_enabled;
+    frame.elrs.link_active = false;
     frame.elrs.busy = false;
     frame.elrs.packet_rate = "--".to_string();
     frame.elrs.telemetry_ratio = "--".to_string();
@@ -263,8 +268,18 @@ fn apply_local_state(frame: &mut UiFrame, cfg: &LocalElrsConfig, status: Option<
 
     frame.elrs.params = vec![
         crate::messages::ElrsParamEntry {
+            id: "rf_output".to_string(),
+            label: "RF Output".to_string(),
+            value: if cfg.rf_output_enabled {
+                "ON".to_string()
+            } else {
+                "OFF".to_string()
+            },
+            selectable: true,
+        },
+        crate::messages::ElrsParamEntry {
             id: "wifi_manual".to_string(),
-            label: "Manual WiFi".to_string(),
+            label: "Module WiFi".to_string(),
             value: if cfg.wifi_manual_on {
                 "ON".to_string()
             } else {
@@ -273,13 +288,9 @@ fn apply_local_state(frame: &mut UiFrame, cfg: &LocalElrsConfig, status: Option<
             selectable: true,
         },
         crate::messages::ElrsParamEntry {
-            id: "bind_mode".to_string(),
-            label: "Bind Mode".to_string(),
-            value: if cfg.bind_mode {
-                "ACTIVE".to_string()
-            } else {
-                "IDLE".to_string()
-            },
+            id: "bind".to_string(),
+            label: "Bind".to_string(),
+            value: "SERVICE".to_string(),
             selectable: true,
         },
         crate::messages::ElrsParamEntry {
@@ -299,6 +310,16 @@ fn apply_local_state(frame: &mut UiFrame, cfg: &LocalElrsConfig, status: Option<
             selectable: true,
         },
         crate::messages::ElrsParamEntry {
+            id: "link_state".to_string(),
+            label: "Link State".to_string(),
+            value: if cfg.rf_output_enabled {
+                "SERVICE OFFLINE".to_string()
+            } else {
+                "RF OFF".to_string()
+            },
+            selectable: false,
+        },
+        crate::messages::ElrsParamEntry {
             id: "signal".to_string(),
             label: "Signal".to_string(),
             value: "--".to_string(),
@@ -316,6 +337,12 @@ fn apply_local_state(frame: &mut UiFrame, cfg: &LocalElrsConfig, status: Option<
             value: "stale".to_string(),
             selectable: false,
         },
+        crate::messages::ElrsParamEntry {
+            id: "feedback".to_string(),
+            label: "Feedback".to_string(),
+            value: "start rf_link_service".to_string(),
+            selectable: false,
+        },
     ];
 }
 
@@ -328,8 +355,8 @@ fn load_local_config() -> LocalElrsConfig {
                 radio.elrs.bind_phrase
             };
             LocalElrsConfig {
+                rf_output_enabled: radio.elrs.rf_output_enabled,
                 wifi_manual_on: radio.elrs.wifi_manual_on,
-                bind_mode: radio.elrs.bind_mode,
                 tx_power_mw: normalize_power_level(radio.elrs.tx_power_mw),
                 bind_phrase,
             }
@@ -340,8 +367,8 @@ fn load_local_config() -> LocalElrsConfig {
 
 fn save_local_config(cfg: &LocalElrsConfig) -> Result<(), String> {
     let mut radio = store::load_radio_config().map_err(|err| err.to_string())?;
+    radio.elrs.rf_output_enabled = cfg.rf_output_enabled;
     radio.elrs.wifi_manual_on = cfg.wifi_manual_on;
-    radio.elrs.bind_mode = cfg.bind_mode;
     radio.elrs.tx_power_mw = normalize_power_level(cfg.tx_power_mw);
     radio.elrs.bind_phrase = cfg.bind_phrase.clone();
     store::save_radio_config(&radio).map_err(|err| err.to_string())

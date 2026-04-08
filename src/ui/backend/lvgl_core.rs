@@ -571,25 +571,40 @@ impl LvglUiCore {
                         if frame.elrs.busy { "busy" } else { "ready" },
                         frame.elrs.path,
                     ),
-                    metric_titles: ["Packet / Telemetry".to_string(), "TX / WiFi".to_string()],
+                    metric_titles: ["UART / Link".to_string(), "RF / Power".to_string()],
                     metric_values: [
                         format!(
                             "{} · {}",
-                            frame.elrs.packet_rate, frame.elrs.telemetry_ratio
+                            if frame.elrs.connected {
+                                "UART ON"
+                            } else {
+                                "UART OFF"
+                            },
+                            if frame.elrs.link_active {
+                                "LINKED"
+                            } else {
+                                "SEARCH"
+                            }
                         ),
                         format!(
                             "{} · {}",
-                            frame.elrs.tx_power,
-                            if frame.elrs.wifi_running {
-                                "WiFi ON"
+                            if frame.elrs.rf_output_enabled {
+                                "RF ON"
                             } else {
-                                "WiFi OFF"
-                            }
+                                "RF OFF"
+                            },
+                            frame.elrs.tx_power,
                         ),
                     ],
                     metric_progress: [
-                        if frame.elrs.connected { 100 } else { 0 },
-                        if frame.elrs.wifi_running { 100 } else { 35 },
+                        if frame.elrs.link_active {
+                            100
+                        } else if frame.elrs.connected {
+                            40
+                        } else {
+                            0
+                        },
+                        if frame.elrs.rf_output_enabled { 100 } else { 0 },
                     ],
                     list_title: if frame.elrs.editor_active {
                         format!(

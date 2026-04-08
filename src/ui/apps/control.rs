@@ -19,7 +19,7 @@ impl UiAppModule for ControlApp {
 
     fn render_terminal_detail(&self, frame: &UiFrame) -> String {
         format!(
-            "Input Source: {}\nStatus: {} ({})\nELRS Feedback: {}  Signal:{}  Aircraft Battery:{}\nChannels: {}\n{}\n\nMixer Out (0..10000)\nThrust:{}\nDirection:{}\nAileron:{}\nElevator:{}\n\nUse this page to validate input chain.\nEsc Back",
+            "Input Source: {}\nStatus: {} ({})\nELRS Feedback: {}  Signal:{}  Aircraft Battery:{}\nELRS Detail: {}\nChannels: {}\n{}\n\nMixer Out (0..10000)\nThrust:{}\nDirection:{}\nAileron:{}\nElevator:{}\n\nUse this page to validate input chain.\nEsc Back",
             frame.input_status.source.label(),
             frame.input_status.health.label(),
             frame.input_status.detail,
@@ -38,6 +38,7 @@ impl UiAppModule for ControlApp {
                 .aircraft_battery_percent
                 .map(|v| format!("{}%", v))
                 .unwrap_or_else(|| "--".to_string()),
+            frame.elrs_feedback.detail,
             frame.input_frame.channels.len(),
             format_channel_groups(&frame.input_frame.channels),
             frame.mixer_out.thrust,

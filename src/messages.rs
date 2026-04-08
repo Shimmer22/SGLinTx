@@ -161,6 +161,8 @@ pub struct ElrsParamEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElrsStateMsg {
     pub connected: bool,
+    pub rf_output_enabled: bool,
+    pub link_active: bool,
     pub busy: bool,
     pub can_leave: bool,
     pub path: String,
@@ -184,6 +186,8 @@ impl Default for ElrsStateMsg {
     fn default() -> Self {
         Self {
             connected: false,
+            rf_output_enabled: false,
+            link_active: false,
             busy: false,
             can_leave: true,
             path: "/".to_string(),
@@ -202,15 +206,21 @@ impl Default for ElrsStateMsg {
             selected_idx: 0,
             params: vec![
                 ElrsParamEntry {
-                    id: "wifi_manual".to_string(),
-                    label: "Manual WiFi".to_string(),
+                    id: "rf_output".to_string(),
+                    label: "RF Output".to_string(),
                     value: "OFF".to_string(),
                     selectable: true,
                 },
                 ElrsParamEntry {
-                    id: "bind_mode".to_string(),
-                    label: "Bind Mode".to_string(),
-                    value: "IDLE".to_string(),
+                    id: "wifi_manual".to_string(),
+                    label: "Module WiFi".to_string(),
+                    value: "OFF".to_string(),
+                    selectable: true,
+                },
+                ElrsParamEntry {
+                    id: "bind".to_string(),
+                    label: "Bind".to_string(),
+                    value: "READY".to_string(),
                     selectable: true,
                 },
                 ElrsParamEntry {
@@ -224,6 +234,12 @@ impl Default for ElrsStateMsg {
                     label: "Bind Phrase".to_string(),
                     value: "654321".to_string(),
                     selectable: true,
+                },
+                ElrsParamEntry {
+                    id: "link_state".to_string(),
+                    label: "Link State".to_string(),
+                    value: "RF OFF".to_string(),
+                    selectable: false,
                 },
                 ElrsParamEntry {
                     id: "signal".to_string(),
@@ -241,6 +257,12 @@ impl Default for ElrsStateMsg {
                     id: "telemetry_fresh".to_string(),
                     label: "Telemetry Fresh".to_string(),
                     value: "stale".to_string(),
+                    selectable: false,
+                },
+                ElrsParamEntry {
+                    id: "feedback".to_string(),
+                    label: "Feedback".to_string(),
+                    value: "waiting".to_string(),
                     selectable: false,
                 },
             ],

@@ -65,6 +65,8 @@ pub struct InputConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ElrsUiConfig {
     #[serde(default)]
+    pub rf_output_enabled: bool,
+    #[serde(default)]
     pub wifi_manual_on: bool,
     #[serde(default)]
     pub bind_mode: bool,
@@ -278,6 +280,7 @@ impl Default for InputConfig {
 impl Default for ElrsUiConfig {
     fn default() -> Self {
         Self {
+            rf_output_enabled: false,
             wifi_manual_on: false,
             bind_mode: false,
             tx_power_mw: default_elrs_tx_power_mw(),

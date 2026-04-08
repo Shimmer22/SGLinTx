@@ -16,7 +16,7 @@ use serialport::{DataBits, FlowControl, Parity, StopBits};
 use crate::{
     client_process_args,
     config::{store, ElrsUiConfig},
-    elrs::{ElrsOperation, ElrsProtocolRuntime, CRSF_SYNC},
+    elrs::{ElrsOperation, ElrsOperationStatus, ElrsProtocolRuntime, CRSF_SYNC},
     messages::{ElrsCommandMsg, ElrsFeedbackMsg, ElrsStateMsg, SystemStatusMsg},
     mixer::MixerOutMsg,
 };
@@ -31,6 +31,8 @@ const TELEMETRY_STALE_AFTER: Duration = Duration::from_secs(2);
 const SERIAL_IO_TIMEOUT: Duration = Duration::from_millis(100);
 const WRITE_TIMEOUT_LOG_EVERY: u32 = 50;
 const ELRS_STATE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const LINK_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(5);
+const BIND_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_RF_UART: &str = "/dev/ttyS2";
 const DEFAULT_RF_LOG_PATH: &str = "/tmp/lintx-elrs/rf_link_service.log";
 const DEFAULT_BIND_PHRASE: &str = "654321";
@@ -59,20 +61,6 @@ fn new_rc_channel_packet(channel_vals: &[u16; 16]) -> RawPacket {
     let chn = crsf::RcChannels(*channel_vals);
     let packet = crsf::Packet::RcChannels(chn);
     packet.into_raw(PacketAddress::Transmitter)
-}
-
-fn gen_magic_packet() -> [u8; 8] {
-    let mut data = [0; 8];
-    let crc8_alg = Crc::<u8>::new(&CRC_8_DVB_S2);
-    data[0] = 0xEE;
-    data[1] = 6;
-    data[2] = 0x2D;
-    data[3] = 0xEE;
-    data[4] = 0xEA;
-    data[5] = 0x1;
-    data[6] = 0x00;
-    data[7] = crc8_alg.checksum(&data[2..7]);
-    data
 }
 
 #[inline]
@@ -144,11 +132,12 @@ struct ElrsUiState {
     config: ElrsUiConfig,
     selected_idx: usize,
     bind_active: bool,
+    bind_waiting_for_link: bool,
     editor: Option<EditorState>,
 }
 
 impl ElrsUiState {
-    const SELECTABLE_PARAM_COUNT: usize = 4;
+    const SELECTABLE_PARAM_COUNT: usize = 5;
 
     fn load() -> Self {
         let mut config = store::load_radio_config()
@@ -161,6 +150,7 @@ impl ElrsUiState {
             config,
             selected_idx: 0,
             bind_active: false,
+            bind_waiting_for_link: false,
             editor: None,
         }
     }
@@ -250,35 +240,63 @@ impl ElrsUiState {
     ) -> String {
         match self.selected_idx {
             0 => {
-                self.config.wifi_manual_on = !self.config.wifi_manual_on;
+                self.config.rf_output_enabled = !self.config.rf_output_enabled;
                 match self.persist() {
                     Ok(()) => {
-                        if self.config.wifi_manual_on {
-                            "ELRS WiFi enabled".to_string()
+                        if self.config.rf_output_enabled {
+                            "RF output enabled".to_string()
                         } else {
-                            "ELRS WiFi disabled".to_string()
+                            self.bind_waiting_for_link = false;
+                            "RF output disabled".to_string()
                         }
                     }
-                    Err(err) => format!("WiFi config save failed: {err}"),
+                    Err(err) => format!("RF output save failed: {err}"),
                 }
             }
             1 => {
-                if !connected {
-                    "Bind unavailable: module offline".to_string()
+                if !self.config.rf_output_enabled {
+                    "WiFi unavailable: enable RF output first".to_string()
+                } else if !connected {
+                    "WiFi unavailable: UART offline".to_string()
                 } else {
-                    let status = protocol.request(ElrsOperation::EnterBind);
-                    self.bind_active = protocol.bind_active();
+                    let enable = !self.config.wifi_manual_on;
+                    let status = protocol.request(ElrsOperation::SetWifiManual(enable));
+                    if !matches!(status, ElrsOperationStatus::Unsupported(_)) {
+                        self.config.wifi_manual_on = enable;
+                        let _ = self.persist();
+                    }
                     status.message().to_string()
                 }
             }
             2 => {
-                self.config.tx_power_mw = shift_power_level(self.config.tx_power_mw, delta);
-                match self.persist() {
-                    Ok(()) => format!("TX power set to {}mW", self.config.tx_power_mw),
-                    Err(err) => format!("TX power save failed: {err}"),
+                if !self.config.rf_output_enabled {
+                    "Bind unavailable: enable RF output first".to_string()
+                } else if !connected {
+                    "Bind unavailable: UART offline".to_string()
+                } else {
+                    let status = protocol.request(ElrsOperation::EnterBind);
+                    self.bind_active = protocol.bind_active();
+                    if self.bind_active {
+                        self.bind_waiting_for_link = true;
+                    }
+                    status.message().to_string()
                 }
             }
             3 => {
+                self.config.tx_power_mw = shift_power_level(self.config.tx_power_mw, delta);
+                let status = protocol.request(ElrsOperation::SetTxPower(self.config.tx_power_mw));
+                match self.persist() {
+                    Ok(()) => {
+                        if matches!(status, ElrsOperationStatus::Unsupported(_)) {
+                            status.message().to_string()
+                        } else {
+                            format!("TX power set to {}mW", self.config.tx_power_mw)
+                        }
+                    }
+                    Err(err) => format!("TX power save failed: {err}"),
+                }
+            }
+            4 => {
                 self.editor = Some(EditorState::new(&self.config.bind_phrase));
                 "Editing bind phrase".to_string()
             }
@@ -292,8 +310,8 @@ impl ElrsUiState {
         connected: bool,
     ) -> String {
         match self.selected_idx {
-            0..=2 => self.adjust_selected(1, protocol, connected),
-            3 => {
+            0..=3 => self.adjust_selected(1, protocol, connected),
+            4 => {
                 self.editor = Some(EditorState::new(&self.config.bind_phrase));
                 "Editing bind phrase".to_string()
             }
@@ -304,21 +322,30 @@ impl ElrsUiState {
     fn current_item_status(&self) -> String {
         match self.selected_idx {
             0 => {
-                if self.config.wifi_manual_on {
-                    "Manual WiFi is ON".to_string()
+                if self.config.rf_output_enabled {
+                    "RF output is ON".to_string()
                 } else {
-                    "Manual WiFi is OFF".to_string()
+                    "RF output is OFF".to_string()
                 }
             }
             1 => {
-                if self.bind_active {
-                    "Bind mode ACTIVE".to_string()
+                if self.config.wifi_manual_on {
+                    "WiFi command set to ON".to_string()
                 } else {
-                    "Bind mode IDLE".to_string()
+                    "WiFi command set to OFF".to_string()
                 }
             }
-            2 => format!("TX power {}mW", self.config.tx_power_mw),
-            3 => "Bind phrase".to_string(),
+            2 => {
+                if self.bind_active {
+                    "Bind command in progress".to_string()
+                } else if self.bind_waiting_for_link {
+                    "Waiting for bind verification".to_string()
+                } else {
+                    "Bind ready".to_string()
+                }
+            }
+            3 => format!("TX power {}mW", self.config.tx_power_mw),
+            4 => "Bind phrase".to_string(),
             _ => String::new(),
         }
     }
@@ -332,6 +359,7 @@ impl ElrsUiState {
                 }
                 self.editor = None;
                 self.bind_active = false;
+                self.bind_waiting_for_link = false;
                 "ELRS config reloaded".to_string()
             }
             Err(err) => format!("ELRS config reload failed: {err}"),
@@ -342,6 +370,95 @@ impl ElrsUiState {
         let mut radio = store::load_radio_config().map_err(|err| err.to_string())?;
         radio.elrs = self.config.clone();
         store::save_radio_config(&radio).map_err(|err| err.to_string())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LinkMonitorState {
+    waiting_for_link_since: Option<Instant>,
+    bind_verify_deadline: Option<Instant>,
+    last_link_active: bool,
+    feedback_text: String,
+}
+
+impl Default for LinkMonitorState {
+    fn default() -> Self {
+        Self {
+            waiting_for_link_since: None,
+            bind_verify_deadline: None,
+            last_link_active: false,
+            feedback_text: "RF disabled".to_string(),
+        }
+    }
+}
+
+impl LinkMonitorState {
+    fn on_rf_enabled(&mut self, now: Instant) {
+        self.waiting_for_link_since.get_or_insert(now);
+        self.feedback_text = "waiting receiver link".to_string();
+    }
+
+    fn on_rf_disabled(&mut self) {
+        self.waiting_for_link_since = None;
+        self.bind_verify_deadline = None;
+        self.last_link_active = false;
+        self.feedback_text = "RF disabled".to_string();
+    }
+
+    fn on_bind_requested(&mut self, now: Instant) {
+        self.waiting_for_link_since = Some(now);
+        self.bind_verify_deadline = Some(now + BIND_VERIFY_TIMEOUT);
+        self.feedback_text = "Bind sent, waiting receiver link".to_string();
+    }
+
+    fn on_link_active(&mut self) -> Option<String> {
+        self.waiting_for_link_since = None;
+        self.last_link_active = true;
+        if self.bind_verify_deadline.take().is_some() {
+            self.feedback_text = "Bind verified by telemetry link".to_string();
+            return Some(self.feedback_text.clone());
+        }
+
+        if self.feedback_text != "Receiver link active" {
+            self.feedback_text = "Receiver link active".to_string();
+            return Some(self.feedback_text.clone());
+        }
+        None
+    }
+
+    fn on_link_lost(&mut self, now: Instant) -> Option<String> {
+        if self.last_link_active {
+            self.last_link_active = false;
+            self.waiting_for_link_since = Some(now);
+            self.feedback_text = "Receiver link lost".to_string();
+            return Some(self.feedback_text.clone());
+        }
+        None
+    }
+
+    fn poll_timeout(&mut self, now: Instant) -> Option<String> {
+        if let Some(deadline) = self.bind_verify_deadline {
+            if now >= deadline {
+                self.bind_verify_deadline = None;
+                self.feedback_text = "Bind not verified (no telemetry link)".to_string();
+                return Some(self.feedback_text.clone());
+            }
+        }
+
+        if let Some(since) = self.waiting_for_link_since {
+            if now.saturating_duration_since(since) >= LINK_ESTABLISH_TIMEOUT
+                && self.feedback_text != "RF enabled, no receiver link"
+            {
+                self.feedback_text = "RF enabled, no receiver link".to_string();
+                return Some(self.feedback_text.clone());
+            }
+        }
+
+        None
+    }
+
+    fn feedback_text(&self) -> String {
+        self.feedback_text.clone()
     }
 }
 
@@ -452,121 +569,122 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
         let mut status_state = TelemetryStatusState::default();
         let mut ui_state = ElrsUiState::load();
         let mut protocol = ElrsProtocolRuntime::default();
+        let mut link_monitor = LinkMonitorState::default();
         let mut serial_buf = Vec::<u8>::new();
         let mut read_buf = [0u8; 256];
         let mut crsf_chn_values: [u16; 16] = [0; 16];
         let mut last_state = ElrsStateMsg::default();
         let mut write_timeout_count: u32 = 0;
         let mut last_state_heartbeat_at: Option<Instant> = Some(Instant::now());
+        let mut ui_status_text = "RF output disabled".to_string();
+        let mut dev: Option<Box<dyn serialport::SerialPort>> = None;
 
         loop {
-            let serial = serialport::new(&args.dev_name, args.baudrate)
-                .timeout(SERIAL_IO_TIMEOUT)
-                .data_bits(DataBits::Eight)
-                .parity(Parity::None)
-                .stop_bits(StopBits::One)
-                .flow_control(FlowControl::None);
-            let mut dev = match serial.open() {
-                Ok(port) => port,
-                Err(err) => {
+            let now = Instant::now();
+
+            while let Some(cmd) = elrs_cmd_rx.try_read() {
+                let prev_rf_enabled = ui_state.config.rf_output_enabled;
+                let prev_bind_active = protocol.bind_active();
+                ui_status_text = ui_state.handle_command(cmd, &mut protocol, dev.is_some());
+                ui_state.bind_active = protocol.bind_active();
+
+                if !prev_rf_enabled && ui_state.config.rf_output_enabled {
+                    link_monitor.on_rf_enabled(now);
+                } else if prev_rf_enabled && !ui_state.config.rf_output_enabled {
                     protocol.clear_ephemeral();
                     ui_state.bind_active = false;
-                    let err_text = format!("open failed: {}", err);
-                    while let Some(cmd) = elrs_cmd_rx.try_read() {
-                        let cmd_status = ui_state.handle_command(cmd, &mut protocol, false);
-                        rf_logln!(
-                            "rf_link_service command while offline: {:?} -> {}",
-                            cmd,
-                            cmd_status
-                        );
-                        let cmd_state = build_elrs_state(
-                            false,
-                            cmd_status,
-                            &status_state,
-                            &ui_state,
-                            &args.dev_name,
-                        );
-                        if cmd_state != last_state {
-                            elrs_state_tx.send(cmd_state.clone());
-                            last_state = cmd_state;
-                        }
-                    }
-                    let state = build_elrs_state(
-                        false,
-                        err_text.clone(),
-                        &status_state,
-                        &ui_state,
-                        &args.dev_name,
-                    );
-                    elrs_feedback_tx.send(build_feedback(false, err_text.clone(), &status_state));
-                    if state != last_state {
-                        elrs_state_tx.send(state.clone());
-                        last_state = state;
-                    }
-                    rf_logln!("rf_link_service open failed on {}: {}", args.dev_name, err);
-                    std::thread::sleep(REOPEN_DELAY);
-                    continue;
+                    ui_state.bind_waiting_for_link = false;
+                    link_monitor.on_rf_disabled();
                 }
-            };
 
-            rf_logln!(
-                "rf_link_service serial open ok on {} @ {} baud",
-                args.dev_name,
-                args.baudrate
-            );
+                if !prev_bind_active && protocol.bind_active() {
+                    link_monitor.on_bind_requested(now);
+                }
 
-            let magic_cmd = gen_magic_packet();
-            for _ in 0..10 {
-                if let Err(err) = write_packet_with_timeout_tolerance(&mut *dev, &magic_cmd) {
-                    if err.kind() == std::io::ErrorKind::TimedOut {
-                        write_timeout_count = write_timeout_count.saturating_add(1);
-                        if write_timeout_count % WRITE_TIMEOUT_LOG_EVERY == 1 {
+                rf_logln!(
+                    "rf_link_service command: {:?} -> {} (rf_enabled={} bind_active={})",
+                    cmd,
+                    ui_status_text,
+                    ui_state.config.rf_output_enabled,
+                    protocol.bind_active()
+                );
+            }
+
+            if !ui_state.config.rf_output_enabled {
+                if dev.take().is_some() {
+                    rf_logln!("rf_link_service UART closed because RF output is disabled");
+                }
+                protocol.clear_ephemeral();
+                ui_state.bind_active = false;
+                ui_state.bind_waiting_for_link = false;
+                serial_buf.clear();
+                link_monitor.on_rf_disabled();
+                ui_status_text = "RF output disabled".to_string();
+            } else {
+                link_monitor.on_rf_enabled(now);
+                if dev.is_none() {
+                    let serial = serialport::new(&args.dev_name, args.baudrate)
+                        .timeout(SERIAL_IO_TIMEOUT)
+                        .data_bits(DataBits::Eight)
+                        .parity(Parity::None)
+                        .stop_bits(StopBits::One)
+                        .flow_control(FlowControl::None);
+                    match serial.open() {
+                        Ok(port) => {
                             rf_logln!(
-                                "rf_link_service magic write timeout on {} (count={})",
+                                "rf_link_service serial open ok on {} @ {} baud",
                                 args.dev_name,
-                                write_timeout_count
+                                args.baudrate
                             );
+                            dev = Some(port);
+                            protocol.request_refresh();
+                            serial_buf.clear();
+                            ui_status_text =
+                                format!("RF output enabled on {} @ {} baud", args.dev_name, args.baudrate);
                         }
+                        Err(err) => {
+                            protocol.clear_ephemeral();
+                            ui_state.bind_active = false;
+                            let err_text = format!("open failed: {}", err);
+                            let state = build_elrs_state(
+                                false,
+                                err_text.clone(),
+                                &status_state,
+                                &ui_state,
+                                &protocol,
+                                &link_monitor,
+                                &args.dev_name,
+                            );
+                            elrs_feedback_tx.send(build_feedback(
+                                false,
+                                err_text.clone(),
+                                &status_state,
+                            ));
+                            if state != last_state {
+                                elrs_state_tx.send(state.clone());
+                                last_state = state;
+                            }
+                            rf_logln!("rf_link_service open failed on {}: {}", args.dev_name, err);
+                            std::thread::sleep(REOPEN_DELAY);
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            let mut serial_fault: Option<String> = None;
+            if let Some(dev) = dev.as_mut() {
+                while let Some(msg) = mixer_out_rx.try_read() {
+                    if protocol.bind_active() {
                         continue;
                     }
-                    rf_logln!("rf_link_service magic write failed: {}", err);
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            rf_logln!(
-                "rf_link_service initial magic sequence sent on {}",
-                args.dev_name
-            );
-
-            let mut ui_status_text = format!("{} @ {} baud", args.dev_name, args.baudrate);
-            let state = build_elrs_state(
-                true,
-                ui_status_text.clone(),
-                &status_state,
-                &ui_state,
-                &args.dev_name,
-            );
-            elrs_feedback_tx.send(build_feedback(
-                true,
-                format!("{} @ {} baud", args.dev_name, args.baudrate),
-                &status_state,
-            ));
-            if state != last_state {
-                elrs_state_tx.send(state.clone());
-                last_state = state;
-            }
-            loop {
-                while let Some(msg) = mixer_out_rx.try_read() {
                     crsf_chn_values[0] = mixer_out_to_crsf(msg.aileron);
                     crsf_chn_values[1] = mixer_out_to_crsf(msg.elevator);
                     crsf_chn_values[2] = mixer_out_to_crsf(msg.thrust);
                     crsf_chn_values[3] = mixer_out_to_crsf(msg.direction);
 
                     let raw_packet = new_rc_channel_packet(&crsf_chn_values);
-                    if let Err(err) =
-                        write_packet_with_timeout_tolerance(&mut *dev, raw_packet.data())
-                    {
+                    if let Err(err) = write_packet_with_timeout_tolerance(&mut **dev, raw_packet.data()) {
                         if err.kind() == std::io::ErrorKind::TimedOut {
                             write_timeout_count = write_timeout_count.saturating_add(1);
                             if write_timeout_count % WRITE_TIMEOUT_LOG_EVERY == 1 {
@@ -580,172 +698,190 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                         }
                         write_timeout_count = 0;
                         rf_logln!("rf_link_service write failed: {}", err);
+                        serial_fault = Some(format!("serial write error: {}", err));
                         break;
                     }
                     write_timeout_count = 0;
                 }
 
-                while let Some(cmd) = elrs_cmd_rx.try_read() {
-                    ui_status_text = ui_state.handle_command(cmd, &mut protocol, true);
-                    rf_logln!(
-                        "rf_link_service command while online: {:?} -> {} (bind_active={})",
-                        cmd,
-                        ui_status_text,
-                        protocol.bind_active()
-                    );
-                    let state = build_elrs_state(
-                        true,
-                        ui_status_text.clone(),
-                        &status_state,
-                        &ui_state,
-                        &args.dev_name,
-                    );
-                    if state != last_state {
-                        elrs_state_tx.send(state.clone());
-                        last_state = state;
+                if serial_fault.is_none() {
+                    if let Some(frame) = protocol.poll_outgoing_frame(now) {
+                        if frame.get(2).copied() == Some(0x32) && frame.get(6).copied() == Some(0x05) {
+                            rf_logln!(
+                                "rf_link_service sending ELRS model id on {}: {:02X?}",
+                                args.dev_name,
+                                frame
+                            );
+                        } else if frame.get(2).copied() == Some(0x28) {
+                            rf_logln!(
+                                "rf_link_service sending ELRS ping on {}: {:02X?}",
+                                args.dev_name,
+                                frame
+                            );
+                        } else if frame.get(2).copied() == Some(0x2A) {
+                            rf_logln!(
+                                "rf_link_service sending ELRS request settings on {}: {:02X?}",
+                                args.dev_name,
+                                frame
+                            );
+                        } else if matches!(frame.get(2).copied(), Some(0x2C | 0x2D)) {
+                            rf_logln!(
+                                "rf_link_service sending ELRS param frame type=0x{:02X} on {}: {:02X?}",
+                                frame[2],
+                                args.dev_name,
+                                frame
+                            );
+                        } else if let Some((current, total)) = protocol.bind_progress() {
+                            rf_logln!(
+                                "rf_link_service sending bind frame {}/{} on {}: {:02X?}",
+                                current,
+                                total,
+                                args.dev_name,
+                                frame
+                            );
+                        }
+                        if let Err(err) = write_packet_with_timeout_tolerance(&mut **dev, &frame) {
+                            if err.kind() == std::io::ErrorKind::TimedOut {
+                                write_timeout_count = write_timeout_count.saturating_add(1);
+                                if write_timeout_count % WRITE_TIMEOUT_LOG_EVERY == 1 {
+                                    rf_logln!(
+                                        "rf_link_service bind write timeout on {} (count={})",
+                                        args.dev_name,
+                                        write_timeout_count
+                                    );
+                                }
+                            } else {
+                                protocol.clear_ephemeral();
+                                ui_state.bind_active = false;
+                                rf_logln!("rf_link_service bind write failed: {}", err);
+                                serial_fault = Some(format!("bind write error: {}", err));
+                            }
+                        }
+                        ui_state.bind_active = protocol.bind_active();
+                        if let Some(status) = protocol.take_status_text() {
+                            ui_status_text = status;
+                        }
                     }
                 }
 
-                if let Some(frame) = protocol.poll_outgoing_frame(Instant::now()) {
-                    if let Some((current, total)) = protocol.bind_progress() {
-                        rf_logln!(
-                            "rf_link_service sending bind frame {}/{} on {}: {:02X?}",
-                            current,
-                            total,
-                            args.dev_name,
-                            frame
-                        );
-                    }
-                    if let Err(err) = write_packet_with_timeout_tolerance(&mut *dev, &frame) {
-                        if err.kind() == std::io::ErrorKind::TimedOut {
-                            write_timeout_count = write_timeout_count.saturating_add(1);
-                            if write_timeout_count % WRITE_TIMEOUT_LOG_EVERY == 1 {
-                                rf_logln!(
-                                    "rf_link_service bind write timeout on {} (count={})",
-                                    args.dev_name,
-                                    write_timeout_count
-                                );
+                if serial_fault.is_none() {
+                    match dev.read(&mut read_buf) {
+                        Ok(n) if n > 0 => {
+                            serial_buf.extend_from_slice(&read_buf[..n]);
+                            for frame in extract_crsf_frames(&mut serial_buf) {
+                                match frame.get(2).copied().unwrap_or_default() {
+                                    0x29 => rf_logln!(
+                                        "rf_link_service received ELRS device info: {:02X?}",
+                                        frame
+                                    ),
+                                    0x2B => rf_logln!(
+                                        "rf_link_service received ELRS param entry: {:02X?}",
+                                        frame
+                                    ),
+                                    0x2E => rf_logln!(
+                                        "rf_link_service received ELRS command status: {:02X?}",
+                                        frame
+                                    ),
+                                    _ => {}
+                                }
+                                protocol.consume_frame(&frame);
+                                if let Some(status) = status_state.consume_frame(&frame) {
+                                    rf_logln!(
+                                        "rf_link_service telemetry frame type=0x{:02X} signal={} battery={} stale={}",
+                                            frame.get(2).copied().unwrap_or_default(),
+                                            status.signal_strength_percent,
+                                            status.aircraft_battery_percent,
+                                            status_state.telemetry_is_stale()
+                                        );
+                                        system_status_tx.send(status);
+                                }
                             }
-                        } else {
+                            if let Some(info) = protocol.device_info() {
+                                if info.is_elrs {
+                                    if let Some(power) =
+                                        protocol.select_value_for_labels(&["Max Power", "TX Power"])
+                                    {
+                                        if let Ok(parsed) = power
+                                            .chars()
+                                            .filter(|ch| ch.is_ascii_digit())
+                                            .collect::<String>()
+                                            .parse::<u16>()
+                                        {
+                                            ui_state.config.tx_power_mw = parsed;
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(status) = link_monitor.on_link_active() {
+                                ui_state.bind_waiting_for_link = false;
+                                ui_status_text = status;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}
+                        Err(err) => {
                             protocol.clear_ephemeral();
                             ui_state.bind_active = false;
-                            rf_logln!("rf_link_service bind write failed: {}", err);
-                            break;
-                        }
-                    }
-                    ui_state.bind_active = protocol.bind_active();
-                    if let Some(status) = protocol.take_status_text() {
-                        ui_status_text = status;
-                        let state = build_elrs_state(
-                            true,
-                            ui_status_text.clone(),
-                            &status_state,
-                            &ui_state,
-                            &args.dev_name,
-                        );
-                        if state != last_state {
-                            elrs_state_tx.send(state.clone());
-                            last_state = state;
+                            rf_logln!("rf_link_service read failed: {}", err);
+                            serial_fault = Some(format!("serial error: {}", err));
                         }
                     }
                 }
-
-                match dev.read(&mut read_buf) {
-                    Ok(n) if n > 0 => {
-                        serial_buf.extend_from_slice(&read_buf[..n]);
-                        for frame in extract_crsf_frames(&mut serial_buf) {
-                            if let Some(status) = status_state.consume_frame(&frame) {
-                                rf_logln!(
-                                    "rf_link_service telemetry frame type=0x{:02X} signal={} battery={} stale={}",
-                                    frame.get(2).copied().unwrap_or_default(),
-                                    status.signal_strength_percent,
-                                    status.aircraft_battery_percent,
-                                    status_state.telemetry_is_stale()
-                                );
-                                system_status_tx.send(status);
-                            }
-                        }
-                        elrs_feedback_tx.send(build_feedback(
-                            true,
-                            "telemetry rx".to_string(),
-                            &status_state,
-                        ));
-                        let state = build_elrs_state(
-                            true,
-                            ui_status_text.clone(),
-                            &status_state,
-                            &ui_state,
-                            &args.dev_name,
-                        );
-                        if state != last_state {
-                            elrs_state_tx.send(state.clone());
-                            last_state = state;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}
-                    Err(err) => {
-                        protocol.clear_ephemeral();
-                        ui_state.bind_active = false;
-                        let state = build_elrs_state(
-                            false,
-                            format!("serial error: {}", err),
-                            &status_state,
-                            &ui_state,
-                            &args.dev_name,
-                        );
-                        elrs_feedback_tx.send(build_feedback(
-                            false,
-                            format!("serial error: {}", err),
-                            &status_state,
-                        ));
-                        if state != last_state {
-                            elrs_state_tx.send(state.clone());
-                            last_state = state;
-                        }
-                        rf_logln!("rf_link_service read failed: {}", err);
-                        break;
-                    }
-                }
-
-                if status_state.telemetry_is_stale() {
-                    if !protocol.bind_active() && ui_status_text == format!("{} @ {} baud", args.dev_name, args.baudrate) {
-                        ui_status_text = "waiting receiver link".to_string();
-                    }
-                    let state = build_elrs_state(
-                        true,
-                        ui_status_text.clone(),
-                        &status_state,
-                        &ui_state,
-                        &args.dev_name,
-                    );
-                    if state != last_state {
-                        elrs_state_tx.send(state.clone());
-                        last_state = state;
-                    }
-                }
-
-                let now = Instant::now();
-                let heartbeat_due = last_state_heartbeat_at
-                    .map(|last| now.saturating_duration_since(last) >= ELRS_STATE_HEARTBEAT_INTERVAL)
-                    .unwrap_or(true);
-                if heartbeat_due {
-                    let heartbeat = build_elrs_state(
-                        true,
-                        ui_status_text.clone(),
-                        &status_state,
-                        &ui_state,
-                        &args.dev_name,
-                    );
-                    elrs_state_tx.send(heartbeat.clone());
-                    last_state = heartbeat;
-                    last_state_heartbeat_at = Some(now);
-                }
-
-                std::thread::sleep(Duration::from_millis(2));
+            } else {
+                while mixer_out_rx.try_read().is_some() {}
             }
 
-            std::thread::sleep(REOPEN_DELAY);
+            if let Some(err_text) = serial_fault {
+                dev = None;
+                ui_status_text = err_text;
+                std::thread::sleep(REOPEN_DELAY);
+                continue;
+            }
+
+            if ui_state.config.rf_output_enabled {
+                if status_state.telemetry_is_stale() {
+                    if let Some(status) = link_monitor.on_link_lost(now) {
+                        ui_status_text = status;
+                    } else if let Some(status) = link_monitor.poll_timeout(now) {
+                        ui_state.bind_waiting_for_link = false;
+                        ui_status_text = status;
+                    }
+                } else if let Some(status) = link_monitor.on_link_active() {
+                    ui_state.bind_waiting_for_link = false;
+                    ui_status_text = status;
+                }
+            }
+
+            elrs_feedback_tx.send(build_feedback(
+                !status_state.telemetry_is_stale(),
+                link_monitor.feedback_text(),
+                &status_state,
+            ));
+
+            let state = build_elrs_state(
+                dev.is_some(),
+                ui_status_text.clone(),
+                &status_state,
+                &ui_state,
+                &protocol,
+                &link_monitor,
+                &args.dev_name,
+            );
+            if state != last_state {
+                elrs_state_tx.send(state.clone());
+                last_state = state.clone();
+            }
+
+            let heartbeat_due = last_state_heartbeat_at
+                .map(|last| now.saturating_duration_since(last) >= ELRS_STATE_HEARTBEAT_INTERVAL)
+                .unwrap_or(true);
+            if heartbeat_due {
+                elrs_state_tx.send(state.clone());
+                last_state = state;
+                last_state_heartbeat_at = Some(now);
+            }
+
+            std::thread::sleep(Duration::from_millis(2));
         }
     }));
 }
@@ -817,9 +953,32 @@ fn build_elrs_state(
     status_text: String,
     telemetry: &TelemetryStatusState,
     ui_state: &ElrsUiState,
+    protocol: &ElrsProtocolRuntime,
+    link_monitor: &LinkMonitorState,
     dev_name: &str,
 ) -> ElrsStateMsg {
     let editor_active = ui_state.editor.is_some();
+    let link_active = ui_state.config.rf_output_enabled && !telemetry.telemetry_is_stale();
+    let module_info = protocol.device_info();
+    let module_name = module_info
+        .map(|info| info.name.clone())
+        .unwrap_or_else(|| "ELRS/CRSF".to_string());
+    let version = module_info
+        .map(|info| format!("{}.{}.{}", (info.sw_version >> 16) & 0xff, (info.sw_version >> 8) & 0xff, info.sw_version & 0xff))
+        .unwrap_or_else(|| "--".to_string());
+    let link_state = if !ui_state.config.rf_output_enabled {
+        "RF OFF".to_string()
+    } else if !connected {
+        "UART OFFLINE".to_string()
+    } else if ui_state.bind_active {
+        "BINDING".to_string()
+    } else if ui_state.bind_waiting_for_link {
+        "VERIFY".to_string()
+    } else if link_active {
+        "LINKED".to_string()
+    } else {
+        "SEARCH".to_string()
+    };
     let (editor_buffer, editor_cursor) = if let Some(editor) = ui_state.editor.as_ref() {
         (editor.as_string(), editor.cursor)
     } else {
@@ -828,7 +987,9 @@ fn build_elrs_state(
 
     ElrsStateMsg {
         connected,
-        busy: false,
+        rf_output_enabled: ui_state.config.rf_output_enabled,
+        link_active,
+        busy: ui_state.bind_active || ui_state.bind_waiting_for_link,
         can_leave: !editor_active,
         path: dev_name.to_string(),
         editor_active,
@@ -839,23 +1000,37 @@ fn build_elrs_state(
         },
         editor_buffer,
         editor_cursor,
-        module_name: "ELRS/CRSF".to_string(),
-        device_name: if connected {
+        module_name,
+        device_name: if let Some(info) = module_info {
+            format!("{} #{:08X}", if connected { "UART Connected" } else { "Disconnected" }, info.serial)
+        } else if connected {
             "UART Connected".to_string()
         } else {
             "Disconnected".to_string()
         },
-        version: "--".to_string(),
+        version,
         packet_rate: "--".to_string(),
         telemetry_ratio: "--".to_string(),
-        tx_power: format!("{}mW", ui_state.config.tx_power_mw),
+        tx_power: protocol
+            .select_value_for_labels(&["Max Power", "TX Power"])
+            .unwrap_or_else(|| format!("{}mW", ui_state.config.tx_power_mw)),
         status_text,
         wifi_running: ui_state.config.wifi_manual_on,
         selected_idx: ui_state.selected_idx,
         params: vec![
             crate::messages::ElrsParamEntry {
+                id: "rf_output".to_string(),
+                label: "RF Output".to_string(),
+                value: if ui_state.config.rf_output_enabled {
+                    "ON".to_string()
+                } else {
+                    "OFF".to_string()
+                },
+                selectable: true,
+            },
+            crate::messages::ElrsParamEntry {
                 id: "wifi_manual".to_string(),
-                label: "Manual WiFi".to_string(),
+                label: "Module WiFi".to_string(),
                 value: if ui_state.config.wifi_manual_on {
                     "ON".to_string()
                 } else {
@@ -864,12 +1039,14 @@ fn build_elrs_state(
                 selectable: true,
             },
             crate::messages::ElrsParamEntry {
-                id: "bind_mode".to_string(),
-                label: "Bind Mode".to_string(),
+                id: "bind".to_string(),
+                label: "Bind".to_string(),
                 value: if ui_state.bind_active {
-                    "ACTIVE".to_string()
+                    "SENDING".to_string()
+                } else if ui_state.bind_waiting_for_link {
+                    "VERIFY".to_string()
                 } else {
-                    "IDLE".to_string()
+                    "READY".to_string()
                 },
                 selectable: true,
             },
@@ -888,6 +1065,12 @@ fn build_elrs_state(
                     ui_state.config.bind_phrase.clone()
                 },
                 selectable: true,
+            },
+            crate::messages::ElrsParamEntry {
+                id: "link_state".to_string(),
+                label: "Link State".to_string(),
+                value: link_state,
+                selectable: false,
             },
             crate::messages::ElrsParamEntry {
                 id: "signal".to_string(),
@@ -917,6 +1100,12 @@ fn build_elrs_state(
                 },
                 selectable: false,
             },
+            crate::messages::ElrsParamEntry {
+                id: "feedback".to_string(),
+                label: "Feedback".to_string(),
+                value: link_monitor.feedback_text(),
+                selectable: false,
+            },
         ],
     }
 }
@@ -939,7 +1128,7 @@ fn extract_crsf_frames(buf: &mut Vec<u8>) -> Vec<Vec<u8>> {
     let mut frames = Vec::new();
     let mut cursor = 0usize;
     while buf.len().saturating_sub(cursor) >= 3 {
-        if !matches!(buf[cursor], CRSF_SYNC | 0xEA | 0xEE) {
+        if buf[cursor] != CRSF_SYNC && buf[cursor] != 0xEA && buf[cursor] != 0xEE {
             cursor += 1;
             continue;
         }
@@ -987,9 +1176,12 @@ fn now_unix_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_frame_crc, extract_crsf_frames, shift_power_level, EditorState, TelemetryStatusState,
-        CRSF_CRC, CRSF_FRAME_BATTERY_ID, CRSF_FRAME_LINK_ID, CRSF_SYNC,
+        build_elrs_state, check_frame_crc, extract_crsf_frames, shift_power_level, EditorState,
+        ElrsUiState, LinkMonitorState, TelemetryStatusState, CRSF_CRC, CRSF_FRAME_BATTERY_ID,
+        CRSF_FRAME_LINK_ID, CRSF_SYNC,
     };
+    use crate::elrs::ElrsProtocolRuntime;
+    use std::time::Instant;
 
     fn build_frame(frame_type: u8, payload: &[u8]) -> Vec<u8> {
         let mut frame = Vec::new();
@@ -1045,6 +1237,40 @@ mod tests {
         assert_eq!(editor.as_string(), "ac");
         editor.move_cursor(-5);
         assert_eq!(editor.cursor, 0);
+    }
+
+    #[test]
+    fn test_link_monitor_marks_bind_verified_on_link() {
+        let mut monitor = LinkMonitorState::default();
+        let now = Instant::now();
+        monitor.on_bind_requested(now);
+        assert_eq!(
+            monitor.on_link_active().as_deref(),
+            Some("Bind verified by telemetry link")
+        );
+    }
+
+    #[test]
+    fn test_build_elrs_state_defaults_to_rf_off() {
+        let ui_state = ElrsUiState::load();
+        let telemetry = TelemetryStatusState::default();
+        let link_monitor = LinkMonitorState::default();
+        let state = build_elrs_state(
+            false,
+            "RF output disabled".to_string(),
+            &telemetry,
+            &ui_state,
+            &ElrsProtocolRuntime::default(),
+            &link_monitor,
+            "/dev/ttyS2",
+        );
+
+        assert!(!state.rf_output_enabled);
+        assert!(!state.link_active);
+        assert_eq!(state.params[0].id, "rf_output");
+        assert_eq!(state.params[0].value, "OFF");
+        assert_eq!(state.params[5].id, "link_state");
+        assert_eq!(state.params[5].value, "RF OFF");
     }
 }
 
