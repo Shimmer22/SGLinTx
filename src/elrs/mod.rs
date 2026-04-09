@@ -460,6 +460,10 @@ impl ElrsProtocolRuntime {
         self.last_status.take()
     }
 
+    pub fn is_pending_wifi_start_frame(&self, frame: &[u8]) -> bool {
+        is_pending_wifi_start_frame(self.pending_command.as_ref(), frame)
+    }
+
     pub fn bind_progress(&self) -> Option<(u8, u8)> {
         if self.bind_frames_total == 0 {
             None
@@ -708,7 +712,8 @@ impl ElrsProtocolRuntime {
         if let Some(mut pending) = self.pending_param_chunks.remove(&field_id) {
             if pending.parent == parent && pending.kind_raw == kind_raw {
                 pending.data.extend_from_slice(data);
-                let assembled = build_parameter_entry_frame(field_id, parent, kind_raw, &pending.data);
+                let assembled =
+                    build_parameter_entry_frame(field_id, parent, kind_raw, &pending.data);
                 parse_parameter_entry(&assembled)
             } else {
                 parse_parameter_entry(frame)

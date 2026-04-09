@@ -6,7 +6,11 @@
 - ELRS `bind` is confirmed working on current hardware.
 - ELRS `WiFi enable` path is now root-caused and fixed in protocol/runtime logic.
 - ELRS `WiFi on` on this module is reliable only when the command is retried continuously while the module remains in CRSF mode.
-- ELRS `WiFi off` in UI is a **local/runtime clear only**; there is still no CRSF-side disable command in ELRS 3.x.
+- ELRS `WiFi off` in UI is still a **local/runtime clear only**; there is no CRSF-side disable command in ELRS 3.x.
+- Current runtime exit strategy after `WiFi off` is:
+  - clear local WiFi pending/retry state immediately
+  - keep UART transmit path silent for a short cooldown
+  - resume mixer / CRSF traffic only after that cooldown
 - Remaining behavior is consistent with ELRS 3.x design:
   - entering WiFi is a parameter command
   - exiting WiFi is not a CRSF command path (module typically needs restart/reconnect path)
@@ -200,13 +204,24 @@ Effect observed on hardware:
   - local `wifi_manual_on`
   - pending WiFi command state
   - already queued retry frames for `field=0x0F`
+- runtime also suppresses all outbound UART traffic for a short exit cooldown before RC/mixer frames resume
 
 Effect:
 
 - switching WiFi from `ON` to `OFF` in UI stops further repeated `0x0F 01` transmissions immediately
+- mixer output no longer resumes in the same moment as local WiFi clear; there is now a deliberate silent gap first
 - RF output disable / module reconnect still remain the hard reset path that returns the module to normal ELRS operation
 
-## 9. Runtime state improvements already aligned
+## 9. Continuous WiFi enable no longer floods logs
+
+- repeated WiFi `START` retries are still sent while the command is pending
+- runtime log now prints the WiFi `START` send only on the leading edge of a continuous enable session
+
+Effect:
+
+- keeping WiFi enabled no longer appends the same retry line continuously to `rf_link_service.log`
+
+## 10. Runtime state improvements already aligned
 
 - WiFi enable sets local state only when command is actually queued.
 - WiFi mode active path suppresses RC frame streaming to avoid unnecessary serial traffic while module is in WiFi behavior.

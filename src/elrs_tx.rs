@@ -34,6 +34,7 @@ const ELRS_STATE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const LINK_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(5);
 const BIND_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 const CRSF_RC_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const WIFI_EXIT_SILENCE_INTERVAL: Duration = Duration::from_secs(2);
 const DEFAULT_RF_UART: &str = "/dev/ttyS2";
 const DEFAULT_RF_LOG_PATH: &str = "/tmp/lintx-elrs/rf_link_service.log";
 const DEFAULT_BIND_PHRASE: &str = "654321";
@@ -588,6 +589,10 @@ fn append_rf_log_line(message: &str) {
     }
 }
 
+fn wifi_exit_silence_active(silent_until: Option<Instant>, now: Instant) -> bool {
+    silent_until.map(|deadline| now < deadline).unwrap_or(false)
+}
+
 fn rf_link_service_main(argc: u32, argv: *const &str) {
     let args = match client_process_args::<Cli>(argc, argv) {
         Some(v) => v,
@@ -622,6 +627,8 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
         let mut write_timeout_count: u32 = 0;
         let mut last_state_heartbeat_at: Option<Instant> = Some(Instant::now());
         let mut ui_status_text = "RF output disabled".to_string();
+        let mut wifi_exit_silent_until: Option<Instant> = None;
+        let mut wifi_retry_log_armed = true;
         let mut dev: Option<Box<dyn serialport::SerialPort>> = None;
 
         loop {
@@ -639,6 +646,7 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
 
             while let Some(cmd) = elrs_cmd_rx.try_read() {
                 let prev_rf_enabled = ui_state.config.rf_output_enabled;
+                let prev_wifi_manual_on = ui_state.config.wifi_manual_on;
                 let prev_bind_active = protocol.bind_active();
                 ui_status_text = ui_state.handle_command(cmd, &mut protocol, dev.is_some());
                 ui_state.bind_active = protocol.bind_active();
@@ -654,6 +662,18 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
 
                 if !prev_bind_active && protocol.bind_active() {
                     link_monitor.on_bind_requested(now);
+                }
+
+                if prev_wifi_manual_on && !ui_state.config.wifi_manual_on {
+                    wifi_exit_silent_until = Some(now + WIFI_EXIT_SILENCE_INTERVAL);
+                    wifi_retry_log_armed = true;
+                    rf_logln!(
+                        "rf_link_service WiFi exit silence enabled for {} ms",
+                        WIFI_EXIT_SILENCE_INTERVAL.as_millis()
+                    );
+                } else if !prev_wifi_manual_on && ui_state.config.wifi_manual_on {
+                    wifi_exit_silent_until = None;
+                    wifi_retry_log_armed = true;
                 }
 
                 rf_logln!(
@@ -674,6 +694,8 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                 ui_state.bind_waiting_for_link = false;
                 serial_buf.clear();
                 link_monitor.on_rf_disabled();
+                wifi_exit_silent_until = None;
+                wifi_retry_log_armed = true;
                 if ui_state.config.wifi_manual_on {
                     ui_state.config.wifi_manual_on = false;
                     let _ = ui_state.persist();
@@ -698,6 +720,8 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                             );
                             dev = Some(port);
                             protocol.request_refresh();
+                            wifi_exit_silent_until = None;
+                            wifi_retry_log_armed = true;
                             if ui_state.config.wifi_manual_on {
                                 ui_state.config.wifi_manual_on = false;
                                 let _ = ui_state.persist();
@@ -745,8 +769,11 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                     latest_mixer_out = Some(msg);
                 }
 
-                if serial_fault.is_none() {
+                let wifi_exit_silence = wifi_exit_silence_active(wifi_exit_silent_until, now);
+
+                if serial_fault.is_none() && !wifi_exit_silence {
                     if let Some(frame) = protocol.poll_outgoing_frame(now) {
+                        let is_wifi_start_retry = protocol.is_pending_wifi_start_frame(&frame);
                         if frame.get(2).copied() == Some(0x32)
                             && frame.get(6).copied() == Some(0x05)
                         {
@@ -762,12 +789,23 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                                 frame
                             );
                         } else if frame.get(2).copied() == Some(0x2D) {
-                            rf_logln!(
-                                "rf_link_service sending ELRS param frame type=0x{:02X} on {}: {:02X?}",
-                                frame[2],
-                                args.dev_name,
-                                frame
-                            );
+                            if is_wifi_start_retry {
+                                if wifi_retry_log_armed {
+                                    rf_logln!(
+                                        "rf_link_service sending ELRS WiFi start on {}: {:02X?}",
+                                        args.dev_name,
+                                        frame
+                                    );
+                                    wifi_retry_log_armed = false;
+                                }
+                            } else {
+                                rf_logln!(
+                                    "rf_link_service sending ELRS param frame type=0x{:02X} on {}: {:02X?}",
+                                    frame[2],
+                                    args.dev_name,
+                                    frame
+                                );
+                            }
                         } else if frame.get(2).copied() == Some(0x32)
                             && frame.get(5).copied() == Some(0x10)
                             && frame.get(6).copied() == Some(0x01)
@@ -812,6 +850,7 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                 if serial_fault.is_none()
                     && !protocol.bind_active()
                     && !ui_state.config.wifi_manual_on
+                    && !wifi_exit_silence
                     && rc_due
                 {
                     if let Some(msg) = latest_mixer_out {
@@ -958,6 +997,8 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                 while mixer_out_rx.try_read().is_some() {}
                 latest_mixer_out = None;
                 last_rc_frame_at = None;
+                wifi_exit_silent_until = None;
+                wifi_retry_log_armed = true;
             }
 
             if let Some(err_text) = serial_fault {
@@ -1321,11 +1362,12 @@ fn now_unix_secs() -> u64 {
 mod tests {
     use super::{
         build_elrs_state, check_frame_crc, derive_elrs_model_id, extract_crsf_frames,
-        shift_power_level, EditorState, ElrsUiState, LinkMonitorState, TelemetryStatusState,
-        CRSF_CRC, CRSF_FRAME_BATTERY_ID, CRSF_FRAME_LINK_ID, CRSF_SYNC,
+        shift_power_level, wifi_exit_silence_active, EditorState, ElrsUiState,
+        LinkMonitorState, TelemetryStatusState, CRSF_CRC, CRSF_FRAME_BATTERY_ID,
+        CRSF_FRAME_LINK_ID, CRSF_SYNC,
     };
     use crate::elrs::ElrsProtocolRuntime;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn build_frame(frame_type: u8, payload: &[u8]) -> Vec<u8> {
         let mut frame = Vec::new();
@@ -1381,6 +1423,25 @@ mod tests {
         assert_eq!(editor.as_string(), "ac");
         editor.move_cursor(-5);
         assert_eq!(editor.cursor, 0);
+    }
+
+    #[test]
+    fn test_wifi_exit_silence_active_before_deadline() {
+        let now = Instant::now();
+        assert!(wifi_exit_silence_active(
+            Some(now + Duration::from_millis(500)),
+            now
+        ));
+    }
+
+    #[test]
+    fn test_wifi_exit_silence_inactive_after_deadline() {
+        let now = Instant::now();
+        assert!(!wifi_exit_silence_active(
+            Some(now + Duration::from_millis(500)),
+            now + Duration::from_secs(1)
+        ));
+        assert!(!wifi_exit_silence_active(None, now));
     }
 
     #[test]
