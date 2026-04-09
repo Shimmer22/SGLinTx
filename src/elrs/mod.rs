@@ -23,7 +23,9 @@ const PARAM_REQUEST_SETTINGS_ID: u8 = 0x2A;
 const PARAM_SETTINGS_ENTRY_ID: u8 = 0x2B;
 const PARAM_READ_ID: u8 = 0x2C;
 const PARAM_WRITE_ID: u8 = 0x2D;
-const PARAM_COMMAND_ID: u8 = 0x2E;
+// 0x2E 是 ELRS 私有链路统计帧（elrsV3.lua parseElrsInfoMessage），不是命令状态响应。
+// 命令执行的响应通过 0x2B（PARAM_SETTINGS_ENTRY_ID）返回，字段 status 字节反映执行状态。
+const ELRS_LINK_STAT_ID: u8 = 0x2E;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ElrsOperation {
@@ -148,26 +150,34 @@ impl ElrsProtocolRuntime {
                 }
             }
             ElrsOperation::SetWifiManual(enable) => {
-                let labels: &[&str] = if enable {
-                    &["Enable WiFi", "Enter WiFi", "WiFi Update"]
-                } else {
-                    &["Disable WiFi", "Exit WiFi"]
-                };
-                if let Some(id) = self.find_command_param(&labels) {
+                if !enable {
+                    // ELRS 3.x 没有通过 CRSF 关闭 WiFi 的命令。
+                    // 模块进入 WiFi 后必须断电重启才能恢复，无需发送帧。
+                    // 返回 Queued 让调用方清除本地 wifi_manual_on 标志。
+                    self.last_status = Some("WiFi state cleared".to_string());
+                    return ElrsOperationStatus::Queued("WiFi state cleared");
+                }
+                let labels: &[&str] = &["Enable WiFi", "Enter WiFi", "WiFi Update"];
+                // 精确标签匹配；若失败则回退到标签中包含 "wifi" 的任意 COMMAND 字段
+                let wifi_id = self
+                    .find_command_param(labels)
+                    .or_else(|| self.find_wifi_command_fallback());
+                if let Some(id) = wifi_id {
                     self.outgoing_queue.push_back(build_parameter_write_frame(
                         MODULE_ADDRESS,
                         id,
                         &[1],
                     ));
-                    self.last_status = Some(if enable {
-                        "WiFi command queued".to_string()
-                    } else {
-                        "WiFi disable queued".to_string()
-                    });
+                    self.last_status = Some("WiFi command queued".to_string());
                     ElrsOperationStatus::Queued("WiFi command queued")
+                } else if self.device_info.is_some() {
+                    // 模块已被识别，参数还在枚举中——不要打断正在进行的枚举。
+                    // 返回 Busy 让调用方提示用户等待，而不是清空已枚举到的数据重来。
+                    ElrsOperationStatus::Busy("WiFi params loading, please wait")
                 } else {
+                    // 模块还未被识别，触发重新发现流程。
                     self.request_refresh();
-                    ElrsOperationStatus::Unsupported("WiFi command unavailable")
+                    ElrsOperationStatus::Unsupported("WiFi unavailable: module not found")
                 }
             }
             ElrsOperation::SetTxPower(power) => {
@@ -315,7 +325,12 @@ impl ElrsProtocolRuntime {
             return Some(build_device_ping_frame(MODULE_ADDRESS));
         }
 
-        if self.device_info.is_some() && self.next_param_read_id <= PARAM_MAX_FIELD_ID {
+        let scan_limit = self
+            .device_info
+            .as_ref()
+            .map(|d| d.field_count)
+            .unwrap_or(PARAM_MAX_FIELD_ID);
+        if self.device_info.is_some() && self.next_param_read_id <= scan_limit {
             let frame = build_parameter_read_frame(MODULE_ADDRESS, self.next_param_read_id, 0);
             self.next_param_read_id = self.next_param_read_id.saturating_add(1);
             self.last_param_frame_at = Some(now);
@@ -358,10 +373,8 @@ impl ElrsProtocolRuntime {
                     self.params.insert(entry.id, entry);
                 }
             }
-            PARAM_COMMAND_ID => {
-                if let Some(status) = parse_command_status(frame) {
-                    self.last_status = Some(status);
-                }
+            ELRS_LINK_STAT_ID => {
+                // ELRS 私有链路统计帧，暂不解析，仅记录已收到
             }
             _ => {}
         }
@@ -399,6 +412,38 @@ impl ElrsProtocolRuntime {
             .find(|param| {
                 matches!(param.kind, ParamKind::String)
                     && labels.iter().any(|label| param.label == *label)
+            })
+            .map(|param| param.id)
+    }
+
+    fn find_wifi_command_fallback(&self) -> Option<u8> {
+        // 已知 WiFi 命令标签的完整小写形式，用于前缀匹配截断标签。
+        // ELRS 模块使用 8 字节数据块，"Enable WiFi" 会被切成 "Enable W" + "iFi\0..."
+        // 两个 chunk。第一个 chunk 没有 null 终止符，label 以截断形式入库。
+        const WIFI_FULL_LABELS: &[&str] = &[
+            "enable wifi",
+            "enter wifi",
+            "wifi update",
+            "wifi connectivity",
+        ];
+        self.params
+            .values()
+            .find(|param| {
+                if !matches!(param.kind, ParamKind::Command) {
+                    return false;
+                }
+                let lower = param.label.to_ascii_lowercase();
+                // 完整 label 包含 "wifi"（label 完整时）
+                if lower.contains("wifi") {
+                    return true;
+                }
+                // 前缀匹配：某已知完整 label 以截断 label 开头
+                // 例："enable wifi".starts_with("enable w") == true
+                // 至少 6 个字符才做前缀匹配，避免过短标签误匹配
+                lower.len() >= 6
+                    && WIFI_FULL_LABELS
+                        .iter()
+                        .any(|full| full.starts_with(lower.as_str()))
             })
             .map(|param| param.id)
     }
@@ -511,13 +556,20 @@ fn parse_device_info(frame: &[u8]) -> Option<DeviceInfo> {
     let major = frame.get(14 + name_size).copied().unwrap_or_default() as u32;
     let minor = frame.get(15 + name_size).copied().unwrap_or_default() as u32;
     let revision = frame.get(16 + name_size).copied().unwrap_or_default() as u32;
+    // param_count 在 name + serial(4) + hw(4) + sw(4) 之后的字节
+    // 即 frame[name_end + 12]
+    let param_count = frame
+        .get(name_end + 12)
+        .copied()
+        .filter(|&c| c > 0)
+        .unwrap_or(PARAM_MAX_FIELD_ID);
     Some(DeviceInfo {
         is_elrs,
         name,
         serial: 0,
         hw_version: major,
         sw_version: (major << 16) | (minor << 8) | revision,
-        field_count: PARAM_MAX_FIELD_ID,
+        field_count: param_count,
     })
 }
 
@@ -526,15 +578,30 @@ fn parse_parameter_entry(frame: &[u8]) -> Option<ParamEntry> {
         return None;
     }
     let field_id = *frame.get(5)?;
-    let chunk = *frame.get(6)?;
-    if chunk != 0 {
-        return None;
-    }
+    let chunks_remain = *frame.get(6)?;
     let parent = *frame.get(7)?;
     let kind_raw = *frame.get(8)?;
     let kind = parse_param_kind(kind_raw);
+    // SELECT/String/Folder/Info 类型需要完整数据，chunks_remain > 0 时数据不完整，丢弃。
+    // COMMAND 类型的 label + status 在第一个 chunk 中就已经完整，
+    // 允许 chunks_remain > 0（info text 可能截断，但不影响命令识别和发送）。
+    if chunks_remain != 0 && !matches!(kind, ParamKind::Command) {
+        return None;
+    }
     let mut cursor = 9usize;
-    let label_end = frame[cursor..].iter().position(|byte| *byte == 0)? + cursor;
+    // ELRS 使用 8 字节数据块。COMMAND 类型首 chunk 的 label 末尾可能落在下一个 chunk
+    // 中，导致本帧内找不到 null 终止符。此时用所有可用字节作截断 label 存入 params，
+    // find_wifi_command_fallback 用前缀匹配仍可识别（"enable wifi".starts_with("enable w")）。
+    let label_end = match frame[cursor..].iter().position(|byte| *byte == 0) {
+        Some(pos) => pos + cursor,
+        None => {
+            if chunks_remain != 0 && matches!(kind, ParamKind::Command) {
+                frame.len().saturating_sub(1) // CRC 之前的所有字节作截断 label
+            } else {
+                return None;
+            }
+        }
+    };
     let label = String::from_utf8_lossy(&frame[cursor..label_end]).to_string();
     cursor = label_end + 1;
 
@@ -594,22 +661,6 @@ fn parse_parameter_entry(frame: &[u8]) -> Option<ParamEntry> {
         value,
         command_status,
     })
-}
-
-fn parse_command_status(frame: &[u8]) -> Option<String> {
-    if frame.len() < 8 || frame[2] != PARAM_COMMAND_ID {
-        return None;
-    }
-    let field_id = *frame.get(5)?;
-    let status = *frame.get(6)?;
-    let msg = match status {
-        0 => format!("ELRS command {} acknowledged", field_id),
-        1 => format!("ELRS command {} executing", field_id),
-        2 => format!("ELRS command {} finished", field_id),
-        3 => format!("ELRS command {} failed", field_id),
-        _ => format!("ELRS command {} status {}", field_id, status),
-    };
-    Some(msg)
 }
 
 fn parse_param_kind(kind: u8) -> ParamKind {
@@ -814,5 +865,109 @@ mod tests {
         assert_eq!(frame[2], 0x2D);
         assert_eq!(frame[5], 9);
         assert_eq!(&frame[6..12], b"abc123");
+    }
+
+    #[test]
+    fn test_wifi_enable_returns_unsupported_when_module_not_found() {
+        // device_info is None → module not yet discovered → Unsupported + refresh triggered
+        let mut runtime = ElrsProtocolRuntime::default();
+        let status = runtime.request(ElrsOperation::SetWifiManual(true));
+        assert!(
+            matches!(status, super::ElrsOperationStatus::Unsupported(_)),
+            "should be Unsupported when module not yet discovered, got {:?}",
+            status
+        );
+        // request_refresh should have been triggered: param_refresh_requested reset via ping
+        // (we just verify the queue is non-empty or ping will fire soon via last_ping_at=None)
+        let frame = runtime.poll_outgoing_frame(Instant::now() + Duration::from_secs(1));
+        assert!(
+            frame.is_some(),
+            "refresh ping should be queued after Unsupported"
+        );
+    }
+
+    #[test]
+    fn test_wifi_enable_returns_busy_when_module_known_but_params_not_enumerated() {
+        // device_info is Some but WiFi command field not yet in params → Busy, no refresh
+        let mut runtime = ElrsProtocolRuntime::default();
+        // Inject a minimal DeviceInfo so the module is "known"
+        runtime.device_info = Some(super::DeviceInfo {
+            name: "DuplicateTX ESP".to_string(),
+            serial: 0,
+            hw_version: 3,
+            sw_version: (3 << 16) | (2 << 8) | 1,
+            field_count: 64,
+            is_elrs: true,
+        });
+        let params_before = runtime.params.len();
+        let status = runtime.request(ElrsOperation::SetWifiManual(true));
+        assert!(
+            matches!(status, super::ElrsOperationStatus::Busy(_)),
+            "should be Busy when module known but WiFi field not yet enumerated, got {:?}",
+            status
+        );
+        // Crucially: params must NOT have been cleared (no request_refresh)
+        assert_eq!(
+            runtime.params.len(),
+            params_before,
+            "params should not be cleared when returning Busy"
+        );
+    }
+
+    #[test]
+    fn test_wifi_enable_queues_frame_when_field_found() {
+        let mut runtime = ElrsProtocolRuntime::default();
+        runtime.device_info = Some(super::DeviceInfo {
+            name: "DuplicateTX ESP".to_string(),
+            serial: 0,
+            hw_version: 3,
+            sw_version: (3 << 16) | (2 << 8) | 1,
+            field_count: 64,
+            is_elrs: true,
+        });
+        runtime.params.insert(
+            5,
+            ParamEntry {
+                id: 5,
+                parent: 0,
+                kind: ParamKind::Command,
+                label: "Enable WiFi".to_string(),
+                options: Vec::new(),
+                value: String::new(),
+                command_status: None,
+            },
+        );
+        let status = runtime.request(ElrsOperation::SetWifiManual(true));
+        assert_eq!(status.message(), "WiFi command queued");
+        let frame = runtime
+            .poll_outgoing_frame(Instant::now() + Duration::from_secs(1))
+            .expect("WiFi command frame should be queued");
+        // C8 06 2D EE EF <field_id=5> <value=1> <crc>
+        assert_eq!(frame[2], 0x2D, "frame type must be PARAM_WRITE");
+        assert_eq!(frame[3], MODULE_ADDRESS, "dest must be MODULE_ADDRESS");
+        assert_eq!(
+            frame[4], ELRS_HANDSET_ADDRESS,
+            "src must be ELRS_HANDSET_ADDRESS"
+        );
+        assert_eq!(frame[5], 5, "field_id must match discovered WiFi field");
+        assert_eq!(frame[6], 1, "value must be 1 (COMMAND CLICK)");
+    }
+
+    #[test]
+    fn test_wifi_disable_returns_queued_without_sending_frame() {
+        // SetWifiManual(false) should return Queued immediately, no frame enqueued
+        let mut runtime = ElrsProtocolRuntime::default();
+        let status = runtime.request(ElrsOperation::SetWifiManual(false));
+        assert_eq!(status.message(), "WiFi state cleared");
+        // No frame should be queued
+        let frame = runtime.poll_outgoing_frame(Instant::now() + Duration::from_secs(1));
+        // model_id frame will fire (model_id_pending=true by default), so drain it
+        // The important thing is no 0x2D PARAM_WRITE frame for WiFi disable
+        if let Some(f) = frame {
+            assert_ne!(
+                f[2], 0x2D,
+                "disable WiFi must not enqueue a PARAM_WRITE frame"
+            );
+        }
     }
 }

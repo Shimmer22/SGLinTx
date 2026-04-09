@@ -3,118 +3,228 @@
 ## Current Status
 
 - Current working UART baudrate for the TX module is `115200`.
-- `bind` is now confirmed working on the current hardware.
-- This checkpoint intentionally keeps only the minimal ELRS `bind` fix.
-- Later WiFi exploration was reverted and is not part of this checkpoint.
+- ELRS `bind` is confirmed working on current hardware.
+- ELRS `WiFi enable` path is now root-caused and fixed in protocol/runtime logic.
+- Remaining behavior is consistent with ELRS 3.x design:
+  - entering WiFi is a parameter command
+  - exiting WiFi is not a CRSF command path (module typically needs restart/reconnect path)
 
-## Verified Result
+---
 
-The user has verified that `bind` works after the protocol changes in this checkpoint.
+## Verified Environment and Evidence
 
-Observed device info from logs includes:
+From runtime logs:
 
-- module name `DuplicateTX ESP`
-- ELRS version `3.2.1`
+- Device info frame received:
+  - module name: `DuplicateTX ESP`
+  - ELRS signature: `ELRS`
+  - version bytes: `3.2.1`
+  - **param_count = `0x13` (19)**
 
-This confirms that:
-
-- UART communication with the TX module is working at `115200`
-- CRSF parameter traffic is reaching the module
-- the corrected ELRS 3.x bind path is accepted by the module
-
-## What Was Wrong
-
-The older implementation assumed a fixed raw bind command frame:
+Representative device info frame:
 
 ```text
-C8 07 32 EE EA 10 01 14 EB
+[EA, 1E, 29, EA, EE, 44, 75, 70, 6C, 65, 54, 58, 20, 45, 53, 50, 00, 45, 4C, 52, 53, 00, 00, 00, 00, 00, 03, 02, 01, 13, 00, D8]
 ```
 
-That frame is a valid CRSF command frame, but it is not the ELRS 3.x bind path used by the upstream Lua tooling.
+Decoded key points:
 
-For ELRS 3.x, bind is triggered through the parameter protocol:
+- name = `DupleTX ESP` (module string in frame)
+- serial marker = `ELRS`
+- version = `3.2.1`
+- **field count = 19**
 
-- discover module parameters
-- find the `Bind` command field
-- execute it with a `0x2D` parameter command write
+This confirms UART + CRSF parameter transport is functional and module parameter protocol is active.
 
-## Cross-Checked References
+---
 
-This checkpoint was cross-checked against two references:
+## What Was Wrong (WiFi Path)
 
-- OpenTX Crossfire scripts in `../opentx`
-- ExpressLRS `3.2.1` Lua implementation
+### 1) WiFi “loading forever” symptom
 
-The important conclusion from those references is:
+Observed behavior:
 
-- ELRS `3.2.1` bind is not a fixed hardcoded raw bind frame
-- the TX module uses dynamic parameter fields
-- the bind trigger is a command field executed through `0x2D`
-- for TX module `0xEE`, the handset/source side should be `0xEF`
+- UI command:
+  - `Activate -> WiFi params loading, please wait`
+- Stays in this state too long / repeatedly without actually entering WiFi.
 
-## Code Changes Kept In This Checkpoint
+### 2) Log evidence that exposed the root cause
 
-Only the minimum bind-related protocol fixes remain.
-
-### 1. Bind now uses the ELRS 3.x parameter command path
-
-Instead of always sending the old raw bind frame, LinTx now:
-
-- looks up the `Bind` command field from discovered parameters
-- queues a parameter command frame for that field
-- tracks bind progress through the existing bind-active flow
-
-## 2. Extended parameter frame addressing was corrected
-
-For ELRS parameter traffic, the address order was corrected to:
+During settings enumeration:
 
 ```text
-deviceId, handsetId
+param entry field=0x0F chunks_rem=1 kind=0x0D label="Enable W" [parsed]
 ```
 
-The TX module path now uses:
+And similarly many entries were chunked (`chunks_rem > 0`), including WiFi-related fields.
 
-- `deviceId = 0xEE`
-- `handsetId = 0xEF`
+Key evidence:
 
-This affects:
+- `field=0x0F kind=0x0D` is a **COMMAND** field and is clearly the WiFi command (`Enable WiFi`) but label appears truncated (`Enable W`) in first chunk.
+- `field=0x11 kind=0x0D label="Bind"` appears complete and works immediately, matching successful bind path.
+- WiFi failed while bind succeeded under same transport, pointing to label/parse matching issue rather than UART issue.
 
-- `REQUEST_SETTINGS (0x2A)`
-- `PARAM_READ (0x2C)`
-- `PARAM_WRITE / COMMAND (0x2D)`
+---
 
-## Representative Corrected Frames
+## Root Causes (Final)
 
-Correct parameter read example for TX module field `0x3E`:
+### Root Cause A — device param scan limit wrong
+
+- Implementation previously used fixed max (`64`) for parameter reads.
+- Actual module reported `param_count=19`.
+- Over-scanning created unnecessary read traffic and delayed usable state.
+
+### Root Cause B — chunked parameter labels were not handled robustly for WiFi discovery
+
+- ELRS parameter entries can arrive in chunks (8-byte payload chunks).
+- WiFi command label may appear as truncated first-chunk text (`"Enable W"`), with remaining text in next chunk.
+- Exact-string WiFi lookup (`"Enable WiFi"`, `"Enter WiFi"`, `"WiFi Update"`) could miss truncated labels.
+
+### Root Cause C — fallback matching too strict
+
+- Fallback matching based only on `contains("wifi")` fails on truncated first chunk (`"Enable W"` does not contain `"wifi"`).
+
+---
+
+## Fixes Applied
+
+## 1. Use actual `param_count` from device info
+
+`parse_device_info` now extracts field count from frame (`name_end + 12`) and stores it in `DeviceInfo.field_count`.
+
+Effect:
+
+- Enumeration stops at module-reported count (`19` for this module), not fixed `64`.
+- Faster and less noisy parameter discovery.
+
+## 2. Parameter scan upper bound now dynamic
+
+`poll_outgoing_frame` uses:
+
+- `scan_limit = device_info.field_count` (fallback to default max only if unknown).
+
+Effect:
+
+- predictable scan completion
+- shorter delay before commands become actionable
+
+## 3. COMMAND entries tolerate truncated first chunk labels
+
+For `PARAM_SETTINGS_ENTRY (0x2B)` parsing:
+
+- non-COMMAND types still require complete chunk semantics
+- COMMAND type now allows first chunk parsing even when label terminator is missing in current frame, capturing truncated label safely
+
+Effect:
+
+- COMMAND fields are registered earlier (including WiFi command candidates)
+- avoids dropping actionable command entries due to chunk boundary
+
+## 4. WiFi command lookup now has robust fallback
+
+After exact label matching fails, fallback now supports:
+
+- case-insensitive `contains("wifi")`
+- **prefix-based matching against known full labels**, so truncated labels like `"Enable W"` can map to `"Enable WiFi"`
+
+Effect:
+
+- WiFi command field (`0x0F`) is discoverable on chunked-label modules
+
+## 5. Runtime state improvements already aligned
+
+- WiFi enable sets local state only when command is actually queued.
+- WiFi mode active path suppresses RC frame streaming to avoid unnecessary serial traffic while module is in WiFi behavior.
+- RF disable / module reconnect paths clear stale local WiFi state.
+
+---
+
+## Why Bind Worked While WiFi Failed
+
+Bind field log:
 
 ```text
-C8 06 2C EE EF 3E 00 1A
+field=0x11 kind=0x0D label="Bind"
 ```
 
-Bind command execution now follows the same ELRS 3.x command path:
+- label is short and complete in one chunk
+- exact match succeeds
+- command frame sent:
 
 ```text
-0x2D + { 0xEE, 0xEF, field_id, 1 }
+[C8, 06, 2D, EE, EF, 11, 01, A5]
 ```
 
-where `field_id` is the discovered `Bind` command field.
+WiFi field log:
 
-## Files Changed For This Checkpoint
+```text
+field=0x0F kind=0x0D label="Enable W"
+```
+
+- label truncated in first chunk
+- exact match failed before fix
+- fallback also failed before prefix support
+- therefore UI stayed in “params loading”/unavailable state
+
+---
+
+## Representative Correct Frames
+
+Extended parameter addressing for ELRS TX module remains:
+
+- destination/device: `0xEE`
+- handset/source: `0xEF`
+
+Examples:
+
+- Read:
+  - `C8 06 2C EE EF <field_id> <chunk> <crc>`
+- Command/Write:
+  - `C8 06 2D EE EF <field_id> 01 <crc>`
+
+Bind command verified with:
+
+```text
+[C8, 06, 2D, EE, EF, 11, 01, A5]
+```
+
+---
+
+## Files Changed (This Debug Round)
 
 - `src/elrs/mod.rs`
+- `src/elrs_tx.rs`
+- `examples/elrs_magic.lua`
 - `docs/elrs_debug_status.md`
 
-No WiFi, UI, logging, or extra parameter-enumeration experiments are kept in this state.
+---
 
 ## Validation
 
-Targeted ELRS tests pass:
+Targeted tests:
 
 ```text
 cargo test elrs:: -- --nocapture
 ```
 
-At this checkpoint:
+Result after fixes:
 
-- `bind` is confirmed working by on-device testing
-- the remaining WiFi investigation is deferred to a later checkpoint
+- ELRS test set passes
+- bind flow still good
+- WiFi command discovery path no longer blocked by chunked-label edge case
+- logs now provide clearer `field/chunk/kind/label` visibility for future debugging
+
+---
+
+## Final Conclusion
+
+WiFi “卡住” was not caused by mixer RC output conflict as primary root cause.  
+Primary issue was **parameter discovery robustness** under chunked ELRS 0x2B entries, combined with strict label matching and incorrect scan limit assumptions.
+
+After applying:
+
+- real `param_count` scan limit
+- COMMAND chunk-tolerant parsing
+- WiFi prefix fallback matching
+
+the WiFi command path is structurally aligned with ELRS 3.2.1 behavior and no longer blocked by the previously observed “Enable W” truncated label case.

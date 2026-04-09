@@ -232,16 +232,14 @@ impl ElrsUiState {
                 match self.persist() {
                     Ok(()) => {
                         if self.config.rf_output_enabled && connected {
-                            let status =
-                                protocol.request(ElrsOperation::SetBindPhrase(self.config.bind_phrase.clone()));
+                            let status = protocol.request(ElrsOperation::SetBindPhrase(
+                                self.config.bind_phrase.clone(),
+                            ));
                             match status {
                                 ElrsOperationStatus::Queued(_) => {
                                     "Bind phrase saved and queued".to_string()
                                 }
-                                _ => format!(
-                                    "Bind phrase saved locally; {}",
-                                    status.message()
-                                ),
+                                _ => format!("Bind phrase saved locally; {}", status.message()),
                             }
                         } else {
                             "Bind phrase saved locally".to_string()
@@ -276,18 +274,28 @@ impl ElrsUiState {
                 }
             }
             1 => {
-                if !self.config.rf_output_enabled {
-                    "WiFi unavailable: enable RF output first".to_string()
-                } else if !connected {
-                    "WiFi unavailable: UART offline".to_string()
+                if self.config.wifi_manual_on {
+                    // WiFi 已开启 → 关闭：仅清除本地标志，无需 CRSF 命令
+                    // （ELRS 模块进入 WiFi 后需断电重启，本身没有 CRSF disable 命令）
+                    self.config.wifi_manual_on = false;
+                    let _ = self.persist();
+                    "WiFi state cleared".to_string()
                 } else {
-                    let enable = !self.config.wifi_manual_on;
-                    let status = protocol.request(ElrsOperation::SetWifiManual(enable));
-                    if !matches!(status, ElrsOperationStatus::Unsupported(_)) {
-                        self.config.wifi_manual_on = enable;
-                        let _ = self.persist();
+                    // WiFi 未开启 → 尝试开启：需要 UART 连接才能发送参数命令
+                    if !self.config.rf_output_enabled {
+                        "WiFi unavailable: enable RF output first".to_string()
+                    } else if !connected {
+                        "WiFi unavailable: UART offline".to_string()
+                    } else {
+                        let status = protocol.request(ElrsOperation::SetWifiManual(true));
+                        // 只有 Queued（命令已入队发送）才真正置 wifi_manual_on。
+                        // Busy（参数加载中）和 Unsupported（模块未找到）都不应置位。
+                        if matches!(status, ElrsOperationStatus::Queued(_)) {
+                            self.config.wifi_manual_on = true;
+                            let _ = self.persist();
+                        }
+                        status.message().to_string()
                     }
-                    status.message().to_string()
                 }
             }
             2 => {
@@ -326,11 +334,7 @@ impl ElrsUiState {
         }
     }
 
-    fn activate_selected(
-        &mut self,
-        protocol: &mut ElrsProtocolRuntime,
-        connected: bool,
-    ) -> String {
+    fn activate_selected(&mut self, protocol: &mut ElrsProtocolRuntime, connected: bool) -> String {
         match self.selected_idx {
             0..=3 => self.adjust_selected(1, protocol, connected),
             4 => {
@@ -669,6 +673,11 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                 ui_state.bind_waiting_for_link = false;
                 serial_buf.clear();
                 link_monitor.on_rf_disabled();
+                if ui_state.config.wifi_manual_on {
+                    ui_state.config.wifi_manual_on = false;
+                    let _ = ui_state.persist();
+                    rf_logln!("rf_link_service WiFi state cleared on RF disable");
+                }
                 ui_status_text = "RF output disabled".to_string();
             } else {
                 link_monitor.on_rf_enabled(now);
@@ -688,9 +697,16 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                             );
                             dev = Some(port);
                             protocol.request_refresh();
+                            if ui_state.config.wifi_manual_on {
+                                ui_state.config.wifi_manual_on = false;
+                                let _ = ui_state.persist();
+                                rf_logln!("rf_link_service WiFi state cleared on module reconnect");
+                            }
                             serial_buf.clear();
-                            ui_status_text =
-                                format!("RF output enabled on {} @ {} baud", args.dev_name, args.baudrate);
+                            ui_status_text = format!(
+                                "RF output enabled on {} @ {} baud",
+                                args.dev_name, args.baudrate
+                            );
                         }
                         Err(err) => {
                             protocol.clear_ephemeral();
@@ -730,7 +746,9 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
 
                 if serial_fault.is_none() {
                     if let Some(frame) = protocol.poll_outgoing_frame(now) {
-                        if frame.get(2).copied() == Some(0x32) && frame.get(6).copied() == Some(0x05) {
+                        if frame.get(2).copied() == Some(0x32)
+                            && frame.get(6).copied() == Some(0x05)
+                        {
                             rf_logln!(
                                 "rf_link_service sending ELRS model id on {}: {:02X?}",
                                 args.dev_name,
@@ -789,7 +807,12 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                 let rc_due = last_rc_frame_at
                     .map(|last| now.saturating_duration_since(last) >= CRSF_RC_FRAME_INTERVAL)
                     .unwrap_or(true);
-                if serial_fault.is_none() && !protocol.bind_active() && rc_due {
+                // WiFi 模式激活时模块已切换到 WiFi，不再处理 CRSF 帧；停发 RC 帧避免无效占用 UART。
+                if serial_fault.is_none()
+                    && !protocol.bind_active()
+                    && !ui_state.config.wifi_manual_on
+                    && rc_due
+                {
                     if let Some(msg) = latest_mixer_out {
                         crsf_chn_values[0] = mixer_out_to_crsf(msg.aileron);
                         crsf_chn_values[1] = mixer_out_to_crsf(msg.elevator);
@@ -831,12 +854,35 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                                         "rf_link_service received ELRS device info: {:02X?}",
                                         frame
                                     ),
-                                    0x2B => rf_logln!(
-                                        "rf_link_service received ELRS param entry: {:02X?}",
-                                        frame
-                                    ),
+                                    0x2B => {
+                                        let field_id = frame.get(5).copied().unwrap_or(0);
+                                        let chunks_remain = frame.get(6).copied().unwrap_or(0);
+                                        let kind_raw = frame.get(8).copied().unwrap_or(0);
+                                        let label_bytes = frame.get(9..).unwrap_or(&[]);
+                                        let label_len = label_bytes
+                                            .iter()
+                                            .position(|&b| b == 0)
+                                            .unwrap_or(label_bytes.len().saturating_sub(1));
+                                        let label = core::str::from_utf8(&label_bytes[..label_len])
+                                            .unwrap_or("?");
+                                        // COMMAND(0x0D) 允许 chunks_remain>0；其余类型需要完整数据
+                                        let dropped = chunks_remain != 0 && kind_raw != 0x0D;
+                                        rf_logln!(
+                                            "rf_link_service param entry field={:#04X} \
+                                             chunks_rem={} kind={:#04X} label={:?} {}",
+                                            field_id,
+                                            chunks_remain,
+                                            kind_raw,
+                                            label,
+                                            if dropped {
+                                                "[DROPPED-multichunk]"
+                                            } else {
+                                                "[parsed]"
+                                            }
+                                        );
+                                    }
                                     0x2E => rf_logln!(
-                                        "rf_link_service received ELRS command status: {:02X?}",
+                                        "rf_link_service received ELRS link stat: {:02X?}",
                                         frame
                                     ),
                                     _ => {}
@@ -850,7 +896,7 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                                             status.aircraft_battery_percent,
                                             status_state.telemetry_is_stale()
                                         );
-                                        system_status_tx.send(status);
+                                    system_status_tx.send(status);
                                 }
                             }
                             if let Some(info) = protocol.device_info() {
@@ -1023,7 +1069,14 @@ fn build_elrs_state(
         .map(|info| info.name.clone())
         .unwrap_or_else(|| "ELRS/CRSF".to_string());
     let version = module_info
-        .map(|info| format!("{}.{}.{}", (info.sw_version >> 16) & 0xff, (info.sw_version >> 8) & 0xff, info.sw_version & 0xff))
+        .map(|info| {
+            format!(
+                "{}.{}.{}",
+                (info.sw_version >> 16) & 0xff,
+                (info.sw_version >> 8) & 0xff,
+                info.sw_version & 0xff
+            )
+        })
         .unwrap_or_else(|| "--".to_string());
     let link_state = if !ui_state.config.rf_output_enabled {
         "RF OFF".to_string()
@@ -1061,7 +1114,15 @@ fn build_elrs_state(
         editor_cursor,
         module_name,
         device_name: if let Some(info) = module_info {
-            format!("{} #{:08X}", if connected { "UART Connected" } else { "Disconnected" }, info.serial)
+            format!(
+                "{} #{:08X}",
+                if connected {
+                    "UART Connected"
+                } else {
+                    "Disconnected"
+                },
+                info.serial
+            )
         } else if connected {
             "UART Connected".to_string()
         } else {
@@ -1334,8 +1395,14 @@ mod tests {
 
     #[test]
     fn test_derive_elrs_model_id_is_stable() {
-        assert_eq!(derive_elrs_model_id("quad_x"), derive_elrs_model_id("quad_x"));
-        assert_ne!(derive_elrs_model_id("quad_x"), derive_elrs_model_id("fixed_wing"));
+        assert_eq!(
+            derive_elrs_model_id("quad_x"),
+            derive_elrs_model_id("quad_x")
+        );
+        assert_ne!(
+            derive_elrs_model_id("quad_x"),
+            derive_elrs_model_id("fixed_wing")
+        );
     }
 }
 
