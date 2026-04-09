@@ -6,13 +6,13 @@ use crc::{Crc, CRC_8_DVB_S2};
 pub const CRSF_SYNC: u8 = 0xC8;
 pub const MODULE_ADDRESS: u8 = 0xEE;
 pub const RADIO_ADDRESS: u8 = 0xEA;
+pub const ELRS_HANDSET_ADDRESS: u8 = 0xEF;
 pub const COMMAND_ID: u8 = 0x32;
 pub const SUBCOMMAND_CRSF: u8 = 0x10;
 pub const SUBCOMMAND_CRSF_BIND: u8 = 0x01;
 pub const COMMAND_MODEL_SELECT_ID: u8 = 0x05;
 
 const CRSF_D5_CRC: Crc<u8> = Crc::<u8>::new(&CRC_8_DVB_S2);
-const BIND_FRAME_BURST_COUNT: u8 = 1;
 const BIND_FRAME_INTERVAL: Duration = Duration::from_millis(120);
 const BIND_SETTLE_INTERVAL: Duration = Duration::from_millis(400);
 const PARAM_FRAME_INTERVAL: Duration = Duration::from_millis(80);
@@ -84,6 +84,7 @@ pub struct ParamEntry {
 pub struct ElrsProtocolRuntime {
     bind_frames_remaining: u8,
     bind_frames_total: u8,
+    bind_command_pending: bool,
     last_bind_frame_at: Option<Instant>,
     bind_settle_until: Option<Instant>,
     last_param_frame_at: Option<Instant>,
@@ -104,6 +105,7 @@ impl Default for ElrsProtocolRuntime {
         Self {
             bind_frames_remaining: 0,
             bind_frames_total: 0,
+            bind_command_pending: false,
             last_bind_frame_at: None,
             bind_settle_until: None,
             last_param_frame_at: None,
@@ -127,13 +129,22 @@ impl ElrsProtocolRuntime {
             ElrsOperation::EnterBind => {
                 if self.bind_active() {
                     ElrsOperationStatus::Busy("Bind already in progress")
-                } else {
-                    self.bind_frames_remaining = BIND_FRAME_BURST_COUNT;
-                    self.bind_frames_total = BIND_FRAME_BURST_COUNT;
+                } else if let Some(id) = self.find_command_param(&["Bind"]) {
+                    self.outgoing_queue.push_back(build_parameter_command_frame(
+                        MODULE_ADDRESS,
+                        id,
+                        1,
+                    ));
+                    self.bind_frames_remaining = 1;
+                    self.bind_frames_total = 1;
+                    self.bind_command_pending = true;
                     self.last_bind_frame_at = None;
                     self.bind_settle_until = None;
-                    self.last_status = Some("Bind request queued".to_string());
-                    ElrsOperationStatus::Queued("Bind request queued")
+                    self.last_status = Some("Bind command queued".to_string());
+                    ElrsOperationStatus::Queued("Bind command queued")
+                } else {
+                    self.request_refresh();
+                    ElrsOperationStatus::Unsupported("Bind command unavailable")
                 }
             }
             ElrsOperation::SetWifiManual(enable) => {
@@ -207,11 +218,13 @@ impl ElrsProtocolRuntime {
                 .bind_settle_until
                 .map(|deadline| Instant::now() < deadline)
                 .unwrap_or(false)
+            || self.bind_command_pending
     }
 
     pub fn clear_ephemeral(&mut self) {
         self.bind_frames_remaining = 0;
         self.bind_frames_total = 0;
+        self.bind_command_pending = false;
         self.last_bind_frame_at = None;
         self.bind_settle_until = None;
         self.outgoing_queue.clear();
@@ -233,7 +246,7 @@ impl ElrsProtocolRuntime {
     }
 
     pub fn poll_outgoing_frame(&mut self, now: Instant) -> Option<Vec<u8>> {
-        if self.bind_frames_remaining > 0 {
+        if self.bind_frames_remaining > 0 && !self.bind_command_pending {
             if let Some(last) = self.last_bind_frame_at {
                 if now.saturating_duration_since(last) < BIND_FRAME_INTERVAL {
                     return None;
@@ -262,6 +275,12 @@ impl ElrsProtocolRuntime {
         }
 
         if let Some(frame) = self.outgoing_queue.pop_front() {
+            if self.bind_command_pending {
+                self.bind_command_pending = false;
+                self.bind_frames_remaining = self.bind_frames_remaining.saturating_sub(1);
+                self.bind_settle_until = Some(now + BIND_SETTLE_INTERVAL);
+                self.last_status = Some("Bind command sent".to_string());
+            }
             self.last_param_frame_at = Some(now);
             return Some(frame);
         }
@@ -360,7 +379,10 @@ impl ElrsProtocolRuntime {
     fn find_command_param(&self, labels: &[&str]) -> Option<u8> {
         self.params
             .values()
-            .find(|param| matches!(param.kind, ParamKind::Command) && labels.iter().any(|label| param.label == *label))
+            .find(|param| {
+                matches!(param.kind, ParamKind::Command)
+                    && labels.iter().any(|label| param.label == *label)
+            })
             .map(|param| param.id)
     }
 
@@ -374,7 +396,10 @@ impl ElrsProtocolRuntime {
     fn find_string_param(&self, labels: &[&str]) -> Option<u8> {
         self.params
             .values()
-            .find(|param| matches!(param.kind, ParamKind::String) && labels.iter().any(|label| param.label == *label))
+            .find(|param| {
+                matches!(param.kind, ParamKind::String)
+                    && labels.iter().any(|label| param.label == *label)
+            })
             .map(|param| param.id)
     }
 }
@@ -421,18 +446,45 @@ fn build_device_ping_frame(destination: u8) -> Vec<u8> {
 }
 
 fn build_request_settings_frame(destination: u8) -> Vec<u8> {
-    build_extended_frame(PARAM_REQUEST_SETTINGS_ID, &[RADIO_ADDRESS, destination])
+    build_extended_frame(
+        PARAM_REQUEST_SETTINGS_ID,
+        &[destination, parameter_handset_address(destination)],
+    )
 }
 
 fn build_parameter_read_frame(destination: u8, field_id: u8, chunk: u8) -> Vec<u8> {
-    build_extended_frame(PARAM_READ_ID, &[RADIO_ADDRESS, destination, field_id, chunk])
+    build_extended_frame(
+        PARAM_READ_ID,
+        &[
+            destination,
+            parameter_handset_address(destination),
+            field_id,
+            chunk,
+        ],
+    )
 }
 
 fn build_parameter_write_frame(destination: u8, field_id: u8, value: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(4 + value.len());
-    payload.extend_from_slice(&[RADIO_ADDRESS, destination, field_id]);
+    payload.extend_from_slice(&[
+        destination,
+        parameter_handset_address(destination),
+        field_id,
+    ]);
     payload.extend_from_slice(value);
     build_extended_frame(PARAM_WRITE_ID, &payload)
+}
+
+fn build_parameter_command_frame(destination: u8, field_id: u8, status: u8) -> Vec<u8> {
+    build_parameter_write_frame(destination, field_id, &[status])
+}
+
+fn parameter_handset_address(destination: u8) -> u8 {
+    if destination == MODULE_ADDRESS {
+        ELRS_HANDSET_ADDRESS
+    } else {
+        RADIO_ADDRESS
+    }
 }
 
 fn build_extended_frame(frame_type: u8, payload: &[u8]) -> Vec<u8> {
@@ -446,7 +498,10 @@ fn build_extended_frame(frame_type: u8, payload: &[u8]) -> Vec<u8> {
 }
 
 fn parse_device_info(frame: &[u8]) -> Option<DeviceInfo> {
-    if frame.len() < 10 || frame[2] != PARAM_DEVICE_INFO_ID || frame.get(4).copied()? != MODULE_ADDRESS {
+    if frame.len() < 10
+        || frame[2] != PARAM_DEVICE_INFO_ID
+        || frame.get(4).copied()? != MODULE_ADDRESS
+    {
         return None;
     }
     let name_size = frame[1].checked_sub(18)? as usize;
@@ -497,7 +552,10 @@ fn parse_parameter_entry(frame: &[u8]) -> Option<ParamEntry> {
                 .collect();
             cursor = options_end + 1;
             let current = *frame.get(cursor)?;
-            value = options.get(current as usize).cloned().unwrap_or_else(|| current.to_string());
+            value = options
+                .get(current as usize)
+                .cloned()
+                .unwrap_or_else(|| current.to_string());
         }
         ParamKind::Command => {
             if let Some(status_start) = cursor.checked_add(2) {
@@ -507,7 +565,8 @@ fn parse_parameter_entry(frame: &[u8]) -> Option<ParamEntry> {
                         .position(|byte| *byte == 0)
                         .map(|offset| status_start + offset)
                         .unwrap_or(frame.len().saturating_sub(1));
-                    let status = String::from_utf8_lossy(&frame[status_start..status_end]).to_string();
+                    let status =
+                        String::from_utf8_lossy(&frame[status_start..status_end]).to_string();
                     if !status.is_empty() {
                         value = status.clone();
                         command_status = Some(status);
@@ -596,9 +655,10 @@ fn crc8_ba(data: &[u8]) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_crossfire_bind_frame, build_crossfire_model_id_frame, build_parameter_write_frame,
-        crc8_ba, parse_parameter_entry, ElrsOperation, ElrsProtocolRuntime, MODULE_ADDRESS,
-        PARAM_SETTINGS_ENTRY_ID, RADIO_ADDRESS,
+        build_crossfire_bind_frame, build_crossfire_model_id_frame, build_parameter_read_frame,
+        build_parameter_write_frame, crc8_ba, parse_parameter_entry, ElrsOperation,
+        ElrsProtocolRuntime, ParamEntry, ParamKind, ELRS_HANDSET_ADDRESS, MODULE_ADDRESS,
+        PARAM_SETTINGS_ENTRY_ID,
     };
     use std::time::{Duration, Instant};
 
@@ -624,19 +684,57 @@ mod tests {
     }
 
     #[test]
-    fn test_bind_request_queues_burst() {
+    fn test_bind_request_queues_command_when_available() {
         let mut runtime = ElrsProtocolRuntime::default();
+        runtime.params.insert(
+            17,
+            ParamEntry {
+                id: 17,
+                parent: 0,
+                kind: ParamKind::Command,
+                label: "Bind".to_string(),
+                options: Vec::new(),
+                value: String::new(),
+                command_status: None,
+            },
+        );
         let status = runtime.request(ElrsOperation::EnterBind);
-        assert_eq!(status.message(), "Bind request queued");
+        assert_eq!(status.message(), "Bind command queued");
         assert!(runtime.bind_active());
     }
 
     #[test]
     fn test_parse_select_parameter_entry() {
         let frame = vec![
-            0xC8, 0x18, PARAM_SETTINGS_ENTRY_ID, 0xEA, 0xEE, 0x07, 0x00, 0x06, 0x09, b'M', b'a',
-            b'x', b' ', b'P', b'o', b'w', b'e', b'r', 0, b'1', b'0', b';', b'2', b'5', 0, 0x01,
-            0x00, 0x02, 0x00,
+            0xC8,
+            0x18,
+            PARAM_SETTINGS_ENTRY_ID,
+            0xEA,
+            0xEE,
+            0x07,
+            0x00,
+            0x06,
+            0x09,
+            b'M',
+            b'a',
+            b'x',
+            b' ',
+            b'P',
+            b'o',
+            b'w',
+            b'e',
+            b'r',
+            0,
+            b'1',
+            b'0',
+            b';',
+            b'2',
+            b'5',
+            0,
+            0x01,
+            0x00,
+            0x02,
+            0x00,
         ];
         let entry = parse_parameter_entry(&frame).expect("entry");
         assert_eq!(entry.label, "Max Power");
@@ -645,11 +743,19 @@ mod tests {
     }
 
     #[test]
+    fn test_build_parameter_read_frame_uses_device_then_handset() {
+        assert_eq!(
+            build_parameter_read_frame(MODULE_ADDRESS, 0x3E, 0),
+            vec![0xC8, 0x06, 0x2C, 0xEE, 0xEF, 0x3E, 0x00, 0x1A]
+        );
+    }
+
+    #[test]
     fn test_build_parameter_write_frame_contains_field_id_and_value() {
         let frame = build_parameter_write_frame(MODULE_ADDRESS, 7, &[2]);
         assert_eq!(frame[2], 0x2D);
-        assert_eq!(frame[3], RADIO_ADDRESS);
-        assert_eq!(frame[4], MODULE_ADDRESS);
+        assert_eq!(frame[3], MODULE_ADDRESS);
+        assert_eq!(frame[4], ELRS_HANDSET_ADDRESS);
         assert_eq!(frame[5], 7);
         assert_eq!(frame[6], 2);
     }
@@ -657,6 +763,18 @@ mod tests {
     #[test]
     fn test_bind_active_stays_true_during_settle_window() {
         let mut runtime = ElrsProtocolRuntime::default();
+        runtime.params.insert(
+            17,
+            ParamEntry {
+                id: 17,
+                parent: 0,
+                kind: ParamKind::Command,
+                label: "Bind".to_string(),
+                options: Vec::new(),
+                value: String::new(),
+                command_status: None,
+            },
+        );
         runtime.request(ElrsOperation::EnterBind);
         let frame = runtime.poll_outgoing_frame(Instant::now());
         assert!(frame.is_some());
@@ -678,10 +796,10 @@ mod tests {
         let mut runtime = ElrsProtocolRuntime::default();
         runtime.params.insert(
             9,
-            super::ParamEntry {
+            ParamEntry {
                 id: 9,
                 parent: 0,
-                kind: super::ParamKind::String,
+                kind: ParamKind::String,
                 label: "Bind Phrase".to_string(),
                 options: Vec::new(),
                 value: String::new(),

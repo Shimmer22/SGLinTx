@@ -2,287 +2,119 @@
 
 ## Current Status
 
-- `RF output` logic is working.
-- `bind` is still not confirmed working.
-- `module wifi` is still not working.
 - Current working UART baudrate for the TX module is `115200`.
-- `420000` did not show usable responses in current tests.
-- After the latest scheduler changes, `DEVICE_INFO` now appears quickly and reliably after `RF output` is enabled.
+- `bind` is now confirmed working on the current hardware.
+- This checkpoint intentionally keeps only the minimal ELRS `bind` fix.
+- Later WiFi exploration was reverted and is not part of this checkpoint.
 
-## Confirmed Good
+## Verified Result
 
-- RF defaults to `OFF`.
-- RF UART opens only after enabling `RF output`.
-- Disabling `RF output` closes UART and stops RF traffic.
-- Startup `magicnum` packet has been removed.
-- `DEVICE_INFO` from TX module is reachable at `115200`.
-- Bind frame format has been corrected to match EdgeTX style.
-- `ModelID` is now sent immediately after RF enable and is no longer fixed to `0`.
-- RC channel traffic is now rate-limited and no longer floods the UART on every mixer update.
+The user has verified that `bind` works after the protocol changes in this checkpoint.
 
-## Confirmed From Logs
+Observed device info from logs includes:
 
-At `115200`, the TX module responds with `DEVICE_INFO`, for example:
+- module name `DuplicateTX ESP`
+- ELRS version `3.2.1`
 
-- `DuplicateTX ESP`
-- version `3.2.1`
+This confirms that:
 
-This means:
+- UART communication with the TX module is working at `115200`
+- CRSF parameter traffic is reaching the module
+- the corrected ELRS 3.x bind path is accepted by the module
 
-- UART wiring is basically correct.
-- Baudrate `115200` is correct for the current setup.
-- CRSF communication is partially working.
+## What Was Wrong
 
-## Current Known Problems
-
-### 1. Bind still does not complete
-
-Current bind frame being sent:
+The older implementation assumed a fixed raw bind command frame:
 
 ```text
 C8 07 32 EE EA 10 01 14 EB
 ```
 
-This frame was previously wrong and has already been corrected.
+That frame is a valid CRSF command frame, but it is not the ELRS 3.x bind path used by the upstream Lua tooling.
 
-Remaining issue:
+For ELRS 3.x, bind is triggered through the parameter protocol:
 
-- The frame is sent, but receiver binding still does not complete.
-- Current implementation sends a single bind frame and now keeps a short post-bind quiet window.
-- It is still unclear whether this module needs:
-  - a longer bind hold behavior,
-  - an even quieter post-bind window,
-  - or some additional prerequisite state.
-- Current test evidence suggests the TX module may still effectively be operating in phrase-based behavior, because:
-  - a RX configured with the same phrase can connect,
-  - a RX with no phrase, left in legacy bind mode, still does not bind,
-  - and LinTx still cannot write the module's actual bind phrase because parameter enumeration is not working.
+- discover module parameters
+- find the `Bind` command field
+- execute it with a `0x2D` parameter command write
 
-### 2. WiFi parameter is unavailable
+## Cross-Checked References
 
-Current UI symptom:
+This checkpoint was cross-checked against two references:
 
-- `Module WiFi` always stays `OFF`
-- Enter / left / right reports `WiFi command unavailable`
+- OpenTX Crossfire scripts in `../opentx`
+- ExpressLRS `3.2.1` Lua implementation
 
-Direct protocol reason:
+The important conclusion from those references is:
 
-- We can receive `0x29 DEVICE_INFO`
-- But we are not receiving any `0x2B PARAM ENTRY`
+- ELRS `3.2.1` bind is not a fixed hardcoded raw bind frame
+- the TX module uses dynamic parameter fields
+- the bind trigger is a command field executed through `0x2D`
+- for TX module `0xEE`, the handset/source side should be `0xEF`
 
-That means:
+## Code Changes Kept In This Checkpoint
 
-- Module discovery works
-- Parameter tree enumeration does not work yet
-- Therefore labels like `Enable WiFi`, `Enter WiFi`, `Disable WiFi`, `Exit WiFi` are never discovered
+Only the minimum bind-related protocol fixes remain.
 
-## Work Already Done
+### 1. Bind now uses the ELRS 3.x parameter command path
 
-### RF / UI behavior
+Instead of always sending the old raw bind frame, LinTx now:
 
-- Added `rf_output_enabled` to config
-- Default RF state changed to `OFF`
-- RF UART is now gated by the ELRS app switch
-- UI shows RF state / link state / feedback
+- looks up the `Bind` command field from discovered parameters
+- queues a parameter command frame for that field
+- tracks bind progress through the existing bind-active flow
 
-### Removed startup side effects
+## 2. Extended parameter frame addressing was corrected
 
-- Removed old startup `magicnum` logic
-- Prevented immediate RF serial activity before the user enables RF output
-
-### Bind work
-
-- Corrected bind frame to:
+For ELRS parameter traffic, the address order was corrected to:
 
 ```text
-C8 07 32 EE EA 10 01 14 EB
+deviceId, handsetId
 ```
 
-- Stopped normal RC channel frame transmission while bind is active
-- Added bind feedback state based on telemetry link observation
-- Changed bind behavior from multi-burst to single-shot to align more closely with EdgeTX behavior
-- Extended bind-active handling to cover a short settle window so RC traffic stays suppressed immediately after bind
-- Fixed logging so only the actual bind command frame is logged as `sending bind frame`
+The TX module path now uses:
 
-### ELRS parameter discovery work
+- `deviceId = 0xEE`
+- `handsetId = 0xEF`
 
-- Added `PING_DEVICES (0x28)`
-- Added `DEVICE_INFO (0x29)` parsing
-- Added `PARAM ENTRY (0x2B)` parsing
-- Added `PARAM READ (0x2C)` sending
-- Added `PARAM WRITE (0x2D)` sending
-- Added `COMMAND STATUS (0x2E)` parsing
-- Added logging for outgoing and incoming ELRS parameter-related frames
-- Reduced repetitive log noise from periodic `PING (0x28)` and `PARAM_READ (0x2C)` traffic so useful events are easier to inspect
+This affects:
 
-### EdgeTX alignment work
+- `REQUEST_SETTINGS (0x2A)`
+- `PARAM_READ (0x2C)`
+- `PARAM_WRITE / COMMAND (0x2D)`
 
-- Added `ModelID` command before ping/param discovery
-- Added `REQUEST_SETTINGS (0x2A)` before parameter field reads
-- Changed `ModelID` from a fixed `0` to a stable model-derived value
-- Reworked RC transmission toward a periodic scheduler instead of flushing every queued mixer update
-- Adjusted protocol initialization order toward:
+## Representative Corrected Frames
+
+Correct parameter read example for TX module field `0x3E`:
 
 ```text
-ModelID -> Ping -> RequestSettings -> FieldRead
+C8 06 2C EE EF 3E 00 1A
 ```
 
-### Current attempt path
-
-This checkpoint focused on one path only:
-
-- make UART traffic less noisy and more EdgeTX-like
-- ensure protocol frames are not starved by RC channel writes
-- reduce misleading logs so the real protocol sequence is visible
-
-Concretely this attempt did:
-
-- rate-limit RC channel output to a fixed minimum interval
-- keep only the latest mixer state instead of flushing the full backlog
-- send protocol frames before RC frames
-- keep bind quiet time active after the bind frame is sent
-
-This path solved:
-
-- `DEVICE_INFO` can now be observed almost immediately after enabling RF
-- repeated fast bind clicking is no longer required to provoke module responses
-- logs are now much easier to read
-
-This path did not solve:
-
-- legacy bind to a no-phrase RX still does not complete
-- parameter enumeration still does not return any `0x2B PARAM ENTRY`
-- module phrase state still cannot be inspected or changed from LinTx
-
-## Important Observations
-
-### Observation A: `DEVICE_INFO` works, parameter tree does not
-
-Representative log pattern:
+Bind command execution now follows the same ELRS 3.x command path:
 
 ```text
-rf_link_service serial open ok on /dev/ttyS2 @ 115200 baud
-rf_link_service sending ELRS model id on /dev/ttyS2: [C8, 08, 32, EE, EA, 10, 05, 61, 42, 59]
-rf_link_service sending ELRS request settings on /dev/ttyS2: [C8, 04, 2A, EA, EE, 96]
-received ELRS device info: [EA, 1E, 29, ...]
+0x2D + { 0xEE, 0xEF, field_id, 1 }
 ```
 
-But no:
+where `field_id` is the discovered `Bind` command field.
 
-```text
-received ELRS param entry: ...
-```
+## Files Changed For This Checkpoint
 
-Interpretation:
-
-- The main unresolved issue for WiFi is parameter tree bring-up.
-- The scheduler improvements were enough to expose module responses reliably, so the remaining blocker is less likely to be raw UART starvation and more likely to be request format / protocol state.
-
-### Observation B: bind is sent, but immediately followed by other traffic
-
-Representative log pattern:
-
-```text
-sending bind frame 1/1 ...
-...
-received ELRS device info: [EA, 1E, 29, ...]
-```
-
-Interpretation:
-
-- This is no longer dominated by RC flood behavior.
-- The remaining bind failure now looks more like module-side state mismatch than pure scheduler starvation.
-- One strong hypothesis is: the TX module still has an active bind phrase, while the test RX is intentionally left in no-phrase legacy bind mode.
-
-### Observation C: bind phrase edits are still local only
-
-Representative UI/log pattern:
-
-```text
-Bind phrase saved locally; Bind phrase parameter unavailable
-```
-
-Interpretation:
-
-- LinTx local config can store a phrase string.
-- The actual TX module phrase is still not writable because no parameter entries are discovered.
-- Therefore current tests that depend on changing or clearing TX phrase from LinTx are not yet valid.
-
-## Probable Remaining Causes
-
-### For WiFi
-
-Most likely causes:
-
-- `0x2A REQUEST_SETTINGS` payload is still not exactly what the module expects
-- `0x2C FIELD READ` timing/order is still not what the module expects
-- parameter enumeration may require additional handshake or chunk behavior not yet implemented
-
-### For bind
-
-Most likely causes:
-
-- module-side stored bind phrase is still active, so legacy bind against a no-phrase RX is not expected to work
-- single-shot bind may still be insufficient for this specific module/firmware combination
-- bind may require a different state transition than the current `ModelID -> bind -> quiet -> discovery` sequence
-
-## Current Code State
-
-Main touched files:
-
-- `src/config/mod.rs`
 - `src/elrs/mod.rs`
-- `src/elrs_tx.rs`
-- `src/messages.rs`
-- `src/ui/apps/control.rs`
-- `src/ui/apps/scripts.rs`
-- `src/ui/backend/lvgl_core.rs`
+- `docs/elrs_debug_status.md`
 
-Latest commit for this checkpoint:
+No WiFi, UI, logging, or extra parameter-enumeration experiments are kept in this state.
 
-- pending new checkpoint commit
-- this document now describes the post-scheduler-tuning state, not the earlier `28a68c0` checkpoint
+## Validation
 
-## Recommended Next Steps
+Targeted ELRS tests pass:
 
-Choose one path at a time.
+```text
+cargo test elrs:: -- --nocapture
+```
 
-### Path 1: Finish WiFi / parameter tree
+At this checkpoint:
 
-Focus only on:
-
-- exact `0x2A REQUEST_SETTINGS` format
-- exact `0x2C` read sequence
-- whether chunked `0x2B` handling is missing behavior
-- compare with additional references such as OpenTX / ELRS Lua behavior, not only EdgeTX `crossfire.cpp`
-
-Success condition:
-
-- log starts showing `received ELRS param entry`
-
-### Path 2: Finish bind behavior
-
-Focus only on:
-
-- validate whether the TX module is still in phrase mode
-- test bind only after TX phrase is explicitly cleared outside LinTx
-- if phrase is truly cleared, then continue testing bind timing / repetition strategy
-
-Success condition:
-
-- RX successfully binds while already in bind mode with a known no-phrase TX state
-
-## Short Summary For Future Conversation
-
-Use this summary:
-
-- TX module works at `115200`
-- `DEVICE_INFO` works
-- scheduler tuning made `DEVICE_INFO` appear reliably right after RF enable
-- RF on/off logic is correct
-- bind frame format is corrected
-- bind logging was fixed; ping/read frames are no longer mislabeled as bind
-- bind still does not complete
-- current evidence suggests TX phrase state may still be the real blocker for legacy bind tests
-- WiFi still fails because parameter entries (`0x2B`) never come back
-- current likely issue is CRSF parameter-tree handshake/timing plus possible module phrase-state mismatch, not basic UART
+- `bind` is confirmed working by on-device testing
+- the remaining WiFi investigation is deferred to a later checkpoint
