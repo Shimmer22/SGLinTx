@@ -16,6 +16,7 @@ const CRSF_D5_CRC: Crc<u8> = Crc::<u8>::new(&CRC_8_DVB_S2);
 const BIND_FRAME_INTERVAL: Duration = Duration::from_millis(120);
 const BIND_SETTLE_INTERVAL: Duration = Duration::from_millis(400);
 const PARAM_FRAME_INTERVAL: Duration = Duration::from_millis(80);
+const WIFI_COMMAND_RETRY_INTERVAL: Duration = Duration::from_millis(180);
 const PARAM_MAX_FIELD_ID: u8 = 64;
 const PARAM_DEVICE_PING_ID: u8 = 0x28;
 const PARAM_DEVICE_INFO_ID: u8 = 0x29;
@@ -72,6 +73,66 @@ pub enum ParamKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandStep {
+    Ready,
+    Start,
+    Progress,
+    ConfirmationNeeded,
+    Confirm,
+    Cancel,
+    Poll,
+    Unknown(u8),
+}
+
+impl CommandStep {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::Ready,
+            1 => Self::Start,
+            2 => Self::Progress,
+            3 => Self::ConfirmationNeeded,
+            4 => Self::Confirm,
+            5 => Self::Cancel,
+            6 => Self::Poll,
+            other => Self::Unknown(other),
+        }
+    }
+
+    fn raw(&self) -> u8 {
+        match self {
+            Self::Ready => 0,
+            Self::Start => 1,
+            Self::Progress => 2,
+            Self::ConfirmationNeeded => 3,
+            Self::Confirm => 4,
+            Self::Cancel => 5,
+            Self::Poll => 6,
+            Self::Unknown(raw) => *raw,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Ready => "READY",
+            Self::Start => "START",
+            Self::Progress => "PROGRESS",
+            Self::ConfirmationNeeded => "CONFIRMATION_NEEDED",
+            Self::Confirm => "CONFIRM",
+            Self::Cancel => "CANCEL",
+            Self::Poll => "POLL",
+            Self::Unknown(_) => "UNKNOWN",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandStatus {
+    pub step: CommandStep,
+    pub timeout: u8,
+    pub info: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamEntry {
     pub id: u8,
     pub parent: u8,
@@ -79,7 +140,25 @@ pub struct ParamEntry {
     pub label: String,
     pub options: Vec<String>,
     pub value: String,
-    pub command_status: Option<String>,
+    pub command_status: Option<CommandStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingCommand {
+    field_id: u8,
+    action: PendingCommandAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingCommandAction {
+    WifiEnable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingParamChunk {
+    parent: u8,
+    kind_raw: u8,
+    data: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +179,9 @@ pub struct ElrsProtocolRuntime {
     outgoing_queue: VecDeque<Vec<u8>>,
     device_info: Option<DeviceInfo>,
     params: HashMap<u8, ParamEntry>,
+    pending_command: Option<PendingCommand>,
+    pending_param_chunks: HashMap<u8, PendingParamChunk>,
+    last_wifi_command_at: Option<Instant>,
 }
 
 impl Default for ElrsProtocolRuntime {
@@ -121,6 +203,9 @@ impl Default for ElrsProtocolRuntime {
             outgoing_queue: VecDeque::new(),
             device_info: None,
             params: HashMap::new(),
+            pending_command: None,
+            pending_param_chunks: HashMap::new(),
+            last_wifi_command_at: None,
         }
     }
 }
@@ -154,6 +239,9 @@ impl ElrsProtocolRuntime {
                     // ELRS 3.x 没有通过 CRSF 关闭 WiFi 的命令。
                     // 模块进入 WiFi 后必须断电重启才能恢复，无需发送帧。
                     // 返回 Queued 让调用方清除本地 wifi_manual_on 标志。
+                    self.drop_pending_wifi_frames();
+                    self.pending_command = None;
+                    self.last_wifi_command_at = None;
                     self.last_status = Some("WiFi state cleared".to_string());
                     return ElrsOperationStatus::Queued("WiFi state cleared");
                 }
@@ -161,13 +249,14 @@ impl ElrsProtocolRuntime {
                 // 精确标签匹配；若失败则回退到标签中包含 "wifi" 的任意 COMMAND 字段
                 let wifi_id = self
                     .find_command_param(labels)
-                    .or_else(|| self.find_wifi_command_fallback());
+                    .or_else(|| self.find_wifi_command_fallback())
+                    .or_else(|| self.find_pending_wifi_command(labels));
                 if let Some(id) = wifi_id {
-                    self.outgoing_queue.push_back(build_parameter_write_frame(
-                        MODULE_ADDRESS,
-                        id,
-                        &[1],
-                    ));
+                    self.queue_command_step(id, CommandStep::Start);
+                    self.pending_command = Some(PendingCommand {
+                        field_id: id,
+                        action: PendingCommandAction::WifiEnable,
+                    });
                     self.last_status = Some("WiFi command queued".to_string());
                     ElrsOperationStatus::Queued("WiFi command queued")
                 } else if self.device_info.is_some() {
@@ -238,6 +327,9 @@ impl ElrsProtocolRuntime {
         self.last_bind_frame_at = None;
         self.bind_settle_until = None;
         self.outgoing_queue.clear();
+        self.pending_command = None;
+        self.pending_param_chunks.clear();
+        self.last_wifi_command_at = None;
     }
 
     pub fn request_refresh(&mut self) {
@@ -291,8 +383,31 @@ impl ElrsProtocolRuntime {
                 self.bind_settle_until = Some(now + BIND_SETTLE_INTERVAL);
                 self.last_status = Some("Bind command sent".to_string());
             }
+            if is_pending_wifi_start_frame(self.pending_command.as_ref(), &frame) {
+                self.last_wifi_command_at = Some(now);
+            }
             self.last_param_frame_at = Some(now);
             return Some(frame);
+        }
+
+        if let Some(PendingCommand {
+            field_id,
+            action: PendingCommandAction::WifiEnable,
+        }) = self.pending_command.as_ref()
+        {
+            let retry_due = self
+                .last_wifi_command_at
+                .map(|last| now.saturating_duration_since(last) >= WIFI_COMMAND_RETRY_INTERVAL)
+                .unwrap_or(true);
+            if retry_due {
+                self.last_wifi_command_at = Some(now);
+                self.last_param_frame_at = Some(now);
+                return Some(build_parameter_command_frame(
+                    MODULE_ADDRESS,
+                    *field_id,
+                    CommandStep::Start.raw(),
+                ));
+            }
         }
 
         if self.model_id_pending {
@@ -321,6 +436,7 @@ impl ElrsProtocolRuntime {
                 self.param_refresh_requested = false;
                 self.next_param_read_id = 1;
                 self.params.clear();
+                self.pending_param_chunks.clear();
             }
             return Some(build_device_ping_frame(MODULE_ADDRESS));
         }
@@ -369,7 +485,10 @@ impl ElrsProtocolRuntime {
                 }
             }
             PARAM_SETTINGS_ENTRY_ID => {
-                if let Some(entry) = parse_parameter_entry(frame) {
+                if let Some(entry) = self.consume_parameter_frame(frame) {
+                    if let Some(status_text) = self.update_pending_command(&entry) {
+                        self.last_status = Some(status_text);
+                    }
                     self.params.insert(entry.id, entry);
                 }
             }
@@ -397,6 +516,41 @@ impl ElrsProtocolRuntime {
                     && labels.iter().any(|label| param.label == *label)
             })
             .map(|param| param.id)
+    }
+
+    fn find_pending_wifi_command(&self, labels: &[&str]) -> Option<u8> {
+        self.pending_param_chunks
+            .iter()
+            .find_map(|(&field_id, pending)| {
+                if !matches!(parse_param_kind(pending.kind_raw), ParamKind::Command) {
+                    return None;
+                }
+                let label_end = pending
+                    .data
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .unwrap_or(pending.data.len());
+                let label = String::from_utf8_lossy(&pending.data[..label_end]).to_string();
+                if labels.iter().any(|expected| *expected == label) {
+                    return Some(field_id);
+                }
+                let lower = label.to_ascii_lowercase();
+                let matches_wifi_prefix = lower.contains("wifi")
+                    || (lower.len() >= 6
+                        && [
+                            "enable wifi",
+                            "enter wifi",
+                            "wifi update",
+                            "wifi connectivity",
+                        ]
+                        .iter()
+                        .any(|full| full.starts_with(lower.as_str())));
+                if matches_wifi_prefix {
+                    Some(field_id)
+                } else {
+                    None
+                }
+            })
     }
 
     fn find_select_param(&self, labels: &[&str]) -> Option<&ParamEntry> {
@@ -446,6 +600,122 @@ impl ElrsProtocolRuntime {
                         .any(|full| full.starts_with(lower.as_str()))
             })
             .map(|param| param.id)
+    }
+
+    fn queue_command_step(&mut self, field_id: u8, step: CommandStep) {
+        self.outgoing_queue.push_back(build_parameter_command_frame(
+            MODULE_ADDRESS,
+            field_id,
+            step.raw(),
+        ));
+    }
+
+    fn drop_pending_wifi_frames(&mut self) {
+        self.outgoing_queue.retain(|frame| {
+            frame.get(2).copied() != Some(PARAM_WRITE_ID)
+                || frame.get(6).copied() != Some(CommandStep::Start.raw())
+        });
+    }
+
+    fn update_pending_command(&mut self, entry: &ParamEntry) -> Option<String> {
+        let Some(pending) = self.pending_command.clone() else {
+            return None;
+        };
+        if pending.field_id != entry.id {
+            return None;
+        }
+        let Some(status) = entry.command_status.as_ref() else {
+            return None;
+        };
+        match (&pending.action, &status.step) {
+            (PendingCommandAction::WifiEnable, CommandStep::Ready) => {
+                self.pending_command = None;
+                self.last_wifi_command_at = None;
+                Some(format!(
+                    "WiFi command ready{}",
+                    suffix_info(&status.info)
+                ))
+            }
+            (PendingCommandAction::WifiEnable, CommandStep::Progress) => Some(format!(
+                "WiFi command in progress{}",
+                suffix_info(&status.info)
+            )),
+            (PendingCommandAction::WifiEnable, CommandStep::ConfirmationNeeded) => {
+                self.queue_command_step(entry.id, CommandStep::Confirm);
+                Some(format!(
+                    "WiFi command confirm queued{}",
+                    suffix_info(&status.info)
+                ))
+            }
+            (PendingCommandAction::WifiEnable, CommandStep::Poll) => {
+                self.queue_command_step(entry.id, CommandStep::Poll);
+                Some(format!(
+                    "WiFi command poll queued{}",
+                    suffix_info(&status.info)
+                ))
+            }
+            (PendingCommandAction::WifiEnable, CommandStep::Cancel) => {
+                self.pending_command = None;
+                self.last_wifi_command_at = None;
+                Some(format!(
+                    "WiFi command canceled{}",
+                    suffix_info(&status.info)
+                ))
+            }
+            (PendingCommandAction::WifiEnable, CommandStep::Start) => Some(format!(
+                "WiFi command started{}",
+                suffix_info(&status.info)
+            )),
+            (PendingCommandAction::WifiEnable, CommandStep::Confirm) => Some(format!(
+                "WiFi command confirming{}",
+                suffix_info(&status.info)
+            )),
+            (PendingCommandAction::WifiEnable, CommandStep::Unknown(raw)) => Some(format!(
+                "WiFi command status 0x{raw:02X}{}",
+                suffix_info(&status.info)
+            )),
+        }
+    }
+
+    fn consume_parameter_frame(&mut self, frame: &[u8]) -> Option<ParamEntry> {
+        if frame.len() < 11 || frame[2] != PARAM_SETTINGS_ENTRY_ID {
+            return None;
+        }
+        let field_id = *frame.get(5)?;
+        let chunks_remain = *frame.get(6)?;
+        let parent = *frame.get(7)?;
+        let kind_raw = *frame.get(8)?;
+        let data = frame.get(9..frame.len().saturating_sub(1))?;
+
+        if chunks_remain > 0 {
+            let slot = self
+                .pending_param_chunks
+                .entry(field_id)
+                .or_insert_with(|| PendingParamChunk {
+                    parent,
+                    kind_raw,
+                    data: Vec::new(),
+                });
+            if slot.parent != parent || slot.kind_raw != kind_raw {
+                slot.parent = parent;
+                slot.kind_raw = kind_raw;
+                slot.data.clear();
+            }
+            slot.data.extend_from_slice(data);
+            return None;
+        }
+
+        if let Some(mut pending) = self.pending_param_chunks.remove(&field_id) {
+            if pending.parent == parent && pending.kind_raw == kind_raw {
+                pending.data.extend_from_slice(data);
+                let assembled = build_parameter_entry_frame(field_id, parent, kind_raw, &pending.data);
+                parse_parameter_entry(&assembled)
+            } else {
+                parse_parameter_entry(frame)
+            }
+        } else {
+            parse_parameter_entry(frame)
+        }
     }
 }
 
@@ -524,6 +794,35 @@ fn build_parameter_command_frame(destination: u8, field_id: u8, status: u8) -> V
     build_parameter_write_frame(destination, field_id, &[status])
 }
 
+fn build_parameter_entry_frame(field_id: u8, parent: u8, kind_raw: u8, data: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(data.len() + 10);
+    frame.push(CRSF_SYNC);
+    frame.push((data.len() + 7) as u8);
+    frame.push(PARAM_SETTINGS_ENTRY_ID);
+    frame.push(RADIO_ADDRESS);
+    frame.push(MODULE_ADDRESS);
+    frame.push(field_id);
+    frame.push(0);
+    frame.push(parent);
+    frame.push(kind_raw);
+    frame.extend_from_slice(data);
+    frame.push(0);
+    frame
+}
+
+fn is_pending_wifi_start_frame(pending: Option<&PendingCommand>, frame: &[u8]) -> bool {
+    let Some(PendingCommand {
+        field_id,
+        action: PendingCommandAction::WifiEnable,
+    }) = pending
+    else {
+        return false;
+    };
+    frame.get(2).copied() == Some(PARAM_WRITE_ID)
+        && frame.get(5).copied() == Some(*field_id)
+        && frame.get(6).copied() == Some(CommandStep::Start.raw())
+}
+
 fn parameter_handset_address(destination: u8) -> u8 {
     if destination == MODULE_ADDRESS {
         ELRS_HANDSET_ADDRESS
@@ -592,7 +891,8 @@ fn parse_parameter_entry(frame: &[u8]) -> Option<ParamEntry> {
     // ELRS 使用 8 字节数据块。COMMAND 类型首 chunk 的 label 末尾可能落在下一个 chunk
     // 中，导致本帧内找不到 null 终止符。此时用所有可用字节作截断 label 存入 params，
     // find_wifi_command_fallback 用前缀匹配仍可识别（"enable wifi".starts_with("enable w")）。
-    let label_end = match frame[cursor..].iter().position(|byte| *byte == 0) {
+    let label_terminated = frame[cursor..].iter().position(|byte| *byte == 0);
+    let label_end = match label_terminated {
         Some(pos) => pos + cursor,
         None => {
             if chunks_remain != 0 && matches!(kind, ParamKind::Command) {
@@ -603,7 +903,11 @@ fn parse_parameter_entry(frame: &[u8]) -> Option<ParamEntry> {
         }
     };
     let label = String::from_utf8_lossy(&frame[cursor..label_end]).to_string();
-    cursor = label_end + 1;
+    cursor = if label_terminated.is_some() {
+        label_end + 1
+    } else {
+        frame.len().saturating_sub(1)
+    };
 
     let mut options = Vec::new();
     let mut value = String::new();
@@ -625,19 +929,43 @@ fn parse_parameter_entry(frame: &[u8]) -> Option<ParamEntry> {
                 .unwrap_or_else(|| current.to_string());
         }
         ParamKind::Command => {
-            if let Some(status_start) = cursor.checked_add(2) {
-                if status_start < frame.len().saturating_sub(1) {
-                    let status_end = frame[status_start..]
-                        .iter()
-                        .position(|byte| *byte == 0)
-                        .map(|offset| status_start + offset)
-                        .unwrap_or(frame.len().saturating_sub(1));
-                    let status =
-                        String::from_utf8_lossy(&frame[status_start..status_end]).to_string();
-                    if !status.is_empty() {
-                        value = status.clone();
-                        command_status = Some(status);
-                    }
+            if label_terminated.is_none() {
+                return Some(ParamEntry {
+                    id: field_id,
+                    parent,
+                    kind,
+                    label,
+                    options,
+                    value,
+                    command_status,
+                });
+            }
+            let step_raw = *frame.get(cursor)?;
+            let timeout = frame.get(cursor + 1).copied().unwrap_or_default();
+            let info_start = cursor.saturating_add(2);
+            let info = frame
+                .get(info_start..frame.len().saturating_sub(1))
+                .map(|slice| {
+                    let end = slice.iter().position(|byte| *byte == 0).unwrap_or(slice.len());
+                    String::from_utf8_lossy(&slice[..end]).to_string()
+                })
+                .unwrap_or_default();
+            let step = CommandStep::from_raw(step_raw);
+            value = if info.is_empty() {
+                step.label().to_string()
+            } else {
+                format!("{} {}", step.label(), info)
+            };
+            command_status = Some(CommandStatus {
+                step,
+                timeout,
+                info,
+            });
+            if chunks_remain != 0 {
+                // 多 chunk COMMAND 的 info 字符串可能不完整；保留 step/timeout 语义，
+                // 后续 chunk=0 的完整 entry 会覆盖。
+                if let Some(status) = command_status.as_mut() {
+                    status.info = status.info.trim_end_matches(char::from(0)).to_string();
                 }
             }
         }
@@ -661,6 +989,14 @@ fn parse_parameter_entry(frame: &[u8]) -> Option<ParamEntry> {
         value,
         command_status,
     })
+}
+
+fn suffix_info(info: &str) -> String {
+    if info.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", info)
+    }
 }
 
 fn parse_param_kind(kind: u8) -> ParamKind {
@@ -707,9 +1043,9 @@ fn crc8_ba(data: &[u8]) -> u8 {
 mod tests {
     use super::{
         build_crossfire_bind_frame, build_crossfire_model_id_frame, build_parameter_read_frame,
-        build_parameter_write_frame, crc8_ba, parse_parameter_entry, ElrsOperation,
-        ElrsProtocolRuntime, ParamEntry, ParamKind, ELRS_HANDSET_ADDRESS, MODULE_ADDRESS,
-        PARAM_SETTINGS_ENTRY_ID,
+        build_parameter_write_frame, crc8_ba, parse_parameter_entry, CommandStep,
+        ElrsOperation, ElrsProtocolRuntime, ParamEntry, ParamKind, ELRS_HANDSET_ADDRESS,
+        MODULE_ADDRESS, PARAM_SETTINGS_ENTRY_ID,
     };
     use std::time::{Duration, Instant};
 
@@ -791,6 +1127,75 @@ mod tests {
         assert_eq!(entry.label, "Max Power");
         assert_eq!(entry.options, vec!["10".to_string(), "25".to_string()]);
         assert_eq!(entry.value, "25");
+    }
+
+    #[test]
+    fn test_parse_command_parameter_entry_extracts_step_timeout_and_info() {
+        let frame = vec![
+            0xC8,
+            0x19,
+            PARAM_SETTINGS_ENTRY_ID,
+            0xEA,
+            0xEE,
+            0x0F,
+            0x00,
+            0x00,
+            0x0D,
+            b'E',
+            b'n',
+            b'a',
+            b'b',
+            b'l',
+            b'e',
+            b' ',
+            b'W',
+            b'i',
+            b'F',
+            b'i',
+            0x00,
+            0x06,
+            0x14,
+            b'W',
+            b'a',
+            b'i',
+            b't',
+            0x00,
+            0x00,
+        ];
+        let entry = parse_parameter_entry(&frame).expect("command entry");
+        let status = entry.command_status.expect("command status");
+        assert_eq!(entry.label, "Enable WiFi");
+        assert_eq!(status.step, CommandStep::Poll);
+        assert_eq!(status.timeout, 0x14);
+        assert_eq!(status.info, "Wait");
+        assert_eq!(entry.value, "POLL Wait");
+    }
+
+    #[test]
+    fn test_parse_multichunk_command_entry_keeps_truncated_label() {
+        let frame = vec![
+            0xC8,
+            0x11,
+            PARAM_SETTINGS_ENTRY_ID,
+            0xEA,
+            0xEE,
+            0x0F,
+            0x01,
+            0x00,
+            0x0D,
+            b'E',
+            b'n',
+            b'a',
+            b'b',
+            b'l',
+            b'e',
+            b' ',
+            b'W',
+            0xAA,
+        ];
+        let entry = parse_parameter_entry(&frame).expect("multichunk command entry");
+        assert_eq!(entry.label, "Enable W");
+        assert!(entry.command_status.is_none());
     }
 
     #[test]
@@ -954,6 +1359,190 @@ mod tests {
     }
 
     #[test]
+    fn test_wifi_enable_allows_followup_protocol_traffic_for_recovery() {
+        let mut runtime = ElrsProtocolRuntime::default();
+        runtime.device_info = Some(super::DeviceInfo {
+            name: "DuplicateTX ESP".to_string(),
+            serial: 0,
+            hw_version: 3,
+            sw_version: (3 << 16) | (2 << 8) | 1,
+            field_count: 19,
+            is_elrs: true,
+        });
+        runtime.params.insert(
+            15,
+            ParamEntry {
+                id: 15,
+                parent: 0,
+                kind: ParamKind::Command,
+                label: "Enable WiFi".to_string(),
+                options: Vec::new(),
+                value: String::new(),
+                command_status: None,
+            },
+        );
+        runtime.request_refresh();
+
+        let status = runtime.request(ElrsOperation::SetWifiManual(true));
+        assert_eq!(status.message(), "WiFi command queued");
+
+        let frame = runtime
+            .poll_outgoing_frame(Instant::now() + Duration::from_secs(1))
+            .expect("WiFi command frame should be queued");
+        assert_eq!(frame[2], 0x2D, "first frame must be the WiFi PARAM_WRITE");
+
+        let followup = runtime.poll_outgoing_frame(Instant::now() + Duration::from_secs(2));
+        assert!(
+            followup.is_some(),
+            "runtime should continue protocol recovery traffic after WiFi command"
+        );
+    }
+
+    #[test]
+    fn test_wifi_enable_poll_status_queues_followup_poll_frame() {
+        let mut runtime = ElrsProtocolRuntime::default();
+        runtime.device_info = Some(super::DeviceInfo {
+            name: "DuplicateTX ESP".to_string(),
+            serial: 0,
+            hw_version: 3,
+            sw_version: (3 << 16) | (2 << 8) | 1,
+            field_count: 19,
+            is_elrs: true,
+        });
+        runtime.params.insert(
+            15,
+            ParamEntry {
+                id: 15,
+                parent: 0,
+                kind: ParamKind::Command,
+                label: "Enable WiFi".to_string(),
+                options: Vec::new(),
+                value: String::new(),
+                command_status: None,
+            },
+        );
+
+        let status = runtime.request(ElrsOperation::SetWifiManual(true));
+        assert_eq!(status.message(), "WiFi command queued");
+
+        let start = runtime
+            .poll_outgoing_frame(Instant::now() + Duration::from_secs(1))
+            .expect("start frame");
+        assert_eq!(start[2], 0x2D);
+        assert_eq!(start[6], CommandStep::Start.raw());
+
+        let poll_status = vec![
+            0xC8,
+            0x18,
+            PARAM_SETTINGS_ENTRY_ID,
+            0xEA,
+            0xEE,
+            0x0F,
+            0x00,
+            0x00,
+            0x0D,
+            b'E',
+            b'n',
+            b'a',
+            b'b',
+            b'l',
+            b'e',
+            b' ',
+            b'W',
+            b'i',
+            b'F',
+            b'i',
+            0x00,
+            0x06,
+            0x05,
+            b'W',
+            b'a',
+            b'i',
+            b't',
+            0x00,
+        ];
+        runtime.consume_frame(&poll_status);
+
+        let poll = runtime
+            .poll_outgoing_frame(Instant::now() + Duration::from_secs(2))
+            .expect("poll frame");
+        assert_eq!(poll[2], 0x2D);
+        assert_eq!(poll[5], 0x0F);
+        assert_eq!(poll[6], CommandStep::Poll.raw());
+    }
+
+    #[test]
+    fn test_wifi_enable_confirmation_status_queues_confirm_frame() {
+        let mut runtime = ElrsProtocolRuntime::default();
+        runtime.device_info = Some(super::DeviceInfo {
+            name: "DuplicateTX ESP".to_string(),
+            serial: 0,
+            hw_version: 3,
+            sw_version: (3 << 16) | (2 << 8) | 1,
+            field_count: 19,
+            is_elrs: true,
+        });
+        runtime.params.insert(
+            15,
+            ParamEntry {
+                id: 15,
+                parent: 0,
+                kind: ParamKind::Command,
+                label: "Enable WiFi".to_string(),
+                options: Vec::new(),
+                value: String::new(),
+                command_status: None,
+            },
+        );
+
+        runtime.request(ElrsOperation::SetWifiManual(true));
+        let _ = runtime.poll_outgoing_frame(Instant::now() + Duration::from_secs(1));
+
+        let confirm_status = vec![
+            0xC8,
+            0x1D,
+            PARAM_SETTINGS_ENTRY_ID,
+            0xEA,
+            0xEE,
+            0x0F,
+            0x00,
+            0x00,
+            0x0D,
+            b'E',
+            b'n',
+            b'a',
+            b'b',
+            b'l',
+            b'e',
+            b' ',
+            b'W',
+            b'i',
+            b'F',
+            b'i',
+            0x00,
+            0x03,
+            0x05,
+            b'C',
+            b'o',
+            b'n',
+            b'f',
+            b'i',
+            b'r',
+            b'm',
+            0x00,
+            0x00,
+        ];
+        runtime.consume_frame(&confirm_status);
+
+        let confirm = runtime
+            .poll_outgoing_frame(Instant::now() + Duration::from_secs(2))
+            .expect("confirm frame");
+        assert_eq!(confirm[2], 0x2D);
+        assert_eq!(confirm[5], 0x0F);
+        assert_eq!(confirm[6], CommandStep::Confirm.raw());
+    }
+
+    #[test]
     fn test_wifi_disable_returns_queued_without_sending_frame() {
         // SetWifiManual(false) should return Queued immediately, no frame enqueued
         let mut runtime = ElrsProtocolRuntime::default();
@@ -969,5 +1558,151 @@ mod tests {
                 "disable WiFi must not enqueue a PARAM_WRITE frame"
             );
         }
+    }
+
+    #[test]
+    fn test_multichunk_wifi_command_remains_usable_after_final_chunk() {
+        let mut runtime = ElrsProtocolRuntime::default();
+        runtime.device_info = Some(super::DeviceInfo {
+            name: "DuplicateTX ESP".to_string(),
+            serial: 0,
+            hw_version: 3,
+            sw_version: (3 << 16) | (2 << 8) | 1,
+            field_count: 19,
+            is_elrs: true,
+        });
+
+        let first = vec![
+            0xC8, 0x11, PARAM_SETTINGS_ENTRY_ID, 0xEA, 0xEE, 0x0F, 0x01, 0x00, 0x0D, b'E', b'n',
+            b'a', b'b', b'l', b'e', b' ', b'W', 0x00,
+        ];
+        let second = vec![
+            0xC8, 0x0E, PARAM_SETTINGS_ENTRY_ID, 0xEA, 0xEE, 0x0F, 0x00, 0x00, 0x0D, b'i', b'F',
+            b'i', 0x00, 0x00, 0x00,
+        ];
+
+        runtime.consume_frame(&first);
+        let status = runtime.request(ElrsOperation::SetWifiManual(true));
+        assert_eq!(status.message(), "WiFi command queued");
+        let first_frame = runtime
+            .poll_outgoing_frame(Instant::now() + Duration::from_secs(1))
+            .expect("first wifi command");
+        assert_eq!(first_frame[2], 0x2D);
+        assert_eq!(first_frame[5], 0x0F);
+        assert_eq!(first_frame[6], CommandStep::Start.raw());
+
+        runtime.consume_frame(&second);
+        let status = runtime.request(ElrsOperation::SetWifiManual(true));
+        assert_eq!(status.message(), "WiFi command queued");
+        let frame = runtime
+            .poll_outgoing_frame(Instant::now() + Duration::from_secs(2))
+            .expect("wifi command");
+        assert_eq!(frame[2], 0x2D);
+        assert_eq!(frame[5], 0x0F);
+        assert_eq!(frame[6], CommandStep::Start.raw());
+    }
+
+    #[test]
+    fn test_pending_wifi_first_chunk_is_usable_as_fallback_candidate() {
+        let mut runtime = ElrsProtocolRuntime::default();
+        runtime.device_info = Some(super::DeviceInfo {
+            name: "DuplicateTX ESP".to_string(),
+            serial: 0,
+            hw_version: 3,
+            sw_version: (3 << 16) | (2 << 8) | 1,
+            field_count: 19,
+            is_elrs: true,
+        });
+
+        let first = vec![
+            0xC8, 0x11, PARAM_SETTINGS_ENTRY_ID, 0xEA, 0xEE, 0x0F, 0x01, 0x00, 0x0D, b'E', b'n',
+            b'a', b'b', b'l', b'e', b' ', b'W', 0x00,
+        ];
+        runtime.consume_frame(&first);
+
+        let status = runtime.request(ElrsOperation::SetWifiManual(true));
+        assert_eq!(status.message(), "WiFi command queued");
+        let frame = runtime
+            .poll_outgoing_frame(Instant::now() + Duration::from_secs(1))
+            .expect("wifi command");
+        assert_eq!(frame[2], 0x2D);
+        assert_eq!(frame[5], 0x0F);
+        assert_eq!(frame[6], CommandStep::Start.raw());
+    }
+
+    #[test]
+    fn test_wifi_pending_retries_start_frame_periodically() {
+        let mut runtime = ElrsProtocolRuntime::default();
+        runtime.device_info = Some(super::DeviceInfo {
+            name: "DuplicateTX ESP".to_string(),
+            serial: 0,
+            hw_version: 3,
+            sw_version: (3 << 16) | (2 << 8) | 1,
+            field_count: 19,
+            is_elrs: true,
+        });
+        runtime.params.insert(
+            15,
+            ParamEntry {
+                id: 15,
+                parent: 0,
+                kind: ParamKind::Command,
+                label: "Enable WiFi".to_string(),
+                options: Vec::new(),
+                value: String::new(),
+                command_status: None,
+            },
+        );
+
+        runtime.request(ElrsOperation::SetWifiManual(true));
+        let first = runtime
+            .poll_outgoing_frame(Instant::now() + Duration::from_secs(1))
+            .expect("first start");
+        assert_eq!(first[2], 0x2D);
+        assert_eq!(first[5], 0x0F);
+        assert_eq!(first[6], CommandStep::Start.raw());
+
+        let retry = runtime
+            .poll_outgoing_frame(Instant::now() + Duration::from_secs(2))
+            .expect("retry start");
+        assert_eq!(retry[2], 0x2D);
+        assert_eq!(retry[5], 0x0F);
+        assert_eq!(retry[6], CommandStep::Start.raw());
+    }
+
+    #[test]
+    fn test_wifi_disable_clears_queued_start_frames() {
+        let mut runtime = ElrsProtocolRuntime::default();
+        runtime.device_info = Some(super::DeviceInfo {
+            name: "DuplicateTX ESP".to_string(),
+            serial: 0,
+            hw_version: 3,
+            sw_version: (3 << 16) | (2 << 8) | 1,
+            field_count: 19,
+            is_elrs: true,
+        });
+        runtime.params.insert(
+            15,
+            ParamEntry {
+                id: 15,
+                parent: 0,
+                kind: ParamKind::Command,
+                label: "Enable WiFi".to_string(),
+                options: Vec::new(),
+                value: String::new(),
+                command_status: None,
+            },
+        );
+
+        runtime.request(ElrsOperation::SetWifiManual(true));
+        let status = runtime.request(ElrsOperation::SetWifiManual(false));
+        assert_eq!(status.message(), "WiFi state cleared");
+
+        let frame = runtime.poll_outgoing_frame(Instant::now() + Duration::from_secs(1));
+        assert!(
+            frame.map(|f| f[2] != 0x2D || f[5] != 0x0F || f[6] != CommandStep::Start.raw())
+                .unwrap_or(true),
+            "WiFi off should remove queued START frames"
+        );
     }
 }

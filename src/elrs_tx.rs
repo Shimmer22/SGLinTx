@@ -277,9 +277,10 @@ impl ElrsUiState {
                 if self.config.wifi_manual_on {
                     // WiFi 已开启 → 关闭：仅清除本地标志，无需 CRSF 命令
                     // （ELRS 模块进入 WiFi 后需断电重启，本身没有 CRSF disable 命令）
+                    let status = protocol.request(ElrsOperation::SetWifiManual(false));
                     self.config.wifi_manual_on = false;
                     let _ = self.persist();
-                    "WiFi state cleared".to_string()
+                    status.message().to_string()
                 } else {
                     // WiFi 未开启 → 尝试开启：需要 UART 连接才能发送参数命令
                     if !self.config.rf_output_enabled {
@@ -867,19 +868,42 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                                             .unwrap_or("?");
                                         // COMMAND(0x0D) 允许 chunks_remain>0；其余类型需要完整数据
                                         let dropped = chunks_remain != 0 && kind_raw != 0x0D;
-                                        rf_logln!(
-                                            "rf_link_service param entry field={:#04X} \
-                                             chunks_rem={} kind={:#04X} label={:?} {}",
-                                            field_id,
-                                            chunks_remain,
-                                            kind_raw,
-                                            label,
-                                            if dropped {
-                                                "[DROPPED-multichunk]"
-                                            } else {
-                                                "[parsed]"
-                                            }
-                                        );
+                                        if kind_raw == 0x0D && !dropped {
+                                            let step_raw = frame.get(9 + label_len + 1).copied();
+                                            let timeout = frame.get(9 + label_len + 2).copied();
+                                            let info_bytes =
+                                                frame.get(9 + label_len + 3..).unwrap_or(&[]);
+                                            let info_len = info_bytes
+                                                .iter()
+                                                .position(|&b| b == 0)
+                                                .unwrap_or(info_bytes.len().saturating_sub(1));
+                                            let info = core::str::from_utf8(&info_bytes[..info_len])
+                                                .unwrap_or("?");
+                                            rf_logln!(
+                                                "rf_link_service param command field={:#04X} \
+                                                 chunks_rem={} label={:?} step={:#04X} timeout={} info={:?}",
+                                                field_id,
+                                                chunks_remain,
+                                                label,
+                                                step_raw.unwrap_or(0),
+                                                timeout.unwrap_or(0),
+                                                info
+                                            );
+                                        } else {
+                                            rf_logln!(
+                                                "rf_link_service param entry field={:#04X} \
+                                                 chunks_rem={} kind={:#04X} label={:?} {}",
+                                                field_id,
+                                                chunks_remain,
+                                                kind_raw,
+                                                label,
+                                                if dropped {
+                                                    "[DROPPED-multichunk]"
+                                                } else {
+                                                    "[parsed]"
+                                                }
+                                            );
+                                        }
                                     }
                                     0x2E => rf_logln!(
                                         "rf_link_service received ELRS link stat: {:02X?}",

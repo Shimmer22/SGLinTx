@@ -5,6 +5,8 @@
 - Current working UART baudrate for the TX module is `115200`.
 - ELRS `bind` is confirmed working on current hardware.
 - ELRS `WiFi enable` path is now root-caused and fixed in protocol/runtime logic.
+- ELRS `WiFi on` on this module is reliable only when the command is retried continuously while the module remains in CRSF mode.
+- ELRS `WiFi off` in UI is a **local/runtime clear only**; there is still no CRSF-side disable command in ELRS 3.x.
 - Remaining behavior is consistent with ELRS 3.x design:
   - entering WiFi is a parameter command
   - exiting WiFi is not a CRSF command path (module typically needs restart/reconnect path)
@@ -84,6 +86,17 @@ Key evidence:
 
 - Fallback matching based only on `contains("wifi")` fails on truncated first chunk (`"Enable W"` does not contain `"wifi"`).
 
+### Root Cause D — treating WiFi command as one-shot was insufficient on this TX module
+
+- Although `field=0x0F` was the correct WiFi command field, a single `PARAM_WRITE 0x2D ... 0F 01` did not keep this module in WiFi mode reliably.
+- Empirical board behavior showed the module only entered/stayed in WiFi when the same `START` command was retried continuously.
+
+### Root Cause E — strict “wait for full multi-chunk assembly” regressed real hardware behavior
+
+- The first `COMMAND` chunk (`"Enable W"`) already exposes the correct `field_id=0x0F`.
+- Requiring the final chunk before exposing WiFi as executable caused repeated `WiFi params loading, please wait` on this module.
+- For this module, first-chunk fallback is required for responsiveness; full assembly remains useful for later status/info updates.
+
 ---
 
 ## Fixes Applied
@@ -131,7 +144,69 @@ Effect:
 
 - WiFi command field (`0x0F`) is discoverable on chunked-label modules
 
-## 5. Runtime state improvements already aligned
+## 5. Multi-chunk parameter assembly now coexists with first-chunk WiFi fallback
+
+- parameter chunks are now assembled by `field_id` so later chunks do not corrupt earlier command discovery
+- fully assembled entries are still parsed and stored once `chunks_rem=0`
+- WiFi specifically is allowed to use the first `COMMAND` chunk as an executable fallback candidate when it already exposes the right field identity (`Enable W` -> `0x0F`)
+
+Effect:
+
+- avoids the earlier regression where WiFi stayed in `params loading`
+- preserves more correct full-entry parsing for command status/info
+
+## 6. COMMAND status parsing now matches EdgeTX/OpenTX CRSF expectations
+
+`COMMAND` entries are now parsed as:
+
+- `step`
+- `timeout`
+- `info`
+
+Instead of treating trailing bytes as a plain status string.
+
+Supported command steps now include:
+
+- `READY`
+- `START`
+- `PROGRESS`
+- `CONFIRMATION_NEEDED`
+- `CONFIRM`
+- `CANCEL`
+- `POLL`
+
+Effect:
+
+- runtime logs now show actual command-step bytes for ELRS commands
+- protocol can react to `POLL` / `CONFIRMATION_NEEDED` consistently
+
+## 7. WiFi `START` command is now retried continuously while pending
+
+Runtime behavior now:
+
+- when WiFi is requested and `field=0x0F` is known, runtime sends
+  - `C8 06 2D EE EF 0F 01 <crc>`
+- if the module has not yet reported command completion/cancel, runtime retries the same `START` command on a timer
+
+Effect observed on hardware:
+
+- this specific TX module reliably enters WiFi only under repeated `START`
+- one-shot send was not sufficient even though the field id was correct
+
+## 8. WiFi off now clears both pending state and queued retries
+
+- UI `WiFi off` still does **not** send a CRSF-side disable command
+- but runtime now clears:
+  - local `wifi_manual_on`
+  - pending WiFi command state
+  - already queued retry frames for `field=0x0F`
+
+Effect:
+
+- switching WiFi from `ON` to `OFF` in UI stops further repeated `0x0F 01` transmissions immediately
+- RF output disable / module reconnect still remain the hard reset path that returns the module to normal ELRS operation
+
+## 9. Runtime state improvements already aligned
 
 - WiFi enable sets local state only when command is actually queued.
 - WiFi mode active path suppresses RC frame streaming to avoid unnecessary serial traffic while module is in WiFi behavior.
@@ -188,6 +263,16 @@ Bind command verified with:
 [C8, 06, 2D, EE, EF, 11, 01, A5]
 ```
 
+WiFi command used on this module:
+
+```text
+[C8, 06, 2D, EE, EF, 0F, 01, 77]
+```
+
+Important practical note:
+
+- on this TX module, **continuous retry of the above WiFi `START` frame** was required to make WiFi entry reliable
+
 ---
 
 ## Files Changed (This Debug Round)
@@ -211,20 +296,37 @@ Result after fixes:
 
 - ELRS test set passes
 - bind flow still good
-- WiFi command discovery path no longer blocked by chunked-label edge case
-- logs now provide clearer `field/chunk/kind/label` visibility for future debugging
+- WiFi command discovery path is no longer blocked by chunked-label edge case
+- WiFi first-chunk fallback and full multi-chunk assembly now coexist
+- COMMAND status parsing is aligned with `step/timeout/info`
+- WiFi `START` retry behavior is covered by unit tests
+- WiFi `OFF` clears queued retry frames
+- logs now provide clearer `field/chunk/kind/label/step/timeout/info` visibility for future debugging
 
 ---
 
 ## Final Conclusion
 
 WiFi “卡住” was not caused by mixer RC output conflict as primary root cause.  
-Primary issue was **parameter discovery robustness** under chunked ELRS 0x2B entries, combined with strict label matching and incorrect scan limit assumptions.
+Primary issues were:
+
+- **parameter discovery robustness** under chunked ELRS `0x2B` entries
+- incorrect assumptions about when WiFi command discovery must wait for full assembly
+- incorrect assumptions that a single WiFi `START` frame was enough on this hardware
 
 After applying:
 
 - real `param_count` scan limit
 - COMMAND chunk-tolerant parsing
 - WiFi prefix fallback matching
+- proper COMMAND `step/timeout/info` parsing
+- WiFi first-chunk executable fallback
+- continuous WiFi `START` retry while pending
+- WiFi off queue cleanup
 
-the WiFi command path is structurally aligned with ELRS 3.2.1 behavior and no longer blocked by the previously observed “Enable W” truncated label case.
+the WiFi command path is aligned with the actual behavior of this ELRS 3.2.1 module:
+
+- WiFi entry uses `field=0x0F`
+- first chunk may be only `Enable W`
+- command completion is stateful
+- practical hardware behavior requires repeated `START` until the module fully leaves CRSF mode
