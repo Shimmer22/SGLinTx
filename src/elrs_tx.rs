@@ -17,7 +17,7 @@ use crate::{
     client_process_args,
     config::{store, ElrsUiConfig},
     elrs::{ElrsOperation, ElrsOperationStatus, ElrsProtocolRuntime, CRSF_SYNC},
-    messages::{ElrsCommandMsg, ElrsFeedbackMsg, ElrsStateMsg, SystemStatusMsg},
+    messages::{ActiveModelMsg, ElrsCommandMsg, ElrsFeedbackMsg, ElrsStateMsg, SystemStatusMsg},
     mixer::MixerOutMsg,
 };
 
@@ -33,6 +33,7 @@ const WRITE_TIMEOUT_LOG_EVERY: u32 = 50;
 const ELRS_STATE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const LINK_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(5);
 const BIND_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
+const CRSF_RC_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const DEFAULT_RF_UART: &str = "/dev/ttyS2";
 const DEFAULT_RF_LOG_PATH: &str = "/tmp/lintx-elrs/rf_link_service.log";
 const DEFAULT_BIND_PHRASE: &str = "654321";
@@ -166,7 +167,7 @@ impl ElrsUiState {
         connected: bool,
     ) -> String {
         if self.editor.is_some() {
-            return self.handle_editor_command(cmd);
+            return self.handle_editor_command(cmd, protocol, connected);
         }
 
         match cmd {
@@ -187,7 +188,12 @@ impl ElrsUiState {
         }
     }
 
-    fn handle_editor_command(&mut self, cmd: ElrsCommandMsg) -> String {
+    fn handle_editor_command(
+        &mut self,
+        cmd: ElrsCommandMsg,
+        protocol: &mut ElrsProtocolRuntime,
+        connected: bool,
+    ) -> String {
         if self.editor.is_none() {
             return "Edit unavailable".to_string();
         }
@@ -224,7 +230,23 @@ impl ElrsUiState {
                 self.config.bind_phrase = editor.as_string();
                 self.editor = None;
                 match self.persist() {
-                    Ok(()) => "Bind phrase saved".to_string(),
+                    Ok(()) => {
+                        if self.config.rf_output_enabled && connected {
+                            let status =
+                                protocol.request(ElrsOperation::SetBindPhrase(self.config.bind_phrase.clone()));
+                            match status {
+                                ElrsOperationStatus::Queued(_) => {
+                                    "Bind phrase saved and queued".to_string()
+                                }
+                                _ => format!(
+                                    "Bind phrase saved locally; {}",
+                                    status.message()
+                                ),
+                            }
+                        } else {
+                            "Bind phrase saved locally".to_string()
+                        }
+                    }
                     Err(err) => format!("Bind phrase save failed: {err}"),
                 }
             }
@@ -495,6 +517,20 @@ fn normalize_power_level(raw: u16) -> u16 {
         .unwrap_or(100)
 }
 
+fn derive_elrs_model_id(model_id: &str) -> u8 {
+    let mut hash = 0x811C9DC5u32;
+    for byte in model_id.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    (hash & 0xFF) as u8
+}
+
+fn load_active_model_id_for_elrs() -> u8 {
+    let model = store::load_active_model().unwrap_or_default();
+    derive_elrs_model_id(&model.id)
+}
+
 fn write_packet_with_timeout_tolerance(
     dev: &mut dyn serialport::SerialPort,
     payload: &[u8],
@@ -555,6 +591,7 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
 
     let mut mixer_out_rx = get_new_rx_of_message::<MixerOutMsg>("mixer_out").unwrap();
     let mut elrs_cmd_rx = get_new_rx_of_message::<ElrsCommandMsg>("elrs_cmd").unwrap();
+    let mut active_model_rx = get_new_rx_of_message::<ActiveModelMsg>("active_model").unwrap();
     let system_status_tx = get_new_tx_of_message::<SystemStatusMsg>("system_status").unwrap();
     let elrs_state_tx = get_new_tx_of_message::<ElrsStateMsg>("elrs_state").unwrap();
     let elrs_feedback_tx = get_new_tx_of_message::<ElrsFeedbackMsg>("elrs_feedback").unwrap();
@@ -569,11 +606,14 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
         let mut status_state = TelemetryStatusState::default();
         let mut ui_state = ElrsUiState::load();
         let mut protocol = ElrsProtocolRuntime::default();
+        protocol.set_model_id(load_active_model_id_for_elrs());
         let mut link_monitor = LinkMonitorState::default();
         let mut serial_buf = Vec::<u8>::new();
         let mut read_buf = [0u8; 256];
         let mut crsf_chn_values: [u16; 16] = [0; 16];
+        let mut latest_mixer_out: Option<MixerOutMsg> = None;
         let mut last_state = ElrsStateMsg::default();
+        let mut last_rc_frame_at: Option<Instant> = None;
         let mut write_timeout_count: u32 = 0;
         let mut last_state_heartbeat_at: Option<Instant> = Some(Instant::now());
         let mut ui_status_text = "RF output disabled".to_string();
@@ -581,6 +621,16 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
 
         loop {
             let now = Instant::now();
+
+            while let Some(model_msg) = active_model_rx.try_read() {
+                let model_id = derive_elrs_model_id(&model_msg.model.id);
+                protocol.set_model_id(model_id);
+                rf_logln!(
+                    "rf_link_service active model updated: {} -> ELRS model id {}",
+                    model_msg.model.id,
+                    model_id
+                );
+            }
 
             while let Some(cmd) = elrs_cmd_rx.try_read() {
                 let prev_rf_enabled = ui_state.config.rf_output_enabled;
@@ -675,33 +725,7 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
             let mut serial_fault: Option<String> = None;
             if let Some(dev) = dev.as_mut() {
                 while let Some(msg) = mixer_out_rx.try_read() {
-                    if protocol.bind_active() {
-                        continue;
-                    }
-                    crsf_chn_values[0] = mixer_out_to_crsf(msg.aileron);
-                    crsf_chn_values[1] = mixer_out_to_crsf(msg.elevator);
-                    crsf_chn_values[2] = mixer_out_to_crsf(msg.thrust);
-                    crsf_chn_values[3] = mixer_out_to_crsf(msg.direction);
-
-                    let raw_packet = new_rc_channel_packet(&crsf_chn_values);
-                    if let Err(err) = write_packet_with_timeout_tolerance(&mut **dev, raw_packet.data()) {
-                        if err.kind() == std::io::ErrorKind::TimedOut {
-                            write_timeout_count = write_timeout_count.saturating_add(1);
-                            if write_timeout_count % WRITE_TIMEOUT_LOG_EVERY == 1 {
-                                rf_logln!(
-                                    "rf_link_service write timeout on {} (count={})",
-                                    args.dev_name,
-                                    write_timeout_count
-                                );
-                            }
-                            continue;
-                        }
-                        write_timeout_count = 0;
-                        rf_logln!("rf_link_service write failed: {}", err);
-                        serial_fault = Some(format!("serial write error: {}", err));
-                        break;
-                    }
-                    write_timeout_count = 0;
+                    latest_mixer_out = Some(msg);
                 }
 
                 if serial_fault.is_none() {
@@ -712,26 +736,24 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                                 args.dev_name,
                                 frame
                             );
-                        } else if frame.get(2).copied() == Some(0x28) {
-                            rf_logln!(
-                                "rf_link_service sending ELRS ping on {}: {:02X?}",
-                                args.dev_name,
-                                frame
-                            );
                         } else if frame.get(2).copied() == Some(0x2A) {
                             rf_logln!(
                                 "rf_link_service sending ELRS request settings on {}: {:02X?}",
                                 args.dev_name,
                                 frame
                             );
-                        } else if matches!(frame.get(2).copied(), Some(0x2C | 0x2D)) {
+                        } else if frame.get(2).copied() == Some(0x2D) {
                             rf_logln!(
                                 "rf_link_service sending ELRS param frame type=0x{:02X} on {}: {:02X?}",
                                 frame[2],
                                 args.dev_name,
                                 frame
                             );
-                        } else if let Some((current, total)) = protocol.bind_progress() {
+                        } else if frame.get(2).copied() == Some(0x32)
+                            && frame.get(5).copied() == Some(0x10)
+                            && frame.get(6).copied() == Some(0x01)
+                        {
+                            let (current, total) = protocol.bind_progress().unwrap_or((1, 1));
                             rf_logln!(
                                 "rf_link_service sending bind frame {}/{} on {}: {:02X?}",
                                 current,
@@ -760,6 +782,41 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                         ui_state.bind_active = protocol.bind_active();
                         if let Some(status) = protocol.take_status_text() {
                             ui_status_text = status;
+                        }
+                    }
+                }
+
+                let rc_due = last_rc_frame_at
+                    .map(|last| now.saturating_duration_since(last) >= CRSF_RC_FRAME_INTERVAL)
+                    .unwrap_or(true);
+                if serial_fault.is_none() && !protocol.bind_active() && rc_due {
+                    if let Some(msg) = latest_mixer_out {
+                        crsf_chn_values[0] = mixer_out_to_crsf(msg.aileron);
+                        crsf_chn_values[1] = mixer_out_to_crsf(msg.elevator);
+                        crsf_chn_values[2] = mixer_out_to_crsf(msg.thrust);
+                        crsf_chn_values[3] = mixer_out_to_crsf(msg.direction);
+
+                        let raw_packet = new_rc_channel_packet(&crsf_chn_values);
+                        if let Err(err) =
+                            write_packet_with_timeout_tolerance(&mut **dev, raw_packet.data())
+                        {
+                            if err.kind() == std::io::ErrorKind::TimedOut {
+                                write_timeout_count = write_timeout_count.saturating_add(1);
+                                if write_timeout_count % WRITE_TIMEOUT_LOG_EVERY == 1 {
+                                    rf_logln!(
+                                        "rf_link_service write timeout on {} (count={})",
+                                        args.dev_name,
+                                        write_timeout_count
+                                    );
+                                }
+                            } else {
+                                write_timeout_count = 0;
+                                rf_logln!("rf_link_service write failed: {}", err);
+                                serial_fault = Some(format!("serial write error: {}", err));
+                            }
+                        } else {
+                            write_timeout_count = 0;
+                            last_rc_frame_at = Some(now);
                         }
                     }
                 }
@@ -829,6 +886,8 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                 }
             } else {
                 while mixer_out_rx.try_read().is_some() {}
+                latest_mixer_out = None;
+                last_rc_frame_at = None;
             }
 
             if let Some(err_text) = serial_fault {
@@ -1176,9 +1235,9 @@ fn now_unix_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_elrs_state, check_frame_crc, extract_crsf_frames, shift_power_level, EditorState,
-        ElrsUiState, LinkMonitorState, TelemetryStatusState, CRSF_CRC, CRSF_FRAME_BATTERY_ID,
-        CRSF_FRAME_LINK_ID, CRSF_SYNC,
+        build_elrs_state, check_frame_crc, derive_elrs_model_id, extract_crsf_frames,
+        shift_power_level, EditorState, ElrsUiState, LinkMonitorState, TelemetryStatusState,
+        CRSF_CRC, CRSF_FRAME_BATTERY_ID, CRSF_FRAME_LINK_ID, CRSF_SYNC,
     };
     use crate::elrs::ElrsProtocolRuntime;
     use std::time::Instant;
@@ -1271,6 +1330,12 @@ mod tests {
         assert_eq!(state.params[0].value, "OFF");
         assert_eq!(state.params[5].id, "link_state");
         assert_eq!(state.params[5].value, "RF OFF");
+    }
+
+    #[test]
+    fn test_derive_elrs_model_id_is_stable() {
+        assert_eq!(derive_elrs_model_id("quad_x"), derive_elrs_model_id("quad_x"));
+        assert_ne!(derive_elrs_model_id("quad_x"), derive_elrs_model_id("fixed_wing"));
     }
 }
 

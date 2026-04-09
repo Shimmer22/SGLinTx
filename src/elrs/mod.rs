@@ -10,7 +10,6 @@ pub const COMMAND_ID: u8 = 0x32;
 pub const SUBCOMMAND_CRSF: u8 = 0x10;
 pub const SUBCOMMAND_CRSF_BIND: u8 = 0x01;
 pub const COMMAND_MODEL_SELECT_ID: u8 = 0x05;
-pub const DEFAULT_MODEL_ID: u8 = 0x00;
 
 const CRSF_D5_CRC: Crc<u8> = Crc::<u8>::new(&CRC_8_DVB_S2);
 const BIND_FRAME_BURST_COUNT: u8 = 1;
@@ -86,12 +85,14 @@ pub struct ElrsProtocolRuntime {
     bind_frames_remaining: u8,
     bind_frames_total: u8,
     last_bind_frame_at: Option<Instant>,
+    bind_settle_until: Option<Instant>,
     last_param_frame_at: Option<Instant>,
     last_ping_at: Option<Instant>,
     last_status: Option<String>,
     param_refresh_requested: bool,
     model_id_pending: bool,
     settings_request_pending: bool,
+    current_model_id: u8,
     next_param_read_id: u8,
     outgoing_queue: VecDeque<Vec<u8>>,
     device_info: Option<DeviceInfo>,
@@ -104,12 +105,14 @@ impl Default for ElrsProtocolRuntime {
             bind_frames_remaining: 0,
             bind_frames_total: 0,
             last_bind_frame_at: None,
+            bind_settle_until: None,
             last_param_frame_at: None,
             last_ping_at: None,
             last_status: None,
             param_refresh_requested: true,
             model_id_pending: true,
             settings_request_pending: true,
+            current_model_id: 0,
             next_param_read_id: 1,
             outgoing_queue: VecDeque::new(),
             device_info: None,
@@ -128,6 +131,7 @@ impl ElrsProtocolRuntime {
                     self.bind_frames_remaining = BIND_FRAME_BURST_COUNT;
                     self.bind_frames_total = BIND_FRAME_BURST_COUNT;
                     self.last_bind_frame_at = None;
+                    self.bind_settle_until = None;
                     self.last_status = Some("Bind request queued".to_string());
                     ElrsOperationStatus::Queued("Bind request queued")
                 }
@@ -176,8 +180,19 @@ impl ElrsProtocolRuntime {
                     Some(format!("TX power request queued: {}", param_options[index]));
                 ElrsOperationStatus::Queued("TX power request queued")
             }
-            ElrsOperation::SetBindPhrase(_value) => {
-                ElrsOperationStatus::Unsupported("Bind phrase write not wired to CRSF yet")
+            ElrsOperation::SetBindPhrase(value) => {
+                if let Some(id) = self.find_string_param(&["Bind Phrase"]) {
+                    self.outgoing_queue.push_back(build_parameter_write_frame(
+                        MODULE_ADDRESS,
+                        id,
+                        value.as_bytes(),
+                    ));
+                    self.last_status = Some("Bind phrase write queued".to_string());
+                    ElrsOperationStatus::Queued("Bind phrase write queued")
+                } else {
+                    self.request_refresh();
+                    ElrsOperationStatus::Unsupported("Bind phrase parameter unavailable")
+                }
             }
             ElrsOperation::RefreshParams => {
                 self.request_refresh();
@@ -188,12 +203,17 @@ impl ElrsProtocolRuntime {
 
     pub fn bind_active(&self) -> bool {
         self.bind_frames_remaining > 0
+            || self
+                .bind_settle_until
+                .map(|deadline| Instant::now() < deadline)
+                .unwrap_or(false)
     }
 
     pub fn clear_ephemeral(&mut self) {
         self.bind_frames_remaining = 0;
         self.bind_frames_total = 0;
         self.last_bind_frame_at = None;
+        self.bind_settle_until = None;
         self.outgoing_queue.clear();
     }
 
@@ -202,6 +222,14 @@ impl ElrsProtocolRuntime {
         self.model_id_pending = true;
         self.settings_request_pending = true;
         self.last_ping_at = None;
+    }
+
+    pub fn set_model_id(&mut self, model_id: u8) {
+        if self.current_model_id != model_id {
+            self.current_model_id = model_id;
+            self.model_id_pending = true;
+            self.last_status = Some(format!("ELRS model id set to {}", model_id));
+        }
     }
 
     pub fn poll_outgoing_frame(&mut self, now: Instant) -> Option<Vec<u8>> {
@@ -214,15 +242,17 @@ impl ElrsProtocolRuntime {
             self.last_bind_frame_at = Some(now);
             self.bind_frames_remaining = self.bind_frames_remaining.saturating_sub(1);
             if self.bind_frames_remaining == 0 {
+                self.bind_settle_until = Some(now + BIND_SETTLE_INTERVAL);
                 self.last_status = Some("Bind command burst sent".to_string());
             }
             return Some(build_crossfire_bind_frame(MODULE_ADDRESS));
         }
 
-        if let Some(last) = self.last_bind_frame_at {
-            if now.saturating_duration_since(last) < BIND_SETTLE_INTERVAL {
+        if let Some(deadline) = self.bind_settle_until {
+            if now < deadline {
                 return None;
             }
+            self.bind_settle_until = None;
         }
 
         if let Some(last) = self.last_param_frame_at {
@@ -239,7 +269,10 @@ impl ElrsProtocolRuntime {
         if self.model_id_pending {
             self.model_id_pending = false;
             self.last_param_frame_at = Some(now);
-            return Some(build_crossfire_model_id_frame(MODULE_ADDRESS, DEFAULT_MODEL_ID));
+            return Some(build_crossfire_model_id_frame(
+                MODULE_ADDRESS,
+                self.current_model_id,
+            ));
         }
 
         if self.settings_request_pending && self.device_info.is_some() {
@@ -336,6 +369,13 @@ impl ElrsProtocolRuntime {
             matches!(param.kind, ParamKind::Select)
                 && labels.iter().any(|label| param.label == *label)
         })
+    }
+
+    fn find_string_param(&self, labels: &[&str]) -> Option<u8> {
+        self.params
+            .values()
+            .find(|param| matches!(param.kind, ParamKind::String) && labels.iter().any(|label| param.label == *label))
+            .map(|param| param.id)
     }
 }
 
@@ -560,6 +600,7 @@ mod tests {
         crc8_ba, parse_parameter_entry, ElrsOperation, ElrsProtocolRuntime, MODULE_ADDRESS,
         PARAM_SETTINGS_ENTRY_ID, RADIO_ADDRESS,
     };
+    use std::time::{Duration, Instant};
 
     #[test]
     fn test_crc8_ba_known_value() {
@@ -593,9 +634,9 @@ mod tests {
     #[test]
     fn test_parse_select_parameter_entry() {
         let frame = vec![
-            0xC8, 0x17, PARAM_SETTINGS_ENTRY_ID, 0xEA, 0xEE, 0x07, 0x06, 0x09, b'M', b'a', b'x',
-            b' ', b'P', b'o', b'w', b'e', b'r', 0, b'1', b'0', b';', b'2', b'5', 0, 0x01, 0x00,
-            0x02, 0x00,
+            0xC8, 0x18, PARAM_SETTINGS_ENTRY_ID, 0xEA, 0xEE, 0x07, 0x00, 0x06, 0x09, b'M', b'a',
+            b'x', b' ', b'P', b'o', b'w', b'e', b'r', 0, b'1', b'0', b';', b'2', b'5', 0, 0x01,
+            0x00, 0x02, 0x00,
         ];
         let entry = parse_parameter_entry(&frame).expect("entry");
         assert_eq!(entry.label, "Max Power");
@@ -611,5 +652,49 @@ mod tests {
         assert_eq!(frame[4], MODULE_ADDRESS);
         assert_eq!(frame[5], 7);
         assert_eq!(frame[6], 2);
+    }
+
+    #[test]
+    fn test_bind_active_stays_true_during_settle_window() {
+        let mut runtime = ElrsProtocolRuntime::default();
+        runtime.request(ElrsOperation::EnterBind);
+        let frame = runtime.poll_outgoing_frame(Instant::now());
+        assert!(frame.is_some());
+        assert!(runtime.bind_active());
+    }
+
+    #[test]
+    fn test_model_id_update_changes_next_model_id_frame() {
+        let mut runtime = ElrsProtocolRuntime::default();
+        runtime.set_model_id(7);
+        let frame = runtime
+            .poll_outgoing_frame(Instant::now() + Duration::from_secs(1))
+            .expect("model id frame");
+        assert_eq!(frame, build_crossfire_model_id_frame(MODULE_ADDRESS, 7));
+    }
+
+    #[test]
+    fn test_bind_phrase_write_queues_string_param_when_available() {
+        let mut runtime = ElrsProtocolRuntime::default();
+        runtime.params.insert(
+            9,
+            super::ParamEntry {
+                id: 9,
+                parent: 0,
+                kind: super::ParamKind::String,
+                label: "Bind Phrase".to_string(),
+                options: Vec::new(),
+                value: String::new(),
+                command_status: None,
+            },
+        );
+        let status = runtime.request(ElrsOperation::SetBindPhrase("abc123".to_string()));
+        assert_eq!(status.message(), "Bind phrase write queued");
+        let frame = runtime
+            .poll_outgoing_frame(Instant::now() + Duration::from_secs(1))
+            .expect("queued frame");
+        assert_eq!(frame[2], 0x2D);
+        assert_eq!(frame[5], 9);
+        assert_eq!(&frame[6..12], b"abc123");
     }
 }
