@@ -219,9 +219,7 @@ fn apply_local_adjust(frame: &mut UiFrame, cfg: &mut LocalElrsConfig, delta: isi
                 "WiFi config save failed"
             }
         }
-        2 => {
-            "Bind feedback requires rf_link_service"
-        }
+        2 => "Bind feedback requires rf_link_service",
         3 => {
             cfg.tx_power_mw = shift_power_level(cfg.tx_power_mw, delta);
             if save_local_config(cfg).is_ok() {

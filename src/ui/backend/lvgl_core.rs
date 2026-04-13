@@ -1265,7 +1265,12 @@ impl LvglUiCore {
                 &lvgl_sys::lv_font_montserrat_14 as *const _ as *const lvgl_sys::lv_font_t,
                 0,
             );
-            lvgl_sys::lv_obj_align(app_badge_label, lvgl_sys::LV_ALIGN_TOP_RIGHT as u8, Self::to_coord(-14), Self::to_coord(14));
+            lvgl_sys::lv_obj_align(
+                app_badge_label,
+                lvgl_sys::LV_ALIGN_TOP_RIGHT as u8,
+                Self::to_coord(-14),
+                Self::to_coord(14),
+            );
 
             let app_title_label = lvgl_sys::lv_label_create(app_header_card);
             lvgl_sys::lv_obj_set_style_text_color(
@@ -1383,12 +1388,24 @@ impl LvglUiCore {
                 let row_card = lvgl_sys::lv_obj_create(app_panel);
                 let y = 212 + i as i32 * (row_height + row_spacing);
                 lvgl_sys::lv_obj_set_pos(row_card, Self::to_coord(14), Self::to_coord(y));
-                lvgl_sys::lv_obj_set_size(row_card, Self::to_coord(width - 28), Self::to_coord(row_height));
+                lvgl_sys::lv_obj_set_size(
+                    row_card,
+                    Self::to_coord(width - 28),
+                    Self::to_coord(row_height),
+                );
                 lvgl_sys::lv_obj_set_style_radius(row_card, 8, 0);
-                lvgl_sys::lv_obj_set_style_bg_color(row_card, lvgl_sys::_LV_COLOR_MAKE(34, 36, 42), 0);
+                lvgl_sys::lv_obj_set_style_bg_color(
+                    row_card,
+                    lvgl_sys::_LV_COLOR_MAKE(34, 36, 42),
+                    0,
+                );
                 lvgl_sys::lv_obj_set_style_bg_opa(row_card, 255, 0);
                 lvgl_sys::lv_obj_set_style_border_width(row_card, 1, 0);
-                lvgl_sys::lv_obj_set_style_border_color(row_card, lvgl_sys::_LV_COLOR_MAKE(34, 36, 42), 0);
+                lvgl_sys::lv_obj_set_style_border_color(
+                    row_card,
+                    lvgl_sys::_LV_COLOR_MAKE(34, 36, 42),
+                    0,
+                );
                 lvgl_sys::lv_obj_clear_flag(row_card, lvgl_sys::LV_OBJ_FLAG_SCROLLABLE);
                 lvgl_sys::lv_obj_set_scrollbar_mode(
                     row_card,
@@ -1406,9 +1423,17 @@ impl LvglUiCore {
                     &lvgl_sys::lv_font_montserrat_14 as *const _ as *const lvgl_sys::lv_font_t,
                     0,
                 );
-                lvgl_sys::lv_label_set_long_mode(key_label, lvgl_sys::LV_LABEL_LONG_CLIP as lvgl_sys::lv_label_long_mode_t);
+                lvgl_sys::lv_label_set_long_mode(
+                    key_label,
+                    lvgl_sys::LV_LABEL_LONG_CLIP as lvgl_sys::lv_label_long_mode_t,
+                );
                 lvgl_sys::lv_obj_set_width(key_label, Self::to_coord((width - 60) / 2));
-                lvgl_sys::lv_obj_align(key_label, lvgl_sys::LV_ALIGN_LEFT_MID as u8, Self::to_coord(12), 0);
+                lvgl_sys::lv_obj_align(
+                    key_label,
+                    lvgl_sys::LV_ALIGN_LEFT_MID as u8,
+                    Self::to_coord(12),
+                    0,
+                );
 
                 let val_label = lvgl_sys::lv_label_create(row_card);
                 lvgl_sys::lv_obj_set_style_text_color(
@@ -1421,9 +1446,17 @@ impl LvglUiCore {
                     &lvgl_sys::lv_font_montserrat_14 as *const _ as *const lvgl_sys::lv_font_t,
                     0,
                 );
-                lvgl_sys::lv_label_set_long_mode(val_label, lvgl_sys::LV_LABEL_LONG_CLIP as lvgl_sys::lv_label_long_mode_t);
+                lvgl_sys::lv_label_set_long_mode(
+                    val_label,
+                    lvgl_sys::LV_LABEL_LONG_CLIP as lvgl_sys::lv_label_long_mode_t,
+                );
                 lvgl_sys::lv_obj_set_width(val_label, Self::to_coord((width - 60) / 2));
-                lvgl_sys::lv_obj_align(val_label, lvgl_sys::LV_ALIGN_RIGHT_MID as u8, Self::to_coord(-12), 0);
+                lvgl_sys::lv_obj_align(
+                    val_label,
+                    lvgl_sys::LV_ALIGN_RIGHT_MID as u8,
+                    Self::to_coord(-12),
+                    0,
+                );
 
                 app_list_row_cards[i] = row_card;
                 app_list_row_keys[i] = key_label;
@@ -1723,7 +1756,7 @@ impl LvglUiCore {
                 is_selected = true;
                 text = text[1..].trim_start();
             }
-            
+
             let mut formatted_text = String::new();
             if is_active {
                 formatted_text.push_str("[A] ");
@@ -1733,11 +1766,17 @@ impl LvglUiCore {
 
             if text.is_empty() {
                 unsafe {
-                    lvgl_sys::lv_obj_add_flag(ui.app_list_row_cards[i], lvgl_sys::LV_OBJ_FLAG_HIDDEN);
+                    lvgl_sys::lv_obj_add_flag(
+                        ui.app_list_row_cards[i],
+                        lvgl_sys::LV_OBJ_FLAG_HIDDEN,
+                    );
                 }
             } else {
                 unsafe {
-                    lvgl_sys::lv_obj_clear_flag(ui.app_list_row_cards[i], lvgl_sys::LV_OBJ_FLAG_HIDDEN);
+                    lvgl_sys::lv_obj_clear_flag(
+                        ui.app_list_row_cards[i],
+                        lvgl_sys::LV_OBJ_FLAG_HIDDEN,
+                    );
                     if is_selected {
                         lvgl_sys::lv_obj_set_style_border_color(
                             ui.app_list_row_cards[i],
@@ -1773,14 +1812,30 @@ impl LvglUiCore {
                     Self::set_label_text(ui.app_list_row_keys[i], key);
                     Self::set_label_text(ui.app_list_row_vals[i], val);
                     unsafe {
-                        lvgl_sys::lv_obj_clear_flag(ui.app_list_row_vals[i], lvgl_sys::LV_OBJ_FLAG_HIDDEN);
-                        lvgl_sys::lv_obj_align(ui.app_list_row_keys[i], lvgl_sys::LV_ALIGN_LEFT_MID as u8, Self::to_coord(12), 0);
+                        lvgl_sys::lv_obj_clear_flag(
+                            ui.app_list_row_vals[i],
+                            lvgl_sys::LV_OBJ_FLAG_HIDDEN,
+                        );
+                        lvgl_sys::lv_obj_align(
+                            ui.app_list_row_keys[i],
+                            lvgl_sys::LV_ALIGN_LEFT_MID as u8,
+                            Self::to_coord(12),
+                            0,
+                        );
                     }
                 } else {
                     Self::set_label_text(ui.app_list_row_keys[i], text);
                     unsafe {
-                        lvgl_sys::lv_obj_add_flag(ui.app_list_row_vals[i], lvgl_sys::LV_OBJ_FLAG_HIDDEN);
-                        lvgl_sys::lv_obj_align(ui.app_list_row_keys[i], lvgl_sys::LV_ALIGN_CENTER as u8, 0, 0);
+                        lvgl_sys::lv_obj_add_flag(
+                            ui.app_list_row_vals[i],
+                            lvgl_sys::LV_OBJ_FLAG_HIDDEN,
+                        );
+                        lvgl_sys::lv_obj_align(
+                            ui.app_list_row_keys[i],
+                            lvgl_sys::LV_ALIGN_CENTER as u8,
+                            0,
+                            0,
+                        );
                     }
                 }
             }
