@@ -18,6 +18,7 @@ version = "0.1.0"
 dependencies = [
  "ads1x1x",
  "build-data",
+ "cc",
  "clap",
  "crc",
  "crsf",
@@ -29,6 +30,7 @@ dependencies = [
  "lvgl-sys",
  "mlua",
  "nb",
+ "pkg-config",
  "rand",
  "rpos",
  "sdl2",

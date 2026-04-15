@@ -7,8 +7,8 @@ SOCKET_PATH="${LINTX_SOCKET_PATH:-/tmp/lintx-rpsocket}"
 LOG_DIR="${LOG_DIR:-/tmp/lintx-elrs}"
 UI_WIDTH="800"
 UI_HEIGHT="480"
-FB_ROTATE="270"
-FB_SWAP_RB="1"
+VO_ROTATE="270"
+TOUCH_ROTATE="${TOUCH_ROTATE:-$VO_ROTATE}"
 TOUCH_DEVICE="${TOUCH_DEVICE:-auto}"
 
 mkdir -p "$LOG_DIR"
@@ -22,14 +22,12 @@ stop_lintx() {
 
 start_server() {
     LINTX_SOCKET_PATH="$SOCKET_PATH" \
-    LINTX_FB_ROTATE="$FB_ROTATE" \
-    LINTX_FB_SWAP_RB="$FB_SWAP_RB" \
     LINTX_ELRS_DEBUG="${LINTX_ELRS_DEBUG:-}" \
     "$BIN" --server >"$LOG_DIR/server.log" 2>&1 &
     sleep 1
 }
 
-start_ui_fb() {
+start_ui_vo() {
     touch_args=""
     touch_device="$TOUCH_DEVICE"
     if [ "$touch_device" = "auto" ]; then
@@ -49,10 +47,15 @@ start_ui_fb() {
         touch_args="--touch-device $touch_device"
     fi
     LINTX_SOCKET_PATH="$SOCKET_PATH" \
-    LINTX_FB_ROTATE="$FB_ROTATE" \
-    LINTX_FB_SWAP_RB="$FB_SWAP_RB" \
-    "$BIN" -- ui_demo --backend fb --fb-device /dev/fb0 $touch_args --width "$UI_WIDTH" --height "$UI_HEIGHT" --fps 120 \
+    LINTX_DEBUG="${LINTX_DEBUG:-1}" \
+    LINTX_VO_ROTATE="$VO_ROTATE" \
+    LINTX_TOUCH_ROTATE="$TOUCH_ROTATE" \
+    "$BIN" -- ui_demo --backend vo $touch_args --width "$UI_WIDTH" --height "$UI_HEIGHT" --fps 120 \
     >"$LOG_DIR/ui.log" 2>&1 &
+}
+
+start_ui_fb() {
+    start_ui_vo
 }
 
 show_status() {
@@ -66,5 +69,5 @@ show_status() {
         tail -n 20 "$log" || true
     done
     echo
-    echo "UI_WIDTH=$UI_WIDTH UI_HEIGHT=$UI_HEIGHT FB_ROTATE=$FB_ROTATE FB_SWAP_RB=$FB_SWAP_RB TOUCH_DEVICE=$TOUCH_DEVICE"
+    echo "UI_WIDTH=$UI_WIDTH UI_HEIGHT=$UI_HEIGHT VO_ROTATE=$VO_ROTATE TOUCH_ROTATE=$TOUCH_ROTATE TOUCH_DEVICE=$TOUCH_DEVICE"
 }

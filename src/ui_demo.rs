@@ -31,14 +31,20 @@ struct Cli {
 }
 
 fn ui_demo_main(argc: u32, argv: *const &str) {
+    eprintln!("[lintx-ui] ui_demo_main argc={argc}");
     crate::ui::debug_log(&format!("ui_demo_main argc={argc}"));
     let args = match client_process_args::<Cli>(argc, argv) {
         Some(a) => a,
         None => {
+            eprintln!("[lintx-ui] ui_demo args parse failed");
             crate::ui::debug_log("ui_demo args parse failed");
             return;
         }
     };
+    eprintln!(
+        "[lintx-ui] ui_demo args backend={} fb_device={} touch_device={:?} fps={} size={}x{}",
+        args.backend, args.fb_device, args.touch_device, args.fps, args.width, args.height
+    );
     crate::ui::debug_log(&format!(
         "ui_demo args backend={} fb_device={} touch_device={:?} fps={} size={}x{}",
         args.backend, args.fb_device, args.touch_device, args.fps, args.width, args.height
@@ -52,11 +58,14 @@ fn ui_demo_main(argc: u32, argv: *const &str) {
         args.height,
     );
     let mut backend = new_backend(backend_kind);
+    eprintln!("[lintx-ui] ui backend created");
     crate::ui::debug_log("ui backend created");
 
     let mut app = UiApp::new();
+    eprintln!("[lintx-ui] ui app entering run loop");
     crate::ui::debug_log("ui app entering run loop");
     app.run(backend.as_mut(), args.fps);
+    eprintln!("[lintx-ui] ui app exited run loop");
     crate::ui::debug_log("ui app exited run loop");
 }
 

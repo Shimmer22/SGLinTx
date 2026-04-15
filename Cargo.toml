@@ -44,6 +44,8 @@ rand = "0.8.4"
 
 [build-dependencies]
 build-data = "0"
+cc = "1.1"
+pkg-config = "0.3"
 
 [patch.crates-io]
 joydev = { path = "third_party/joydev" }
