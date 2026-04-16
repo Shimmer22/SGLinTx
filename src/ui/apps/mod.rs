@@ -1,7 +1,7 @@
 use rpos::channel::Sender;
 
 use crate::{
-    messages::{ActiveModelMsg, ElrsCommandMsg, SystemConfigMsg},
+    messages::{ActiveModelMsg, ElrsCommandMsg, SystemConfigMsg, UiInteractionFeedback},
     ui::{input::UiInputEvent, model::UiFrame},
 };
 
@@ -11,7 +11,7 @@ mod about;
 mod cloud;
 mod common;
 mod control;
-mod models;
+pub(crate) mod models;
 mod scripts;
 mod sensor;
 mod system;
@@ -37,6 +37,7 @@ pub struct UiAppContext<'a> {
     pub config_tx: &'a Sender<SystemConfigMsg>,
     pub active_model_tx: &'a Sender<ActiveModelMsg>,
     pub elrs_cmd_tx: &'a Sender<ElrsCommandMsg>,
+    pub ui_feedback_tx: &'a Sender<UiInteractionFeedback>,
 }
 
 pub trait UiAppModule: Sync {

@@ -9,7 +9,7 @@ use crate::{
     config::store,
     messages::{
         ActiveModelMsg, ElrsCommandMsg, ElrsFeedbackMsg, ElrsStateMsg, InputFrameMsg,
-        InputStatusMsg, SystemConfigMsg, SystemStatusMsg,
+        InputStatusMsg, SystemConfigMsg, SystemStatusMsg, UiInteractionFeedback,
     },
     mixer::MixerOutMsg,
     ui::feedback::UiFeedbackController,
@@ -172,7 +172,6 @@ impl UiPerfSampler {
 pub struct UiApp {
     frame: UiFrame,
     feedback_controller: UiFeedbackController,
-    last_seen_elrs_feedback_seq: Option<u32>,
 }
 
 impl UiApp {
@@ -189,7 +188,6 @@ impl UiApp {
         let mut app = Self {
             frame: UiFrame::default(),
             feedback_controller: UiFeedbackController::default(),
-            last_seen_elrs_feedback_seq: None,
         };
         app.frame.debug.enabled = super::debug_overlay_enabled();
         app.reload_models();
@@ -330,11 +328,13 @@ impl UiApp {
         config_tx: &Sender<SystemConfigMsg>,
         active_model_tx: &Sender<ActiveModelMsg>,
         elrs_cmd_tx: &Sender<ElrsCommandMsg>,
+        ui_feedback_tx: &Sender<UiInteractionFeedback>,
     ) {
         let ctx = UiAppContext {
             config_tx,
             active_model_tx,
             elrs_cmd_tx,
+            ui_feedback_tx,
         };
         apps::handle_event(app, &mut self.frame, event, &ctx);
     }
@@ -345,6 +345,7 @@ impl UiApp {
         config_tx: &Sender<SystemConfigMsg>,
         active_model_tx: &Sender<ActiveModelMsg>,
         elrs_cmd_tx: &Sender<ElrsCommandMsg>,
+        ui_feedback_tx: &Sender<UiInteractionFeedback>,
     ) -> bool {
         match event {
             UiInputEvent::Quit => return false,
@@ -357,6 +358,7 @@ impl UiApp {
                             config_tx,
                             active_model_tx,
                             elrs_cmd_tx,
+                            ui_feedback_tx,
                         );
                     } else {
                         self.frame.page = UiPage::Launcher;
@@ -375,28 +377,56 @@ impl UiApp {
                         self.frame.page = UiPage::App(app);
                     }
                 } else if let UiPage::App(app) = self.frame.page {
-                    self.apply_event_in_app(app, event, config_tx, active_model_tx, elrs_cmd_tx);
+                    self.apply_event_in_app(
+                        app,
+                        event,
+                        config_tx,
+                        active_model_tx,
+                        elrs_cmd_tx,
+                        ui_feedback_tx,
+                    );
                 }
             }
             UiInputEvent::Left => {
                 if self.frame.page == UiPage::Launcher {
                     self.move_left();
                 } else if let UiPage::App(app) = self.frame.page {
-                    self.apply_event_in_app(app, event, config_tx, active_model_tx, elrs_cmd_tx);
+                    self.apply_event_in_app(
+                        app,
+                        event,
+                        config_tx,
+                        active_model_tx,
+                        elrs_cmd_tx,
+                        ui_feedback_tx,
+                    );
                 }
             }
             UiInputEvent::Right => {
                 if self.frame.page == UiPage::Launcher {
                     self.move_right();
                 } else if let UiPage::App(app) = self.frame.page {
-                    self.apply_event_in_app(app, event, config_tx, active_model_tx, elrs_cmd_tx);
+                    self.apply_event_in_app(
+                        app,
+                        event,
+                        config_tx,
+                        active_model_tx,
+                        elrs_cmd_tx,
+                        ui_feedback_tx,
+                    );
                 }
             }
             UiInputEvent::Up | UiInputEvent::Down => {
                 if self.frame.page == UiPage::Launcher {
                     self.move_selection_vertical(if event == UiInputEvent::Up { -1 } else { 1 });
                 } else if let UiPage::App(app) = self.frame.page {
-                    self.apply_event_in_app(app, event, config_tx, active_model_tx, elrs_cmd_tx);
+                    self.apply_event_in_app(
+                        app,
+                        event,
+                        config_tx,
+                        active_model_tx,
+                        elrs_cmd_tx,
+                        ui_feedback_tx,
+                    );
                 }
             }
             UiInputEvent::PagePrev => {
@@ -418,17 +448,6 @@ impl UiApp {
     }
 
     fn sync_interaction_feedback(&mut self, now: std::time::Instant) -> bool {
-        if self.frame.page == UiPage::App(AppId::Scripts) {
-            if let Some(feedback) = self.frame.elrs.interaction_feedback.clone() {
-                if self.last_seen_elrs_feedback_seq != Some(feedback.seq) {
-                    self.feedback_controller.submit(feedback.clone(), now);
-                    self.last_seen_elrs_feedback_seq = Some(feedback.seq);
-                }
-            }
-        } else {
-            self.last_seen_elrs_feedback_seq = None;
-        }
-
         let next_snapshot = if matches!(self.frame.page, UiPage::App(_)) {
             self.feedback_controller.snapshot(now)
         } else {
@@ -452,6 +471,10 @@ impl UiApp {
         let config_tx = get_new_tx_of_message::<SystemConfigMsg>("system_config").unwrap();
         let active_model_tx = get_new_tx_of_message::<ActiveModelMsg>("active_model").unwrap();
         let elrs_cmd_tx = get_new_tx_of_message::<ElrsCommandMsg>("elrs_cmd").unwrap();
+        let ui_feedback_tx =
+            get_new_tx_of_message::<UiInteractionFeedback>("ui_interaction_feedback").unwrap();
+        let mut ui_feedback_rx =
+            get_new_rx_of_message::<UiInteractionFeedback>("ui_interaction_feedback").unwrap();
 
         let elrs_state_tx = get_new_tx_of_message::<ElrsStateMsg>("elrs_state").unwrap();
         elrs_state_tx.send(ElrsStateMsg::default());
@@ -504,6 +527,12 @@ impl UiApp {
                 dirty |= Self::update_field(&mut self.frame.elrs, elrs);
             }
 
+            while let Some(feedback) = ui_feedback_rx.try_read() {
+                self.feedback_controller
+                    .submit(feedback, std::time::Instant::now());
+                dirty = true;
+            }
+
             if self.frame.cloud_connected
                 && self.frame.status.unix_time_secs
                     >= self.frame.cloud_last_sync_secs.saturating_add(5)
@@ -513,7 +542,13 @@ impl UiApp {
             }
 
             while let Some(evt) = backend.poll_event() {
-                if !self.apply_event(evt, &config_tx, &active_model_tx, &elrs_cmd_tx) {
+                if !self.apply_event(
+                    evt,
+                    &config_tx,
+                    &active_model_tx,
+                    &elrs_cmd_tx,
+                    &ui_feedback_tx,
+                ) {
                     backend.shutdown();
                     return;
                 }
@@ -521,7 +556,13 @@ impl UiApp {
             }
 
             while let Some(evt) = injected_input_rx.try_read() {
-                if !self.apply_event(evt, &config_tx, &active_model_tx, &elrs_cmd_tx) {
+                if !self.apply_event(
+                    evt,
+                    &config_tx,
+                    &active_model_tx,
+                    &elrs_cmd_tx,
+                    &ui_feedback_tx,
+                ) {
                     backend.shutdown();
                     return;
                 }

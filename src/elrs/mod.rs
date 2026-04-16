@@ -635,10 +635,7 @@ impl ElrsProtocolRuntime {
             (PendingCommandAction::WifiEnable, CommandStep::Ready) => {
                 self.pending_command = None;
                 self.last_wifi_command_at = None;
-                Some(format!(
-                    "WiFi command ready{}",
-                    suffix_info(&status.info)
-                ))
+                Some(format!("WiFi command ready{}", suffix_info(&status.info)))
             }
             (PendingCommandAction::WifiEnable, CommandStep::Progress) => Some(format!(
                 "WiFi command in progress{}",
@@ -666,10 +663,9 @@ impl ElrsProtocolRuntime {
                     suffix_info(&status.info)
                 ))
             }
-            (PendingCommandAction::WifiEnable, CommandStep::Start) => Some(format!(
-                "WiFi command started{}",
-                suffix_info(&status.info)
-            )),
+            (PendingCommandAction::WifiEnable, CommandStep::Start) => {
+                Some(format!("WiFi command started{}", suffix_info(&status.info)))
+            }
             (PendingCommandAction::WifiEnable, CommandStep::Confirm) => Some(format!(
                 "WiFi command confirming{}",
                 suffix_info(&status.info)
@@ -951,7 +947,10 @@ fn parse_parameter_entry(frame: &[u8]) -> Option<ParamEntry> {
             let info = frame
                 .get(info_start..frame.len().saturating_sub(1))
                 .map(|slice| {
-                    let end = slice.iter().position(|byte| *byte == 0).unwrap_or(slice.len());
+                    let end = slice
+                        .iter()
+                        .position(|byte| *byte == 0)
+                        .unwrap_or(slice.len());
                     String::from_utf8_lossy(&slice[..end]).to_string()
                 })
                 .unwrap_or_default();
@@ -1048,9 +1047,9 @@ fn crc8_ba(data: &[u8]) -> u8 {
 mod tests {
     use super::{
         build_crossfire_bind_frame, build_crossfire_model_id_frame, build_parameter_read_frame,
-        build_parameter_write_frame, crc8_ba, parse_parameter_entry, CommandStep,
-        ElrsOperation, ElrsProtocolRuntime, ParamEntry, ParamKind, ELRS_HANDSET_ADDRESS,
-        MODULE_ADDRESS, PARAM_SETTINGS_ENTRY_ID,
+        build_parameter_write_frame, crc8_ba, parse_parameter_entry, CommandStep, ElrsOperation,
+        ElrsProtocolRuntime, ParamEntry, ParamKind, ELRS_HANDSET_ADDRESS, MODULE_ADDRESS,
+        PARAM_SETTINGS_ENTRY_ID,
     };
     use std::time::{Duration, Instant};
 
@@ -1578,12 +1577,41 @@ mod tests {
         });
 
         let first = vec![
-            0xC8, 0x11, PARAM_SETTINGS_ENTRY_ID, 0xEA, 0xEE, 0x0F, 0x01, 0x00, 0x0D, b'E', b'n',
-            b'a', b'b', b'l', b'e', b' ', b'W', 0x00,
+            0xC8,
+            0x11,
+            PARAM_SETTINGS_ENTRY_ID,
+            0xEA,
+            0xEE,
+            0x0F,
+            0x01,
+            0x00,
+            0x0D,
+            b'E',
+            b'n',
+            b'a',
+            b'b',
+            b'l',
+            b'e',
+            b' ',
+            b'W',
+            0x00,
         ];
         let second = vec![
-            0xC8, 0x0E, PARAM_SETTINGS_ENTRY_ID, 0xEA, 0xEE, 0x0F, 0x00, 0x00, 0x0D, b'i', b'F',
-            b'i', 0x00, 0x00, 0x00,
+            0xC8,
+            0x0E,
+            PARAM_SETTINGS_ENTRY_ID,
+            0xEA,
+            0xEE,
+            0x0F,
+            0x00,
+            0x00,
+            0x0D,
+            b'i',
+            b'F',
+            b'i',
+            0x00,
+            0x00,
+            0x00,
         ];
 
         runtime.consume_frame(&first);
@@ -1620,8 +1648,24 @@ mod tests {
         });
 
         let first = vec![
-            0xC8, 0x11, PARAM_SETTINGS_ENTRY_ID, 0xEA, 0xEE, 0x0F, 0x01, 0x00, 0x0D, b'E', b'n',
-            b'a', b'b', b'l', b'e', b' ', b'W', 0x00,
+            0xC8,
+            0x11,
+            PARAM_SETTINGS_ENTRY_ID,
+            0xEA,
+            0xEE,
+            0x0F,
+            0x01,
+            0x00,
+            0x0D,
+            b'E',
+            b'n',
+            b'a',
+            b'b',
+            b'l',
+            b'e',
+            b' ',
+            b'W',
+            0x00,
         ];
         runtime.consume_frame(&first);
 
@@ -1705,7 +1749,8 @@ mod tests {
 
         let frame = runtime.poll_outgoing_frame(Instant::now() + Duration::from_secs(1));
         assert!(
-            frame.map(|f| f[2] != 0x2D || f[5] != 0x0F || f[6] != CommandStep::Start.raw())
+            frame
+                .map(|f| f[2] != 0x2D || f[5] != 0x0F || f[6] != CommandStep::Start.raw())
                 .unwrap_or(true),
             "WiFi off should remove queued START frames"
         );

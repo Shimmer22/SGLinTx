@@ -48,7 +48,7 @@ impl UiAppModule for ScriptsApp {
     fn on_event(&self, frame: &mut UiFrame, event: UiInputEvent, ctx: &UiAppContext<'_>) {
         if is_local_fallback(frame) {
             ensure_local_state(frame);
-            if handle_local_event(frame, event) {
+            if handle_local_event(frame, event, ctx.ui_feedback_tx) {
                 return;
             }
         }
@@ -138,18 +138,18 @@ fn local_feedback_target(selected_idx: usize) -> UiFeedbackTarget {
 }
 
 fn set_local_feedback(
-    frame: &mut UiFrame,
+    frame: &UiFrame,
+    ui_feedback_tx: &rpos::channel::Sender<UiInteractionFeedback>,
     severity: UiFeedbackSeverity,
     motion: UiFeedbackMotion,
     message: &str,
 ) {
     let next_seq = frame
-        .elrs
         .interaction_feedback
         .as_ref()
         .map(|feedback| feedback.seq.wrapping_add(1))
         .unwrap_or(1);
-    frame.elrs.interaction_feedback = Some(UiInteractionFeedback {
+    ui_feedback_tx.send(UiInteractionFeedback {
         seq: next_seq,
         severity,
         target: local_feedback_target(frame.elrs.selected_idx),
@@ -164,11 +164,11 @@ fn set_local_feedback(
     });
 }
 
-fn clear_local_feedback(frame: &mut UiFrame) {
-    frame.elrs.interaction_feedback = None;
-}
-
-fn handle_local_event(frame: &mut UiFrame, event: UiInputEvent) -> bool {
+fn handle_local_event(
+    frame: &mut UiFrame,
+    event: UiInputEvent,
+    ui_feedback_tx: &rpos::channel::Sender<UiInteractionFeedback>,
+) -> bool {
     let mut cfg = load_local_config();
 
     if frame.elrs.editor_active {
@@ -179,6 +179,7 @@ fn handle_local_event(frame: &mut UiFrame, event: UiInputEvent) -> bool {
                 frame.elrs.status_text = "Bind phrase edit cancelled".to_string();
                 set_local_feedback(
                     frame,
+                    ui_feedback_tx,
                     UiFeedbackSeverity::Error,
                     UiFeedbackMotion::ShakeX,
                     "Bind phrase edit cancelled",
@@ -186,22 +187,18 @@ fn handle_local_event(frame: &mut UiFrame, event: UiInputEvent) -> bool {
                 true
             }
             UiInputEvent::Up => {
-                clear_local_feedback(frame);
                 cycle_editor_char(frame, -1);
                 true
             }
             UiInputEvent::Down => {
-                clear_local_feedback(frame);
                 cycle_editor_char(frame, 1);
                 true
             }
             UiInputEvent::Left => {
-                clear_local_feedback(frame);
                 move_editor_cursor(frame, -1);
                 true
             }
             UiInputEvent::Right => {
-                clear_local_feedback(frame);
                 move_editor_cursor(frame, 1);
                 true
             }
@@ -222,25 +219,22 @@ fn handle_local_event(frame: &mut UiFrame, event: UiInputEvent) -> bool {
     } else {
         match event {
             UiInputEvent::Up => {
-                clear_local_feedback(frame);
                 frame.elrs.selected_idx = frame.elrs.selected_idx.saturating_sub(1);
                 true
             }
             UiInputEvent::Down => {
-                clear_local_feedback(frame);
                 frame.elrs.selected_idx = frame.elrs.selected_idx.saturating_add(1).min(4);
                 true
             }
             UiInputEvent::Left => {
-                apply_local_adjust(frame, &mut cfg, -1);
+                apply_local_adjust(frame, &mut cfg, -1, ui_feedback_tx);
                 true
             }
             UiInputEvent::Right | UiInputEvent::Open => {
-                apply_local_adjust(frame, &mut cfg, 1);
+                apply_local_adjust(frame, &mut cfg, 1, ui_feedback_tx);
                 true
             }
             UiInputEvent::PageNext => {
-                clear_local_feedback(frame);
                 let cfg = load_local_config();
                 apply_local_state(frame, &cfg, Some("ELRS config reloaded"));
                 true
@@ -251,7 +245,12 @@ fn handle_local_event(frame: &mut UiFrame, event: UiInputEvent) -> bool {
     }
 }
 
-fn apply_local_adjust(frame: &mut UiFrame, cfg: &mut LocalElrsConfig, delta: isize) {
+fn apply_local_adjust(
+    frame: &mut UiFrame,
+    cfg: &mut LocalElrsConfig,
+    delta: isize,
+    ui_feedback_tx: &rpos::channel::Sender<UiInteractionFeedback>,
+) {
     let (status, severity, motion) = match frame.elrs.selected_idx {
         0 => {
             cfg.rf_output_enabled = !cfg.rf_output_enabled;
@@ -332,16 +331,14 @@ fn apply_local_adjust(frame: &mut UiFrame, cfg: &mut LocalElrsConfig, delta: isi
                 cfg.bind_phrase.clone()
             };
             frame.elrs.editor_cursor = 0;
-            clear_local_feedback(frame);
             return apply_local_state(frame, cfg, Some("Editing bind phrase"));
         }
         _ => {
-            clear_local_feedback(frame);
             return apply_local_state(frame, cfg, Some("ELRS"));
         }
     };
 
-    set_local_feedback(frame, severity, motion, status);
+    set_local_feedback(frame, ui_feedback_tx, severity, motion, status);
     apply_local_state(frame, cfg, Some(status));
 }
 
@@ -533,6 +530,7 @@ mod tests {
         messages::{UiFeedbackMotion, UiFeedbackSeverity, UiFeedbackSlot, UiFeedbackTarget},
         ui::model::UiFrame,
     };
+    use rpos::channel::Channel;
 
     #[test]
     fn test_local_feedback_target_for_wifi_maps_to_wifi_field() {
@@ -546,29 +544,34 @@ mod tests {
     fn test_set_local_feedback_assigns_top_status_feedback_and_increments_seq() {
         let mut frame = UiFrame::default();
         frame.elrs.selected_idx = 3;
+        let (tx, mut rx) = Channel::new();
 
         set_local_feedback(
-            &mut frame,
+            &frame,
+            &tx,
             UiFeedbackSeverity::Success,
             UiFeedbackMotion::Pulse,
             "TX power updated",
         );
-        let first = frame
-            .elrs
-            .interaction_feedback
-            .clone()
-            .expect("first feedback");
+        let first = rx.try_read().expect("first feedback");
+        frame.interaction_feedback = Some(crate::ui::feedback::UiFeedbackSnapshot {
+            seq: first.seq,
+            severity: first.severity,
+            target: first.target.clone(),
+            motion: first.motion,
+            slot: first.slot,
+            message: first.message.clone(),
+            elapsed_ms: 10,
+            ttl_ms: first.ttl_ms,
+        });
         set_local_feedback(
-            &mut frame,
+            &frame,
+            &tx,
             UiFeedbackSeverity::Error,
             UiFeedbackMotion::ShakeX,
             "TX power save failed",
         );
-        let second = frame
-            .elrs
-            .interaction_feedback
-            .clone()
-            .expect("second feedback");
+        let second = rx.try_read().expect("second feedback");
 
         assert_eq!(first.slot, UiFeedbackSlot::TopStatusBar);
         assert_eq!(

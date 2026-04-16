@@ -206,6 +206,10 @@ impl ElrsUiState {
         self.interaction_feedback = None;
     }
 
+    fn take_feedback(&mut self) -> Option<UiInteractionFeedback> {
+        self.interaction_feedback.take()
+    }
+
     fn handle_command(
         &mut self,
         cmd: ElrsCommandMsg,
@@ -485,13 +489,12 @@ impl ElrsUiState {
                                 UiFeedbackMotion::ShakeX,
                                 message.clone(),
                             ),
-                            ElrsOperationStatus::Queued(_) | ElrsOperationStatus::Busy(_) => {
-                                self.emit_feedback(
+                            ElrsOperationStatus::Queued(_) | ElrsOperationStatus::Busy(_) => self
+                                .emit_feedback(
                                     UiFeedbackSeverity::Success,
                                     UiFeedbackMotion::Pulse,
                                     message.clone(),
-                                )
-                            }
+                                ),
                         }
                         message
                     }
@@ -805,6 +808,8 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
     let system_status_tx = get_new_tx_of_message::<SystemStatusMsg>("system_status").unwrap();
     let elrs_state_tx = get_new_tx_of_message::<ElrsStateMsg>("elrs_state").unwrap();
     let elrs_feedback_tx = get_new_tx_of_message::<ElrsFeedbackMsg>("elrs_feedback").unwrap();
+    let ui_feedback_tx =
+        get_new_tx_of_message::<UiInteractionFeedback>("ui_interaction_feedback").unwrap();
 
     rf_logln!(
         "rf_link_service start on {} @ {} baud",
@@ -849,6 +854,9 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                 let prev_wifi_manual_on = ui_state.config.wifi_manual_on;
                 let prev_bind_active = protocol.bind_active();
                 ui_status_text = ui_state.handle_command(cmd, &mut protocol, dev.is_some());
+                if let Some(feedback) = ui_state.take_feedback() {
+                    ui_feedback_tx.send(feedback);
+                }
                 ui_state.bind_active = protocol.bind_active();
 
                 if !prev_rf_enabled && ui_state.config.rf_output_enabled {
@@ -1116,8 +1124,9 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                                                 .iter()
                                                 .position(|&b| b == 0)
                                                 .unwrap_or(info_bytes.len().saturating_sub(1));
-                                            let info = core::str::from_utf8(&info_bytes[..info_len])
-                                                .unwrap_or("?");
+                                            let info =
+                                                core::str::from_utf8(&info_bytes[..info_len])
+                                                    .unwrap_or("?");
                                             rf_logln!(
                                                 "rf_link_service param command field={:#04X} \
                                                  chunks_rem={} label={:?} step={:#04X} timeout={} info={:?}",
@@ -1402,7 +1411,6 @@ fn build_elrs_state(
         status_text,
         wifi_running: ui_state.config.wifi_manual_on,
         selected_idx: ui_state.selected_idx,
-        interaction_feedback: ui_state.interaction_feedback.clone(),
         params: vec![
             crate::messages::ElrsParamEntry {
                 id: "rf_output".to_string(),
@@ -1563,9 +1571,8 @@ fn now_unix_secs() -> u64 {
 mod tests {
     use super::{
         build_elrs_state, check_frame_crc, derive_elrs_model_id, extract_crsf_frames,
-        shift_power_level, wifi_exit_silence_active, EditorState, ElrsUiState,
-        LinkMonitorState, TelemetryStatusState, CRSF_CRC, CRSF_FRAME_BATTERY_ID,
-        CRSF_FRAME_LINK_ID, CRSF_SYNC,
+        shift_power_level, wifi_exit_silence_active, EditorState, ElrsUiState, LinkMonitorState,
+        TelemetryStatusState, CRSF_CRC, CRSF_FRAME_BATTERY_ID, CRSF_FRAME_LINK_ID, CRSF_SYNC,
     };
     use crate::{
         elrs::ElrsProtocolRuntime,
@@ -1697,10 +1704,11 @@ mod tests {
     #[test]
     fn test_wifi_unavailable_emits_error_feedback_for_wifi_field() {
         let mut ui_state = ElrsUiState::load();
+        ui_state.config.rf_output_enabled = false;
+        ui_state.config.wifi_manual_on = false;
         ui_state.selected_idx = 1;
 
-        let message =
-            ui_state.adjust_selected(1, &mut ElrsProtocolRuntime::default(), false);
+        let message = ui_state.adjust_selected(1, &mut ElrsProtocolRuntime::default(), false);
 
         assert_eq!(message, "WiFi unavailable: enable RF output first");
         let feedback = ui_state

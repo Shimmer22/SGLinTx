@@ -1,8 +1,7 @@
 use std::time::Instant;
 
 use crate::messages::{
-    UiFeedbackMotion, UiFeedbackSeverity, UiFeedbackSlot, UiFeedbackTarget,
-    UiInteractionFeedback,
+    UiFeedbackMotion, UiFeedbackSeverity, UiFeedbackSlot, UiFeedbackTarget, UiInteractionFeedback,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,9 +49,7 @@ impl UiFeedbackController {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        UiFeedbackController, UiFeedbackSnapshot,
-    };
+    use super::{UiFeedbackController, UiFeedbackSnapshot};
     use crate::messages::{
         UiFeedbackMotion, UiFeedbackSeverity, UiFeedbackSlot, UiFeedbackTarget,
         UiInteractionFeedback,

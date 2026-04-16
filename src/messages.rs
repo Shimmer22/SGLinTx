@@ -217,7 +217,6 @@ pub struct ElrsStateMsg {
     pub status_text: String,
     pub wifi_running: bool,
     pub selected_idx: usize,
-    pub interaction_feedback: Option<UiInteractionFeedback>,
     pub params: Vec<ElrsParamEntry>,
 }
 
@@ -243,7 +242,6 @@ impl Default for ElrsStateMsg {
             status_text: "ELRS service not started".to_string(),
             wifi_running: false,
             selected_idx: 0,
-            interaction_feedback: None,
             params: vec![
                 ElrsParamEntry {
                     id: "rf_output".to_string(),
@@ -332,6 +330,7 @@ fn register() {
     rpos::msg::add_message::<ActiveModelMsg>("active_model");
     rpos::msg::add_message::<ElrsStateMsg>("elrs_state");
     rpos::msg::add_message::<ElrsCommandMsg>("elrs_cmd");
+    rpos::msg::add_message::<UiInteractionFeedback>("ui_interaction_feedback");
 }
 
 #[cfg(test)]

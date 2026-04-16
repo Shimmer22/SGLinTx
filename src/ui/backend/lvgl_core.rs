@@ -1,6 +1,7 @@
 use crate::{
     messages::{UiFeedbackMotion, UiFeedbackSeverity, UiFeedbackSlot, UiFeedbackTarget},
     ui::{
+        apps::models::visible_model_rows,
         catalog::{app_at, app_spec, page, PAGE_SPECS},
         feedback::UiFeedbackSnapshot,
         model::{AppId, UiFrame, UiPage},
@@ -508,24 +509,23 @@ impl LvglUiCore {
                 let metric_focus = focused_entry
                     .map(|entry| format!("{} · {}", entry.name, entry.protocol))
                     .unwrap_or_else(|| "No models".to_string());
-                let mut list_lines: Vec<String> = frame
-                    .model_entries
+                let visible_rows = visible_model_rows(frame, 4);
+                let mut list_lines: Vec<String> = visible_rows
                     .iter()
-                    .enumerate()
-                    .take(4)
-                    .map(|(idx, entry)| {
+                    .map(|row| {
                         format!(
-                            "{} {} ({})",
-                            if idx == active { "[A]" } else { "   " },
-                            if idx == focus {
-                                format!("> {}", entry.name)
-                            } else {
-                                format!("  {}", entry.name)
-                            },
-                            entry.protocol
+                            "{} {}: {} · {}",
+                            if row.is_focused { ">" } else { " " },
+                            row.name,
+                            if row.is_active { "ACTIVE" } else { "STORED" },
+                            row.protocol
                         )
                     })
                     .collect();
+                let mut list_row_ids = [None, None, None, None];
+                for (idx, row) in visible_rows.iter().enumerate() {
+                    list_row_ids[idx] = Some(row.id.clone());
+                }
                 if list_lines.is_empty() {
                     list_lines.push("No imported models found in ./models".to_string());
                 }
@@ -550,7 +550,7 @@ impl LvglUiCore {
                         list_lines[2].clone(),
                         list_lines[3].clone(),
                     ],
-                    list_row_ids: [None, None, None, None],
+                    list_row_ids,
                     hint:
                         "UP/DOWN: Focus Profile   ENTER: Apply   Files: ./models   Swipe right: Back"
                             .to_string(),
@@ -1812,30 +1812,22 @@ impl LvglUiCore {
             let mut is_selected = false;
             let mut text = line.as_str();
 
-            let mut is_active = false;
             text = text.trim_start();
-            if text.starts_with("[A]") {
-                is_active = true;
-                text = text[3..].trim_start();
-            }
             if text.starts_with(">") {
                 is_selected = true;
                 text = text[1..].trim_start();
             }
 
-            let mut formatted_text = String::new();
-            if is_active {
-                formatted_text.push_str("[A] ");
-            }
-            formatted_text.push_str(text);
-            let text = formatted_text.as_str();
-            let row_feedback = data.feedback.as_ref().filter(|feedback| match &feedback.target {
-                UiFeedbackTarget::SelectedListRow => is_selected,
-                UiFeedbackTarget::FieldId(field_id) => {
-                    data.list_row_ids[i].as_deref() == Some(field_id.as_str())
-                }
-                UiFeedbackTarget::Page => false,
-            });
+            let row_feedback = data
+                .feedback
+                .as_ref()
+                .filter(|feedback| match &feedback.target {
+                    UiFeedbackTarget::SelectedListRow => is_selected,
+                    UiFeedbackTarget::FieldId(field_id) => {
+                        data.list_row_ids[i].as_deref() == Some(field_id.as_str())
+                    }
+                    UiFeedbackTarget::Page => false,
+                });
 
             if text.is_empty() {
                 unsafe {
@@ -1877,7 +1869,9 @@ impl LvglUiCore {
                     lvgl_sys::lv_obj_set_style_translate_x(
                         ui.app_list_row_cards[i],
                         Self::to_coord(
-                            row_feedback.map(Self::feedback_row_offset).unwrap_or_default(),
+                            row_feedback
+                                .map(Self::feedback_row_offset)
+                                .unwrap_or_default(),
                         ),
                         0,
                     );
@@ -1931,8 +1925,16 @@ impl LvglUiCore {
                     Self::set_label_text(ui.app_list_row_keys[i], key);
                     Self::set_label_text(ui.app_list_row_vals[i], val);
                     unsafe {
-                        lvgl_sys::lv_obj_set_style_text_color(ui.app_list_row_keys[i], key_color, 0);
-                        lvgl_sys::lv_obj_set_style_text_color(ui.app_list_row_vals[i], val_color, 0);
+                        lvgl_sys::lv_obj_set_style_text_color(
+                            ui.app_list_row_keys[i],
+                            key_color,
+                            0,
+                        );
+                        lvgl_sys::lv_obj_set_style_text_color(
+                            ui.app_list_row_vals[i],
+                            val_color,
+                            0,
+                        );
                         lvgl_sys::lv_obj_clear_flag(
                             ui.app_list_row_vals[i],
                             lvgl_sys::LV_OBJ_FLAG_HIDDEN,
@@ -1947,7 +1949,11 @@ impl LvglUiCore {
                 } else {
                     Self::set_label_text(ui.app_list_row_keys[i], text);
                     unsafe {
-                        lvgl_sys::lv_obj_set_style_text_color(ui.app_list_row_keys[i], key_color, 0);
+                        lvgl_sys::lv_obj_set_style_text_color(
+                            ui.app_list_row_keys[i],
+                            key_color,
+                            0,
+                        );
                         lvgl_sys::lv_obj_add_flag(
                             ui.app_list_row_vals[i],
                             lvgl_sys::LV_OBJ_FLAG_HIDDEN,
