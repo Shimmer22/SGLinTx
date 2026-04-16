@@ -2021,6 +2021,11 @@ impl LvglUiCore {
             }
         }
 
+        let top_status_feedback = frame
+            .interaction_feedback
+            .as_ref()
+            .filter(|feedback| feedback.slot == UiFeedbackSlot::TopStatusBar);
+
         if prev_frame
             .map(|prev| {
                 prev.status != frame.status
@@ -2035,11 +2040,7 @@ impl LvglUiCore {
             })
             .unwrap_or(true)
         {
-            if let Some(feedback) = frame
-                .interaction_feedback
-                .as_ref()
-                .filter(|feedback| feedback.slot == UiFeedbackSlot::TopStatusBar)
-            {
+            if let Some(feedback) = top_status_feedback {
                 let color = Self::feedback_hint_color(feedback);
                 Self::set_label_text(ui.status_label, &feedback.message);
                 unsafe {
@@ -2077,10 +2078,24 @@ impl LvglUiCore {
         }
 
         if prev_frame
-            .map(|prev| prev.launcher_page != frame.launcher_page)
+            .map(|prev| {
+                prev.launcher_page != frame.launcher_page
+                    || prev
+                        .interaction_feedback
+                        .as_ref()
+                        .map(|feedback| (feedback.seq, feedback.slot))
+                        != frame
+                            .interaction_feedback
+                            .as_ref()
+                            .map(|feedback| (feedback.seq, feedback.slot))
+            })
             .unwrap_or(true)
         {
-            let page_txt = format!("Page {}/{}", frame.launcher_page + 1, PAGE_SPECS.len());
+            let page_txt = if top_status_feedback.is_some() {
+                String::new()
+            } else {
+                format!("Page {}/{}", frame.launcher_page + 1, PAGE_SPECS.len())
+            };
             Self::set_label_text(ui.page_label, &page_txt);
         }
 

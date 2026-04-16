@@ -17,6 +17,8 @@ const BIND_FRAME_INTERVAL: Duration = Duration::from_millis(120);
 const BIND_SETTLE_INTERVAL: Duration = Duration::from_millis(400);
 const PARAM_FRAME_INTERVAL: Duration = Duration::from_millis(80);
 const WIFI_COMMAND_RETRY_INTERVAL: Duration = Duration::from_millis(180);
+const TX_POWER_CONFIRM_TIMEOUT: Duration = Duration::from_millis(5000);
+const TX_POWER_CONFIRM_QUERY_INTERVAL: Duration = Duration::from_millis(700);
 const PARAM_MAX_FIELD_ID: u8 = 64;
 const PARAM_DEVICE_PING_ID: u8 = 0x28;
 const PARAM_DEVICE_INFO_ID: u8 = 0x29;
@@ -24,15 +26,24 @@ const PARAM_REQUEST_SETTINGS_ID: u8 = 0x2A;
 const PARAM_SETTINGS_ENTRY_ID: u8 = 0x2B;
 const PARAM_READ_ID: u8 = 0x2C;
 const PARAM_WRITE_ID: u8 = 0x2D;
+const CRSF_LINK_ID: u8 = 0x14;
 // 0x2E 是 ELRS 私有链路统计帧（elrsV3.lua parseElrsInfoMessage），不是命令状态响应。
 // 命令执行的响应通过 0x2B（PARAM_SETTINGS_ENTRY_ID）返回，字段 status 字节反映执行状态。
 const ELRS_LINK_STAT_ID: u8 = 0x2E;
+const TX_POWER_CURRENT_LABELS: &[&str] = &["Power", "TX Power", "RF Power", "Output Power"];
+const TX_POWER_MAX_LABELS: &[&str] = &["Max Power"];
+const TX_POWER_FALLBACK_LABELS: &[&str] =
+    &["power", "tx power", "rf power", "output power", "max power"];
+const TX_POWER_CURRENT_FALLBACK_LABELS: &[&str] =
+    &["power", "tx power", "rf power", "output power"];
+const TX_POWER_FALLBACK_LEVELS_MW: &[u16] = &[10, 25, 50, 100, 250, 500, 1000, 2000];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ElrsOperation {
     EnterBind,
     SetWifiManual(bool),
     SetTxPower(u16),
+    SetTxMaxPower(u16),
     SetBindPhrase(String),
     RefreshParams,
 }
@@ -161,6 +172,21 @@ struct PendingParamChunk {
     data: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingTxPowerWrite {
+    field_id: u8,
+    expected_index: u8,
+    expected_mw: Option<u16>,
+    kind: PendingTxPowerKind,
+    requested_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingTxPowerKind {
+    Current,
+    Max,
+}
+
 #[derive(Debug, Clone)]
 pub struct ElrsProtocolRuntime {
     bind_frames_remaining: u8,
@@ -181,6 +207,8 @@ pub struct ElrsProtocolRuntime {
     params: HashMap<u8, ParamEntry>,
     pending_command: Option<PendingCommand>,
     pending_param_chunks: HashMap<u8, PendingParamChunk>,
+    pending_tx_power_write: Option<PendingTxPowerWrite>,
+    last_tx_power_query_at: Option<Instant>,
     last_wifi_command_at: Option<Instant>,
 }
 
@@ -205,6 +233,8 @@ impl Default for ElrsProtocolRuntime {
             params: HashMap::new(),
             pending_command: None,
             pending_param_chunks: HashMap::new(),
+            pending_tx_power_write: None,
+            last_tx_power_query_at: None,
             last_wifi_command_at: None,
         }
     }
@@ -270,25 +300,87 @@ impl ElrsProtocolRuntime {
                 }
             }
             ElrsOperation::SetTxPower(power) => {
+                let (param_id, index, selected) =
+                    if let Some((param_id, param_label, param_options)) = self
+                        .find_current_tx_power_select_param()
+                        .map(|param| (param.id, param.label.clone(), param.options.clone()))
+                    {
+                        let index = if let Some(index) = nearest_option_index(&param_options, power)
+                        {
+                            index
+                        } else if param_options.is_empty()
+                            && is_tx_power_label_candidate(&param_label)
+                        {
+                            fallback_tx_power_option_index(power)
+                        } else {
+                            self.request_refresh();
+                            return ElrsOperationStatus::Unsupported(
+                                "TX power options unavailable",
+                            );
+                        };
+                        let selected = param_options
+                            .get(index)
+                            .cloned()
+                            .unwrap_or_else(|| format!("{}mW", TX_POWER_FALLBACK_LEVELS_MW[index]));
+                        (param_id, index, selected)
+                    } else if let Some((field_id, _label)) =
+                        self.find_pending_current_tx_power_select_field()
+                    {
+                        let index = fallback_tx_power_option_index(power);
+                        let selected = format!("{}mW", TX_POWER_FALLBACK_LEVELS_MW[index]);
+                        (field_id, index, selected)
+                    } else {
+                        self.request_refresh();
+                        return ElrsOperationStatus::Unsupported(
+                            "TX power is read-only on this module (adjust TX max power)",
+                        );
+                    };
+                self.outgoing_queue.push_back(build_parameter_write_frame(
+                    MODULE_ADDRESS,
+                    param_id,
+                    &[index as u8],
+                ));
+                self.pending_tx_power_write = Some(PendingTxPowerWrite {
+                    field_id: param_id,
+                    expected_index: index as u8,
+                    expected_mw: parse_power_value(&selected),
+                    kind: PendingTxPowerKind::Current,
+                    requested_at: Instant::now(),
+                });
+                self.last_tx_power_query_at = None;
+                self.last_status = Some(format!("TX power request queued: {}", selected));
+                ElrsOperationStatus::Queued("TX power request queued")
+            }
+            ElrsOperation::SetTxMaxPower(power) => {
                 let Some((param_id, param_options)) = self
-                    .find_select_param(&["Max Power", "TX Power"])
+                    .find_max_tx_power_select_param()
                     .map(|param| (param.id, param.options.clone()))
                 else {
                     self.request_refresh();
-                    return ElrsOperationStatus::Unsupported("TX power parameter unavailable");
+                    return ElrsOperationStatus::Unsupported("TX max power parameter unavailable");
                 };
                 let Some(index) = nearest_option_index(&param_options, power) else {
                     self.request_refresh();
-                    return ElrsOperationStatus::Unsupported("TX power options unavailable");
+                    return ElrsOperationStatus::Unsupported("TX max power options unavailable");
                 };
                 self.outgoing_queue.push_back(build_parameter_write_frame(
                     MODULE_ADDRESS,
                     param_id,
                     &[index as u8],
                 ));
-                self.last_status =
-                    Some(format!("TX power request queued: {}", param_options[index]));
-                ElrsOperationStatus::Queued("TX power request queued")
+                self.pending_tx_power_write = Some(PendingTxPowerWrite {
+                    field_id: param_id,
+                    expected_index: index as u8,
+                    expected_mw: parse_power_value(&param_options[index]),
+                    kind: PendingTxPowerKind::Max,
+                    requested_at: Instant::now(),
+                });
+                self.last_tx_power_query_at = None;
+                self.last_status = Some(format!(
+                    "TX max power request queued: {}",
+                    param_options[index]
+                ));
+                ElrsOperationStatus::Queued("TX max power request queued")
             }
             ElrsOperation::SetBindPhrase(value) => {
                 if let Some(id) = self.find_string_param(&["Bind Phrase"]) {
@@ -329,6 +421,8 @@ impl ElrsProtocolRuntime {
         self.outgoing_queue.clear();
         self.pending_command = None;
         self.pending_param_chunks.clear();
+        self.pending_tx_power_write = None;
+        self.last_tx_power_query_at = None;
         self.last_wifi_command_at = None;
     }
 
@@ -373,6 +467,34 @@ impl ElrsProtocolRuntime {
         if let Some(last) = self.last_param_frame_at {
             if now.saturating_duration_since(last) < PARAM_FRAME_INTERVAL {
                 return None;
+            }
+        }
+
+        if let Some(pending) = self.pending_tx_power_write.clone() {
+            if now.saturating_duration_since(pending.requested_at) >= TX_POWER_CONFIRM_TIMEOUT {
+                self.pending_tx_power_write = None;
+                self.last_tx_power_query_at = None;
+                let timeout = match pending.kind {
+                    PendingTxPowerKind::Current => "TX power confirmation timeout",
+                    PendingTxPowerKind::Max => "TX max power confirmation timeout",
+                };
+                self.last_status = Some(timeout.to_string());
+            }
+        }
+
+        if let Some(pending) = self.pending_tx_power_write.as_ref() {
+            let query_due = self
+                .last_tx_power_query_at
+                .map(|last| now.saturating_duration_since(last) >= TX_POWER_CONFIRM_QUERY_INTERVAL)
+                .unwrap_or(true);
+            if query_due {
+                self.last_tx_power_query_at = Some(now);
+                self.last_param_frame_at = Some(now);
+                return Some(build_parameter_read_frame(
+                    MODULE_ADDRESS,
+                    pending.field_id,
+                    0,
+                ));
             }
         }
 
@@ -490,10 +612,23 @@ impl ElrsProtocolRuntime {
             }
             PARAM_SETTINGS_ENTRY_ID => {
                 if let Some(entry) = self.consume_parameter_frame(frame) {
-                    if let Some(status_text) = self.update_pending_command(&entry) {
+                    if let Some(status_text) = self
+                        .update_pending_command(&entry)
+                        .or_else(|| self.update_pending_tx_power(&entry))
+                    {
                         self.last_status = Some(status_text);
                     }
                     self.params.insert(entry.id, entry);
+                }
+            }
+            PARAM_WRITE_ID => {
+                if let Some(status_text) = self.update_pending_tx_power_from_write_ack(frame) {
+                    self.last_status = Some(status_text);
+                }
+            }
+            CRSF_LINK_ID => {
+                if let Some(status_text) = self.update_pending_tx_power_from_link(frame) {
+                    self.last_status = Some(status_text);
                 }
             }
             ELRS_LINK_STAT_ID => {
@@ -507,8 +642,18 @@ impl ElrsProtocolRuntime {
         self.device_info.as_ref()
     }
 
-    pub fn select_value_for_labels(&self, labels: &[&str]) -> Option<String> {
-        self.find_select_param(labels)
+    pub fn select_tx_power_value(&self) -> Option<String> {
+        self.find_current_tx_power_select_param()
+            .map(|param| param.value.clone())
+    }
+
+    pub fn has_current_tx_power_control(&self) -> bool {
+        self.find_current_tx_power_select_param().is_some()
+            || self.find_pending_current_tx_power_select_field().is_some()
+    }
+
+    pub fn select_tx_max_power_value(&self) -> Option<String> {
+        self.find_max_tx_power_select_param()
             .map(|param| param.value.clone())
     }
 
@@ -558,10 +703,93 @@ impl ElrsProtocolRuntime {
     }
 
     fn find_select_param(&self, labels: &[&str]) -> Option<&ParamEntry> {
-        self.params.values().find(|param| {
-            matches!(param.kind, ParamKind::Select)
-                && labels.iter().any(|label| param.label == *label)
-        })
+        for label in labels {
+            if let Some(param) = self
+                .params
+                .values()
+                .filter(|param| matches!(param.kind, ParamKind::Select) && param.label == *label)
+                .min_by_key(|param| param.id)
+            {
+                return Some(param);
+            }
+        }
+        None
+    }
+
+    fn find_tx_power_select_param(&self) -> Option<&ParamEntry> {
+        self.find_current_tx_power_select_param()
+            .or_else(|| self.find_max_tx_power_select_param())
+            .or_else(|| self.find_tx_power_select_fallback())
+    }
+
+    fn find_current_tx_power_select_param(&self) -> Option<&ParamEntry> {
+        self.find_select_param(TX_POWER_CURRENT_LABELS)
+            .or_else(|| self.find_current_tx_power_select_fallback())
+    }
+
+    fn find_max_tx_power_select_param(&self) -> Option<&ParamEntry> {
+        self.find_select_param(TX_POWER_MAX_LABELS)
+    }
+
+    fn find_tx_power_select_fallback(&self) -> Option<&ParamEntry> {
+        self.params
+            .values()
+            .filter(|param| matches!(param.kind, ParamKind::Select))
+            .filter_map(|param| {
+                tx_power_label_priority(&param.label).map(|priority| (priority, param.id, param))
+            })
+            .min_by_key(|(priority, id, _)| (*priority, *id))
+            .map(|(_, _, param)| param)
+    }
+
+    fn find_current_tx_power_select_fallback(&self) -> Option<&ParamEntry> {
+        self.params
+            .values()
+            .filter(|param| matches!(param.kind, ParamKind::Select))
+            .filter_map(|param| {
+                current_tx_power_label_priority(&param.label)
+                    .map(|priority| (priority, param.id, param))
+            })
+            .min_by_key(|(priority, id, _)| (*priority, *id))
+            .map(|(_, _, param)| param)
+    }
+
+    fn find_pending_tx_power_select_field(&self) -> Option<(u8, String)> {
+        self.pending_param_chunks
+            .iter()
+            .filter_map(|(&field_id, pending)| {
+                if !matches!(parse_param_kind(pending.kind_raw), ParamKind::Select) {
+                    return None;
+                }
+                let label_end = pending
+                    .data
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .unwrap_or(pending.data.len());
+                let label = String::from_utf8_lossy(&pending.data[..label_end]).to_string();
+                tx_power_label_priority(&label).map(|priority| (priority, field_id, label))
+            })
+            .min_by_key(|(priority, field_id, _)| (*priority, *field_id))
+            .map(|(_, field_id, label)| (field_id, label))
+    }
+
+    fn find_pending_current_tx_power_select_field(&self) -> Option<(u8, String)> {
+        self.pending_param_chunks
+            .iter()
+            .filter_map(|(&field_id, pending)| {
+                if !matches!(parse_param_kind(pending.kind_raw), ParamKind::Select) {
+                    return None;
+                }
+                let label_end = pending
+                    .data
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .unwrap_or(pending.data.len());
+                let label = String::from_utf8_lossy(&pending.data[..label_end]).to_string();
+                current_tx_power_label_priority(&label).map(|priority| (priority, field_id, label))
+            })
+            .min_by_key(|(priority, field_id, _)| (*priority, *field_id))
+            .map(|(_, field_id, label)| (field_id, label))
     }
 
     fn find_string_param(&self, labels: &[&str]) -> Option<u8> {
@@ -615,10 +843,9 @@ impl ElrsProtocolRuntime {
     }
 
     fn drop_pending_wifi_frames(&mut self) {
-        self.outgoing_queue.retain(|frame| {
-            frame.get(2).copied() != Some(PARAM_WRITE_ID)
-                || frame.get(6).copied() != Some(CommandStep::Start.raw())
-        });
+        let pending = self.pending_command.clone();
+        self.outgoing_queue
+            .retain(|frame| !is_pending_wifi_start_frame(pending.as_ref(), frame));
     }
 
     fn update_pending_command(&mut self, entry: &ParamEntry) -> Option<String> {
@@ -675,6 +902,83 @@ impl ElrsProtocolRuntime {
                 suffix_info(&status.info)
             )),
         }
+    }
+
+    fn update_pending_tx_power(&mut self, entry: &ParamEntry) -> Option<String> {
+        let Some(pending) = self.pending_tx_power_write.clone() else {
+            return None;
+        };
+        let select_confirmed = pending.field_id == entry.id
+            && matches!(entry.kind, ParamKind::Select)
+            && entry
+                .options
+                .get(pending.expected_index as usize)
+                .map(|expected| entry.value == *expected)
+                .unwrap_or(false);
+
+        let telemetry_confirmed = matches!(pending.kind, PendingTxPowerKind::Current)
+            && entry.id == ELRS_LINK_STAT_ID
+            && pending
+                .expected_mw
+                .map(|expected| parse_power_value(&entry.value) == Some(expected))
+                .unwrap_or(false);
+
+        if !select_confirmed && !telemetry_confirmed {
+            return None;
+        }
+        self.pending_tx_power_write = None;
+        self.last_tx_power_query_at = None;
+        let expected_text = if telemetry_confirmed {
+            pending
+                .expected_mw
+                .map(|value| format!("{}mW", value))
+                .unwrap_or_else(|| entry.value.clone())
+        } else {
+            entry
+                .options
+                .get(pending.expected_index as usize)
+                .cloned()
+                .unwrap_or_else(|| entry.value.clone())
+        };
+        let message = match pending.kind {
+            PendingTxPowerKind::Current => format!("TX power applied: {}", expected_text),
+            PendingTxPowerKind::Max => format!("TX max power applied: {}", expected_text),
+        };
+        Some(message)
+    }
+
+    fn update_pending_tx_power_from_link(&mut self, frame: &[u8]) -> Option<String> {
+        let pending = self.pending_tx_power_write.clone()?;
+        if !matches!(pending.kind, PendingTxPowerKind::Current) {
+            return None;
+        }
+        let expected = pending.expected_mw?;
+        let actual = parse_link_frame_tx_power_mw(frame)?;
+        if actual != expected {
+            return None;
+        }
+        self.pending_tx_power_write = None;
+        self.last_tx_power_query_at = None;
+        Some(format!("TX power applied: {}mW", actual))
+    }
+
+    fn update_pending_tx_power_from_write_ack(&mut self, frame: &[u8]) -> Option<String> {
+        let pending = self.pending_tx_power_write.clone()?;
+        if frame.len() < 8 || frame.get(2).copied()? != PARAM_WRITE_ID {
+            return None;
+        }
+        let field_id = frame.get(5).copied()?;
+        let value = frame.get(6).copied()?;
+        if field_id != pending.field_id || value != pending.expected_index {
+            return None;
+        }
+        self.pending_tx_power_write = None;
+        self.last_tx_power_query_at = None;
+        let message = match pending.kind {
+            PendingTxPowerKind::Current => format!("TX power applied: idx {}", value),
+            PendingTxPowerKind::Max => format!("TX max power applied: idx {}", value),
+        };
+        Some(message)
     }
 
     fn consume_parameter_frame(&mut self, frame: &[u8]) -> Option<ParamEntry> {
@@ -882,12 +1186,6 @@ fn parse_parameter_entry(frame: &[u8]) -> Option<ParamEntry> {
     let parent = *frame.get(7)?;
     let kind_raw = *frame.get(8)?;
     let kind = parse_param_kind(kind_raw);
-    // SELECT/String/Folder/Info 类型需要完整数据，chunks_remain > 0 时数据不完整，丢弃。
-    // COMMAND 类型的 label + status 在第一个 chunk 中就已经完整，
-    // 允许 chunks_remain > 0（info text 可能截断，但不影响命令识别和发送）。
-    if chunks_remain != 0 && !matches!(kind, ParamKind::Command) {
-        return None;
-    }
     let mut cursor = 9usize;
     // ELRS 使用 8 字节数据块。COMMAND 类型首 chunk 的 label 末尾可能落在下一个 chunk
     // 中，导致本帧内找不到 null 终止符。此时用所有可用字节作截断 label 存入 params，
@@ -896,7 +1194,9 @@ fn parse_parameter_entry(frame: &[u8]) -> Option<ParamEntry> {
     let label_end = match label_terminated {
         Some(pos) => pos + cursor,
         None => {
-            if chunks_remain != 0 && matches!(kind, ParamKind::Command) {
+            if chunks_remain != 0
+                && (matches!(kind, ParamKind::Command) || matches!(kind, ParamKind::Select))
+            {
                 frame.len().saturating_sub(1) // CRC 之前的所有字节作截断 label
             } else {
                 return None;
@@ -910,24 +1210,41 @@ fn parse_parameter_entry(frame: &[u8]) -> Option<ParamEntry> {
         frame.len().saturating_sub(1)
     };
 
+    // 默认要求完整 chunk。仅 COMMAND 和 TX power 的 SELECT 允许使用首 chunk 的截断信息。
+    if chunks_remain != 0
+        && !matches!(kind, ParamKind::Command)
+        && !(matches!(kind, ParamKind::Select) && is_tx_power_label_candidate(&label))
+    {
+        return None;
+    }
+
     let mut options = Vec::new();
     let mut value = String::new();
     let mut command_status = None;
 
     match kind {
         ParamKind::Select => {
-            let options_end = frame[cursor..].iter().position(|byte| *byte == 0)? + cursor;
-            options = frame[cursor..options_end]
-                .split(|byte| *byte == b';')
-                .map(|slice| String::from_utf8_lossy(slice).to_string())
-                .filter(|item| !item.is_empty())
-                .collect();
-            cursor = options_end + 1;
-            let current = *frame.get(cursor)?;
-            value = options
-                .get(current as usize)
-                .cloned()
-                .unwrap_or_else(|| current.to_string());
+            let options_end = frame[cursor..].iter().position(|byte| *byte == 0);
+            if let Some(offset) = options_end {
+                let options_end = offset + cursor;
+                options = parse_select_options(&frame[cursor..options_end]);
+                cursor = options_end + 1;
+                if let Some(current) = frame.get(cursor).copied() {
+                    value = options
+                        .get(current as usize)
+                        .cloned()
+                        .unwrap_or_else(|| current.to_string());
+                } else if chunks_remain != 0 {
+                    value = options.first().cloned().unwrap_or_default();
+                } else {
+                    return None;
+                }
+            } else if chunks_remain != 0 && is_tx_power_label_candidate(&label) {
+                options = parse_select_options(&frame[cursor..frame.len().saturating_sub(1)]);
+                value = options.first().cloned().unwrap_or_default();
+            } else {
+                return None;
+            }
         }
         ParamKind::Command => {
             if label_terminated.is_none() {
@@ -984,6 +1301,14 @@ fn parse_parameter_entry(frame: &[u8]) -> Option<ParamEntry> {
         ParamKind::Folder | ParamKind::Unknown(_) => {}
     }
 
+    if field_id == ELRS_LINK_STAT_ID {
+        if let Some(power) =
+            parse_link_stat_tx_power_mw(frame.get(3..frame.len().saturating_sub(1))?)
+        {
+            value = format!("{}mW", power);
+        }
+    }
+
     Some(ParamEntry {
         id: field_id,
         parent,
@@ -1026,6 +1351,54 @@ fn nearest_option_index(options: &[String], target_mw: u16) -> Option<usize> {
 fn parse_power_value(raw: &str) -> Option<u16> {
     let digits: String = raw.chars().filter(|ch| ch.is_ascii_digit()).collect();
     digits.parse::<u16>().ok()
+}
+
+fn parse_link_stat_tx_power_mw(raw: &[u8]) -> Option<u16> {
+    let idx = *raw.get(7)? as usize;
+    const POWER_VALUES: [u16; 9] = [0, 10, 25, 100, 500, 1000, 2000, 250, 50];
+    POWER_VALUES.get(idx).copied()
+}
+
+fn parse_link_frame_tx_power_mw(frame: &[u8]) -> Option<u16> {
+    let idx = *frame.get(9)? as usize;
+    const POWER_VALUES: [u16; 9] = [0, 10, 25, 100, 500, 1000, 2000, 250, 50];
+    POWER_VALUES.get(idx).copied()
+}
+
+fn fallback_tx_power_option_index(target_mw: u16) -> usize {
+    TX_POWER_FALLBACK_LEVELS_MW
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, value)| value.abs_diff(target_mw))
+        .map(|(idx, _)| idx)
+        .unwrap_or(0)
+}
+
+fn parse_select_options(raw: &[u8]) -> Vec<String> {
+    raw.split(|byte| *byte == b';')
+        .map(|slice| String::from_utf8_lossy(slice).trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+fn tx_power_label_priority(label: &str) -> Option<usize> {
+    let lower = label.to_ascii_lowercase();
+    TX_POWER_FALLBACK_LABELS.iter().position(|candidate| {
+        lower == *candidate || (lower.len() >= 4 && candidate.starts_with(lower.as_str()))
+    })
+}
+
+fn current_tx_power_label_priority(label: &str) -> Option<usize> {
+    let lower = label.to_ascii_lowercase();
+    TX_POWER_CURRENT_FALLBACK_LABELS
+        .iter()
+        .position(|candidate| {
+            lower == *candidate || (lower.len() >= 4 && candidate.starts_with(lower.as_str()))
+        })
+}
+
+fn is_tx_power_label_candidate(label: &str) -> bool {
+    tx_power_label_priority(label).is_some()
 }
 
 fn crc8_ba(data: &[u8]) -> u8 {
@@ -1274,6 +1647,357 @@ mod tests {
         assert_eq!(frame[2], 0x2D);
         assert_eq!(frame[5], 9);
         assert_eq!(&frame[6..12], b"abc123");
+    }
+
+    #[test]
+    fn test_select_tx_power_value_prefers_current_over_max() {
+        let mut runtime = ElrsProtocolRuntime::default();
+        runtime.params.insert(
+            3,
+            ParamEntry {
+                id: 3,
+                parent: 0,
+                kind: ParamKind::Select,
+                label: "Max Power".to_string(),
+                options: vec!["25".to_string(), "250".to_string()],
+                value: "250".to_string(),
+                command_status: None,
+            },
+        );
+        runtime.params.insert(
+            4,
+            ParamEntry {
+                id: 4,
+                parent: 0,
+                kind: ParamKind::Select,
+                label: "Power".to_string(),
+                options: vec!["10".to_string(), "100".to_string()],
+                value: "100".to_string(),
+                command_status: None,
+            },
+        );
+
+        assert_eq!(runtime.select_tx_power_value().as_deref(), Some("100"));
+    }
+
+    #[test]
+    fn test_set_tx_power_prefers_current_power_field_id() {
+        let mut runtime = ElrsProtocolRuntime::default();
+        runtime.params.insert(
+            9,
+            ParamEntry {
+                id: 9,
+                parent: 0,
+                kind: ParamKind::Select,
+                label: "Max Power".to_string(),
+                options: vec!["25".to_string(), "250".to_string()],
+                value: "25".to_string(),
+                command_status: None,
+            },
+        );
+        runtime.params.insert(
+            10,
+            ParamEntry {
+                id: 10,
+                parent: 0,
+                kind: ParamKind::Select,
+                label: "Power".to_string(),
+                options: vec!["25".to_string(), "250".to_string()],
+                value: "25".to_string(),
+                command_status: None,
+            },
+        );
+
+        let status = runtime.request(ElrsOperation::SetTxPower(250));
+        assert_eq!(status.message(), "TX power request queued");
+
+        let frame = runtime
+            .poll_outgoing_frame(Instant::now() + Duration::from_secs(1))
+            .expect("queued tx power frame");
+        assert_eq!(frame[2], 0x2D);
+        assert_eq!(frame[5], 10);
+    }
+
+    #[test]
+    fn test_set_tx_power_prefers_label_priority_over_hashmap_iteration_order() {
+        let mut runtime = ElrsProtocolRuntime::default();
+        runtime.params.insert(
+            2,
+            ParamEntry {
+                id: 2,
+                parent: 0,
+                kind: ParamKind::Select,
+                label: "RF Power".to_string(),
+                options: vec!["25".to_string(), "250".to_string()],
+                value: "25".to_string(),
+                command_status: None,
+            },
+        );
+        runtime.params.insert(
+            20,
+            ParamEntry {
+                id: 20,
+                parent: 0,
+                kind: ParamKind::Select,
+                label: "Power".to_string(),
+                options: vec!["25".to_string(), "250".to_string()],
+                value: "25".to_string(),
+                command_status: None,
+            },
+        );
+
+        let status = runtime.request(ElrsOperation::SetTxPower(250));
+        assert_eq!(status.message(), "TX power request queued");
+
+        let frame = runtime
+            .poll_outgoing_frame(Instant::now() + Duration::from_secs(1))
+            .expect("queued tx power frame");
+        assert_eq!(frame[2], 0x2D);
+        // "Power" is ahead of "RF Power" in TX_POWER_CURRENT_LABELS.
+        assert_eq!(frame[5], 20);
+    }
+
+    #[test]
+    fn test_set_tx_power_falls_back_to_max_power_when_current_missing() {
+        let mut runtime = ElrsProtocolRuntime::default();
+        runtime.params.insert(
+            11,
+            ParamEntry {
+                id: 11,
+                parent: 0,
+                kind: ParamKind::Select,
+                label: "Max Power".to_string(),
+                options: vec!["25".to_string(), "500".to_string()],
+                value: "25".to_string(),
+                command_status: None,
+            },
+        );
+
+        let status = runtime.request(ElrsOperation::SetTxPower(500));
+        assert_eq!(status.message(), "TX power request queued");
+
+        let frame = runtime
+            .poll_outgoing_frame(Instant::now() + Duration::from_secs(1))
+            .expect("queued tx power frame");
+        assert_eq!(frame[2], 0x2D);
+        assert_eq!(frame[5], 11);
+    }
+
+    #[test]
+    fn test_set_tx_power_returns_unsupported_when_no_power_select_found() {
+        let mut runtime = ElrsProtocolRuntime::default();
+        let status = runtime.request(ElrsOperation::SetTxPower(250));
+        assert!(matches!(status, super::ElrsOperationStatus::Unsupported(_)));
+        assert_eq!(
+            status.message(),
+            "TX power is read-only on this module (adjust TX max power)"
+        );
+    }
+
+    #[test]
+    fn test_set_tx_power_rejected_when_only_max_power_exists() {
+        let mut runtime = ElrsProtocolRuntime::default();
+        runtime.params.insert(
+            6,
+            ParamEntry {
+                id: 6,
+                parent: 0,
+                kind: ParamKind::Select,
+                label: "Max Power".to_string(),
+                options: vec!["10".to_string(), "25".to_string()],
+                value: "10".to_string(),
+                command_status: None,
+            },
+        );
+
+        let status = runtime.request(ElrsOperation::SetTxPower(25));
+        assert!(matches!(status, super::ElrsOperationStatus::Unsupported(_)));
+        assert_eq!(
+            status.message(),
+            "TX power is read-only on this module (adjust TX max power)"
+        );
+    }
+
+    #[test]
+    fn test_set_tx_power_uses_fallback_index_when_tx_power_select_chunk_has_no_options_yet() {
+        let mut runtime = ElrsProtocolRuntime::default();
+        let first_chunk = vec![
+            0xC8,
+            0x11,
+            PARAM_SETTINGS_ENTRY_ID,
+            0xEA,
+            0xEE,
+            0x05,
+            0x01,
+            0x00,
+            0x09,
+            b'T',
+            b'X',
+            b' ',
+            b'P',
+            b'o',
+            b'w',
+            b'e',
+            b'r',
+            0x00,
+        ];
+        runtime.consume_frame(&first_chunk);
+
+        let status = runtime.request(ElrsOperation::SetTxPower(100));
+        assert_eq!(status.message(), "TX power request queued");
+
+        let frame = runtime
+            .poll_outgoing_frame(Instant::now() + Duration::from_secs(1))
+            .expect("queued tx power frame");
+        assert_eq!(frame[2], 0x2D);
+        assert_eq!(frame[5], 0x05);
+        // fallback levels: [10, 25, 50, 100, 250, 500, 1000, 2000]
+        assert_eq!(frame[6], 3);
+    }
+
+    #[test]
+    fn test_tx_power_write_gets_applied_feedback_on_matching_select_update() {
+        let mut runtime = ElrsProtocolRuntime::default();
+        runtime.params.insert(
+            5,
+            ParamEntry {
+                id: 5,
+                parent: 0,
+                kind: ParamKind::Select,
+                label: "TX Power".to_string(),
+                options: vec!["10".to_string(), "25".to_string(), "100".to_string()],
+                value: "10".to_string(),
+                command_status: None,
+            },
+        );
+
+        let status = runtime.request(ElrsOperation::SetTxPower(100));
+        assert_eq!(status.message(), "TX power request queued");
+
+        let _frame = runtime
+            .poll_outgoing_frame(Instant::now() + Duration::from_secs(1))
+            .expect("queued tx power frame");
+
+        let confirm = vec![
+            0xC8,
+            0x1C,
+            PARAM_SETTINGS_ENTRY_ID,
+            0xEA,
+            0xEE,
+            0x05,
+            0x00,
+            0x00,
+            0x09,
+            b'T',
+            b'X',
+            b' ',
+            b'P',
+            b'o',
+            b'w',
+            b'e',
+            b'r',
+            0x00,
+            b'1',
+            b'0',
+            b';',
+            b'2',
+            b'5',
+            b';',
+            b'1',
+            b'0',
+            b'0',
+            0x00,
+            0x02,
+        ];
+        runtime.consume_frame(&confirm);
+        let status_text = runtime.take_status_text();
+        assert_eq!(status_text.as_deref(), Some("TX power applied: 100"));
+    }
+
+    #[test]
+    fn test_tx_max_power_write_gets_applied_feedback_on_matching_select_update() {
+        let mut runtime = ElrsProtocolRuntime::default();
+        runtime.params.insert(
+            6,
+            ParamEntry {
+                id: 6,
+                parent: 0,
+                kind: ParamKind::Select,
+                label: "Max Power".to_string(),
+                options: vec!["25".to_string(), "250".to_string(), "500".to_string()],
+                value: "250".to_string(),
+                command_status: None,
+            },
+        );
+
+        let status = runtime.request(ElrsOperation::SetTxMaxPower(500));
+        assert_eq!(status.message(), "TX max power request queued");
+
+        let _frame = runtime
+            .poll_outgoing_frame(Instant::now() + Duration::from_secs(1))
+            .expect("queued tx max power frame");
+
+        let confirm = vec![
+            0xC8, 0x1D, 0x2B, 0xEA, 0xEE, 0x06, 0x00, 0x00, 0x09, b'M', b'a', b'x', b' ', b'P',
+            b'o', b'w', b'e', b'r', 0, b'2', b'5', b';', b'2', b'5', b'0', b';', b'5', b'0', b'0',
+            0, 0x02,
+        ];
+        runtime.consume_frame(&confirm);
+        let status_text = runtime.take_status_text();
+        assert_eq!(status_text.as_deref(), Some("TX max power applied: 500"));
+    }
+
+    #[test]
+    fn test_tx_power_write_gets_applied_feedback_on_2d_ack() {
+        let mut runtime = ElrsProtocolRuntime::default();
+        runtime.params.insert(
+            6,
+            ParamEntry {
+                id: 6,
+                parent: 0,
+                kind: ParamKind::Select,
+                label: "Max Power".to_string(),
+                options: vec!["25".to_string(), "250".to_string(), "500".to_string()],
+                value: "25".to_string(),
+                command_status: None,
+            },
+        );
+
+        let status = runtime.request(ElrsOperation::SetTxMaxPower(500));
+        assert_eq!(status.message(), "TX max power request queued");
+
+        let _frame = runtime
+            .poll_outgoing_frame(Instant::now() + Duration::from_secs(1))
+            .expect("queued tx max power frame");
+
+        let ack = vec![0xC8, 0x06, 0x2D, 0xEE, 0xEF, 0x06, 0x02, 0x00];
+        runtime.consume_frame(&ack);
+        let status_text = runtime.take_status_text();
+        assert_eq!(status_text.as_deref(), Some("TX max power applied: idx 2"));
+    }
+
+    #[test]
+    fn test_tx_power_confirmation_via_link_stat_telemetry() {
+        let mut runtime = ElrsProtocolRuntime::default();
+        let first_chunk = vec![
+            0xC8, 0x11, 0x2B, 0xEA, 0xEE, 0x05, 0x01, 0x00, 0x09, b'T', b'X', b' ', b'P', b'o',
+            b'w', b'e', b'r', 0x00,
+        ];
+        runtime.consume_frame(&first_chunk);
+
+        let status = runtime.request(ElrsOperation::SetTxPower(100));
+        assert_eq!(status.message(), "TX power request queued");
+
+        let _write = runtime
+            .poll_outgoing_frame(Instant::now() + Duration::from_millis(100))
+            .expect("tx power write frame");
+
+        let link_stat = vec![
+            0xC8, 0x0C, 0x14, 0xEA, 0xEE, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00,
+        ];
+        runtime.consume_frame(&link_stat);
+        let status_text = runtime.take_status_text();
+        assert_eq!(status_text.as_deref(), Some("TX power applied: 100mW"));
     }
 
     #[test]
@@ -1754,5 +2478,57 @@ mod tests {
                 .unwrap_or(true),
             "WiFi off should remove queued START frames"
         );
+    }
+
+    #[test]
+    fn test_wifi_disable_does_not_drop_unrelated_param_write_frames() {
+        let mut runtime = ElrsProtocolRuntime::default();
+        runtime.device_info = Some(super::DeviceInfo {
+            name: "DuplicateTX ESP".to_string(),
+            serial: 0,
+            hw_version: 3,
+            sw_version: (3 << 16) | (2 << 8) | 1,
+            field_count: 64,
+            is_elrs: true,
+        });
+        runtime.params.insert(
+            15,
+            ParamEntry {
+                id: 15,
+                parent: 0,
+                kind: ParamKind::Command,
+                label: "Enable WiFi".to_string(),
+                options: Vec::new(),
+                value: String::new(),
+                command_status: None,
+            },
+        );
+        runtime.params.insert(
+            7,
+            ParamEntry {
+                id: 7,
+                parent: 0,
+                kind: ParamKind::Select,
+                label: "Power".to_string(),
+                options: vec!["25".to_string(), "250".to_string()],
+                value: "25".to_string(),
+                command_status: None,
+            },
+        );
+
+        let wifi_status = runtime.request(ElrsOperation::SetWifiManual(true));
+        assert_eq!(wifi_status.message(), "WiFi command queued");
+        let power_status = runtime.request(ElrsOperation::SetTxPower(250));
+        assert_eq!(power_status.message(), "TX power request queued");
+
+        let clear_status = runtime.request(ElrsOperation::SetWifiManual(false));
+        assert_eq!(clear_status.message(), "WiFi state cleared");
+
+        let frame = runtime
+            .poll_outgoing_frame(Instant::now() + Duration::from_secs(1))
+            .expect("tx power write should remain queued");
+        assert_eq!(frame[2], 0x2D);
+        assert_eq!(frame[5], 7);
+        assert_eq!(frame[6], 1);
     }
 }

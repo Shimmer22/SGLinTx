@@ -72,6 +72,8 @@ pub struct ElrsUiConfig {
     pub bind_mode: bool,
     #[serde(default = "default_elrs_tx_power_mw")]
     pub tx_power_mw: u16,
+    #[serde(default = "default_elrs_tx_max_power_mw")]
+    pub tx_max_power_mw: u16,
     #[serde(default = "default_elrs_bind_phrase")]
     pub bind_phrase: String,
 }
@@ -284,6 +286,7 @@ impl Default for ElrsUiConfig {
             wifi_manual_on: false,
             bind_mode: false,
             tx_power_mw: default_elrs_tx_power_mw(),
+            tx_max_power_mw: default_elrs_tx_max_power_mw(),
             bind_phrase: default_elrs_bind_phrase(),
         }
     }
@@ -466,6 +469,10 @@ fn default_elrs_tx_power_mw() -> u16 {
     100
 }
 
+fn default_elrs_tx_max_power_mw() -> u16 {
+    1000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,5 +511,12 @@ mod tests {
 
         assert_eq!(radio, restored_radio);
         assert_eq!(model, restored_model);
+    }
+
+    #[test]
+    fn test_elrs_default_tx_max_power() {
+        let cfg = ElrsUiConfig::default();
+        assert_eq!(cfg.tx_max_power_mw, 1000);
+        assert!(cfg.tx_power_mw <= cfg.tx_max_power_mw);
     }
 }

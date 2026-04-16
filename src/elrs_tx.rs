@@ -145,7 +145,7 @@ struct ElrsUiState {
 }
 
 impl ElrsUiState {
-    const SELECTABLE_PARAM_COUNT: usize = 5;
+    const SELECTABLE_PARAM_COUNT: usize = 6;
 
     fn load() -> Self {
         let mut config = store::load_radio_config()
@@ -175,7 +175,8 @@ impl ElrsUiState {
             1 => UiFeedbackTarget::FieldId("wifi_manual".to_string()),
             2 => UiFeedbackTarget::FieldId("bind".to_string()),
             3 => UiFeedbackTarget::FieldId("tx_power".to_string()),
-            4 => UiFeedbackTarget::FieldId("bind_phrase".to_string()),
+            4 => UiFeedbackTarget::FieldId("tx_max_power".to_string()),
+            5 => UiFeedbackTarget::FieldId("bind_phrase".to_string()),
             _ => UiFeedbackTarget::SelectedListRow,
         }
     }
@@ -474,32 +475,56 @@ impl ElrsUiState {
                 }
             }
             3 => {
-                self.config.tx_power_mw = shift_power_level(self.config.tx_power_mw, delta);
-                let status = protocol.request(ElrsOperation::SetTxPower(self.config.tx_power_mw));
-                match self.persist() {
-                    Ok(()) => {
-                        let message = if matches!(status, ElrsOperationStatus::Unsupported(_)) {
-                            status.message().to_string()
-                        } else {
-                            format!("TX power set to {}mW", self.config.tx_power_mw)
-                        };
-                        match status {
-                            ElrsOperationStatus::Unsupported(_) => self.emit_feedback(
-                                UiFeedbackSeverity::Error,
-                                UiFeedbackMotion::ShakeX,
-                                message.clone(),
-                            ),
-                            ElrsOperationStatus::Queued(_) | ElrsOperationStatus::Busy(_) => self
-                                .emit_feedback(
-                                    UiFeedbackSeverity::Success,
-                                    UiFeedbackMotion::Pulse,
-                                    message.clone(),
-                                ),
-                        }
+                if !self.config.rf_output_enabled {
+                    let message = "TX power unavailable: enable RF output first".to_string();
+                    self.emit_feedback(
+                        UiFeedbackSeverity::Error,
+                        UiFeedbackMotion::ShakeX,
+                        message.clone(),
+                    );
+                    return message;
+                }
+                if !connected {
+                    let message = "TX power unavailable: UART offline".to_string();
+                    self.emit_feedback(
+                        UiFeedbackSeverity::Error,
+                        UiFeedbackMotion::ShakeX,
+                        message.clone(),
+                    );
+                    return message;
+                }
+                let requested = shift_power_level(self.config.tx_power_mw, delta);
+                if requested > self.config.tx_max_power_mw {
+                    let message = format!("TX power exceeds max {}mW", self.config.tx_max_power_mw);
+                    self.emit_feedback(
+                        UiFeedbackSeverity::Error,
+                        UiFeedbackMotion::ShakeX,
+                        message.clone(),
+                    );
+                    return message;
+                }
+                if !protocol.has_current_tx_power_control() {
+                    let message =
+                        "TX power is read-only on this module (adjust TX max power)".to_string();
+                    self.emit_feedback(
+                        UiFeedbackSeverity::Error,
+                        UiFeedbackMotion::ShakeX,
+                        message.clone(),
+                    );
+                    return message;
+                }
+                let status = protocol.request(ElrsOperation::SetTxPower(requested));
+                let message = status.message().to_string();
+                match status {
+                    ElrsOperationStatus::Queued(_) | ElrsOperationStatus::Busy(_) => {
+                        self.emit_feedback(
+                            UiFeedbackSeverity::Busy,
+                            UiFeedbackMotion::Pulse,
+                            message.clone(),
+                        );
                         message
                     }
-                    Err(err) => {
-                        let message = format!("TX power save failed: {err}");
+                    ElrsOperationStatus::Unsupported(_) => {
                         self.emit_feedback(
                             UiFeedbackSeverity::Error,
                             UiFeedbackMotion::ShakeX,
@@ -510,6 +535,47 @@ impl ElrsUiState {
                 }
             }
             4 => {
+                if !self.config.rf_output_enabled {
+                    let message = "TX max power unavailable: enable RF output first".to_string();
+                    self.emit_feedback(
+                        UiFeedbackSeverity::Error,
+                        UiFeedbackMotion::ShakeX,
+                        message.clone(),
+                    );
+                    return message;
+                }
+                if !connected {
+                    let message = "TX max power unavailable: UART offline".to_string();
+                    self.emit_feedback(
+                        UiFeedbackSeverity::Error,
+                        UiFeedbackMotion::ShakeX,
+                        message.clone(),
+                    );
+                    return message;
+                }
+                let requested = shift_power_level(self.config.tx_max_power_mw, delta);
+                let status = protocol.request(ElrsOperation::SetTxMaxPower(requested));
+                let message = status.message().to_string();
+                match status {
+                    ElrsOperationStatus::Queued(_) | ElrsOperationStatus::Busy(_) => {
+                        self.emit_feedback(
+                            UiFeedbackSeverity::Busy,
+                            UiFeedbackMotion::Pulse,
+                            message.clone(),
+                        );
+                        message
+                    }
+                    ElrsOperationStatus::Unsupported(_) => {
+                        self.emit_feedback(
+                            UiFeedbackSeverity::Error,
+                            UiFeedbackMotion::ShakeX,
+                            message.clone(),
+                        );
+                        message
+                    }
+                }
+            }
+            5 => {
                 self.editor = Some(EditorState::new(&self.config.bind_phrase));
                 self.clear_feedback();
                 "Editing bind phrase".to_string()
@@ -523,8 +589,8 @@ impl ElrsUiState {
 
     fn activate_selected(&mut self, protocol: &mut ElrsProtocolRuntime, connected: bool) -> String {
         match self.selected_idx {
-            0..=3 => self.adjust_selected(1, protocol, connected),
-            4 => {
+            0..=4 => self.adjust_selected(1, protocol, connected),
+            5 => {
                 self.editor = Some(EditorState::new(&self.config.bind_phrase));
                 self.clear_feedback();
                 "Editing bind phrase".to_string()
@@ -562,7 +628,8 @@ impl ElrsUiState {
                 }
             }
             3 => format!("TX power {}mW", self.config.tx_power_mw),
-            4 => "Bind phrase".to_string(),
+            4 => format!("TX max power {}mW", self.config.tx_max_power_mw),
+            5 => "Bind phrase".to_string(),
             _ => String::new(),
         }
     }
@@ -1153,6 +1220,16 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                                             );
                                         }
                                     }
+                                    0x2D => {
+                                        let field_id = frame.get(5).copied().unwrap_or(0);
+                                        let value = frame.get(6).copied().unwrap_or(0);
+                                        rf_logln!(
+                                            "rf_link_service received ELRS write-ack field={:#04X} value=0x{:02X} frame={:02X?}",
+                                            field_id,
+                                            value,
+                                            frame
+                                        );
+                                    }
                                     0x2E => rf_logln!(
                                         "rf_link_service received ELRS link stat: {:02X?}",
                                         frame
@@ -1173,9 +1250,7 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                             }
                             if let Some(info) = protocol.device_info() {
                                 if info.is_elrs {
-                                    if let Some(power) =
-                                        protocol.select_value_for_labels(&["Max Power", "TX Power"])
-                                    {
+                                    if let Some(power) = protocol.select_tx_power_value() {
                                         if let Ok(parsed) = power
                                             .chars()
                                             .filter(|ch| ch.is_ascii_digit())
@@ -1185,6 +1260,20 @@ fn rf_link_service_main(argc: u32, argv: *const &str) {
                                             ui_state.config.tx_power_mw = parsed;
                                         }
                                     }
+                                    if let Some(max_power) = protocol.select_tx_max_power_value() {
+                                        if let Ok(parsed) = max_power
+                                            .chars()
+                                            .filter(|ch| ch.is_ascii_digit())
+                                            .collect::<String>()
+                                            .parse::<u16>()
+                                        {
+                                            ui_state.config.tx_max_power_mw = parsed;
+                                            if ui_state.config.tx_power_mw > parsed {
+                                                ui_state.config.tx_power_mw = parsed;
+                                            }
+                                        }
+                                    }
+                                    let _ = ui_state.persist();
                                 }
                             }
                             if let Some(status) = link_monitor.on_link_active() {
@@ -1406,7 +1495,7 @@ fn build_elrs_state(
         packet_rate: "--".to_string(),
         telemetry_ratio: "--".to_string(),
         tx_power: protocol
-            .select_value_for_labels(&["Max Power", "TX Power"])
+            .select_tx_power_value()
             .unwrap_or_else(|| format!("{}mW", ui_state.config.tx_power_mw)),
         status_text,
         wifi_running: ui_state.config.wifi_manual_on,
@@ -1447,7 +1536,20 @@ fn build_elrs_state(
             crate::messages::ElrsParamEntry {
                 id: "tx_power".to_string(),
                 label: "TX Power".to_string(),
-                value: format!("{}mW", ui_state.config.tx_power_mw),
+                value: if protocol.has_current_tx_power_control() {
+                    format!("{}mW", ui_state.config.tx_power_mw)
+                } else {
+                    format!(
+                        "{}mW (Read-only, use TX Max Power)",
+                        ui_state.config.tx_power_mw
+                    )
+                },
+                selectable: protocol.has_current_tx_power_control(),
+            },
+            crate::messages::ElrsParamEntry {
+                id: "tx_max_power".to_string(),
+                label: "TX Max Power".to_string(),
+                value: format!("{}mW", ui_state.config.tx_max_power_mw),
                 selectable: true,
             },
             crate::messages::ElrsParamEntry {
@@ -1687,6 +1789,185 @@ mod tests {
         assert_eq!(state.params[0].value, "OFF");
         assert_eq!(state.params[5].id, "link_state");
         assert_eq!(state.params[5].value, "RF OFF");
+    }
+
+    #[test]
+    fn test_build_elrs_state_tx_power_prefers_runtime_current_power_value() {
+        let mut ui_state = ElrsUiState::load();
+        ui_state.config.rf_output_enabled = true;
+        ui_state.config.tx_power_mw = 500;
+        ui_state.config.tx_max_power_mw = 1000;
+
+        let telemetry = TelemetryStatusState::default();
+        let link_monitor = LinkMonitorState::default();
+        let mut protocol = ElrsProtocolRuntime::default();
+
+        let max_power_frame = vec![
+            0xC8, 0x18, 0x2B, 0xEA, 0xEE, 0x01, 0x00, 0x00, 0x09, b'M', b'a', b'x', b' ', b'P',
+            b'o', b'w', b'e', b'r', 0, b'2', b'5', b';', b'5', b'0', b'0', 0, 0x01, 0x00,
+        ];
+        let current_power_frame = vec![
+            0xC8, 0x14, 0x2B, 0xEA, 0xEE, 0x02, 0x00, 0x00, 0x09, b'P', b'o', b'w', b'e', b'r', 0,
+            b'2', b'5', b';', b'2', b'5', b'0', 0, 0x01, 0x00,
+        ];
+        protocol.consume_frame(&max_power_frame);
+        protocol.consume_frame(&current_power_frame);
+
+        let state = build_elrs_state(
+            true,
+            "ok".to_string(),
+            &telemetry,
+            &ui_state,
+            &protocol,
+            &link_monitor,
+            "/dev/ttyS2",
+        );
+
+        assert_eq!(state.tx_power, "250");
+        let max_entry = state
+            .params
+            .iter()
+            .find(|entry| entry.id == "tx_max_power")
+            .expect("tx_max_power entry");
+        assert_eq!(max_entry.value, "1000mW");
+    }
+
+    #[test]
+    fn test_tx_power_rejects_value_above_max_with_error_feedback() {
+        let mut ui_state = ElrsUiState::load();
+        ui_state.selected_idx = 3;
+        ui_state.config.rf_output_enabled = true;
+        ui_state.config.tx_power_mw = 10;
+        ui_state.config.tx_max_power_mw = 10;
+
+        let mut protocol = ElrsProtocolRuntime::default();
+        let current_power_frame = vec![
+            0xC8, 0x14, 0x2B, 0xEA, 0xEE, 0x02, 0x00, 0x00, 0x09, b'P', b'o', b'w', b'e', b'r', 0,
+            b'1', b'0', b';', b'2', b'5', 0, 0x00, 0x00,
+        ];
+        protocol.consume_frame(&current_power_frame);
+
+        let message = ui_state.adjust_selected(1, &mut protocol, true);
+        assert_eq!(message, "TX power exceeds max 10mW");
+        assert_eq!(ui_state.config.tx_power_mw, 10);
+
+        let feedback = ui_state
+            .interaction_feedback
+            .as_ref()
+            .expect("feedback should exist");
+        assert_eq!(feedback.severity, UiFeedbackSeverity::Error);
+        assert_eq!(
+            feedback.target,
+            UiFeedbackTarget::FieldId("tx_power".to_string())
+        );
+    }
+
+    #[test]
+    fn test_tx_max_power_adjust_clamps_tx_power() {
+        let mut ui_state = ElrsUiState::load();
+        ui_state.selected_idx = 4;
+        ui_state.config.rf_output_enabled = true;
+        ui_state.config.tx_power_mw = 500;
+        ui_state.config.tx_max_power_mw = 500;
+
+        let mut protocol = ElrsProtocolRuntime::default();
+        let max_power_frame = vec![
+            0xC8, 0x18, 0x2B, 0xEA, 0xEE, 0x01, 0x00, 0x00, 0x09, b'M', b'a', b'x', b' ', b'P',
+            b'o', b'w', b'e', b'r', 0, b'2', b'5', b';', b'5', b'0', b'0', 0, 0x01, 0x00,
+        ];
+        protocol.consume_frame(&max_power_frame);
+
+        let message = ui_state.adjust_selected(-1, &mut protocol, true);
+        assert_eq!(message, "TX max power request queued");
+        assert_eq!(ui_state.config.tx_max_power_mw, 500);
+        assert_eq!(ui_state.config.tx_power_mw, 500);
+
+        let feedback = ui_state
+            .interaction_feedback
+            .as_ref()
+            .expect("feedback should exist");
+        assert_eq!(feedback.severity, UiFeedbackSeverity::Busy);
+        assert_eq!(
+            feedback.target,
+            UiFeedbackTarget::FieldId("tx_max_power".to_string())
+        );
+    }
+
+    #[test]
+    fn test_tx_power_requires_rf_output_enabled() {
+        let mut ui_state = ElrsUiState::load();
+        ui_state.selected_idx = 3;
+        ui_state.config.rf_output_enabled = false;
+        ui_state.config.tx_power_mw = 100;
+
+        let message = ui_state.adjust_selected(1, &mut ElrsProtocolRuntime::default(), false);
+        assert_eq!(message, "TX power unavailable: enable RF output first");
+        assert_eq!(ui_state.config.tx_power_mw, 100);
+        let feedback = ui_state
+            .interaction_feedback
+            .as_ref()
+            .expect("feedback should exist");
+        assert_eq!(feedback.severity, UiFeedbackSeverity::Error);
+    }
+
+    #[test]
+    fn test_tx_max_power_requires_rf_output_enabled() {
+        let mut ui_state = ElrsUiState::load();
+        ui_state.selected_idx = 4;
+        ui_state.config.rf_output_enabled = false;
+        ui_state.config.tx_max_power_mw = 500;
+
+        let message = ui_state.adjust_selected(-1, &mut ElrsProtocolRuntime::default(), false);
+        assert_eq!(message, "TX max power unavailable: enable RF output first");
+        assert_eq!(ui_state.config.tx_max_power_mw, 500);
+        let feedback = ui_state
+            .interaction_feedback
+            .as_ref()
+            .expect("feedback should exist");
+        assert_eq!(feedback.severity, UiFeedbackSeverity::Error);
+    }
+
+    #[test]
+    fn test_tx_power_queued_does_not_change_local_value_until_confirmation() {
+        let mut ui_state = ElrsUiState::load();
+        ui_state.selected_idx = 3;
+        ui_state.config.rf_output_enabled = true;
+        ui_state.config.tx_power_mw = 10;
+        ui_state.config.tx_max_power_mw = 1000;
+        let mut protocol = ElrsProtocolRuntime::default();
+
+        let first_chunk = vec![
+            0xC8, 0x11, 0x2B, 0xEA, 0xEE, 0x05, 0x01, 0x00, 0x09, b'T', b'X', b' ', b'P', b'o',
+            b'w', b'e', b'r', 0x00,
+        ];
+        protocol.consume_frame(&first_chunk);
+
+        let message = ui_state.adjust_selected(1, &mut protocol, true);
+        assert_eq!(message, "TX power request queued");
+        assert_eq!(ui_state.config.tx_power_mw, 10);
+    }
+
+    #[test]
+    fn test_tx_power_is_read_only_when_only_max_power_exists() {
+        let mut ui_state = ElrsUiState::load();
+        ui_state.selected_idx = 3;
+        ui_state.config.rf_output_enabled = true;
+        ui_state.config.tx_power_mw = 10;
+        ui_state.config.tx_max_power_mw = 25;
+        let mut protocol = ElrsProtocolRuntime::default();
+
+        let max_power_frame = vec![
+            0xC8, 0x17, 0x2B, 0xEA, 0xEE, 0x06, 0x00, 0x00, 0x09, b'M', b'a', b'x', b' ', b'P',
+            b'o', b'w', b'e', b'r', 0, b'1', b'0', b';', b'2', b'5', 0, 0x00, 0x00,
+        ];
+        protocol.consume_frame(&max_power_frame);
+
+        let message = ui_state.adjust_selected(1, &mut protocol, true);
+        assert_eq!(
+            message,
+            "TX power is read-only on this module (adjust TX max power)"
+        );
+        assert_eq!(ui_state.config.tx_power_mw, 10);
     }
 
     #[test]
