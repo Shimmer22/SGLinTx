@@ -17,7 +17,11 @@ use crate::{
     client_process_args,
     config::{store, ElrsUiConfig},
     elrs::{ElrsOperation, ElrsOperationStatus, ElrsProtocolRuntime, CRSF_SYNC},
-    messages::{ActiveModelMsg, ElrsCommandMsg, ElrsFeedbackMsg, ElrsStateMsg, SystemStatusMsg},
+    messages::{
+        ActiveModelMsg, ElrsCommandMsg, ElrsFeedbackMsg, ElrsStateMsg, SystemStatusMsg,
+        UiFeedbackMotion, UiFeedbackSeverity, UiFeedbackSlot, UiFeedbackTarget,
+        UiInteractionFeedback,
+    },
     mixer::MixerOutMsg,
 };
 
@@ -136,6 +140,8 @@ struct ElrsUiState {
     bind_active: bool,
     bind_waiting_for_link: bool,
     editor: Option<EditorState>,
+    feedback_seq: u32,
+    interaction_feedback: Option<UiInteractionFeedback>,
 }
 
 impl ElrsUiState {
@@ -154,11 +160,50 @@ impl ElrsUiState {
             bind_active: false,
             bind_waiting_for_link: false,
             editor: None,
+            feedback_seq: 0,
+            interaction_feedback: None,
         }
     }
 
     fn editor_label(&self) -> &'static str {
         "Bind Phrase"
+    }
+
+    fn selected_feedback_target(&self) -> UiFeedbackTarget {
+        match self.selected_idx {
+            0 => UiFeedbackTarget::FieldId("rf_output".to_string()),
+            1 => UiFeedbackTarget::FieldId("wifi_manual".to_string()),
+            2 => UiFeedbackTarget::FieldId("bind".to_string()),
+            3 => UiFeedbackTarget::FieldId("tx_power".to_string()),
+            4 => UiFeedbackTarget::FieldId("bind_phrase".to_string()),
+            _ => UiFeedbackTarget::SelectedListRow,
+        }
+    }
+
+    fn emit_feedback(
+        &mut self,
+        severity: UiFeedbackSeverity,
+        motion: UiFeedbackMotion,
+        message: impl Into<String>,
+    ) {
+        self.feedback_seq = self.feedback_seq.wrapping_add(1);
+        self.interaction_feedback = Some(UiInteractionFeedback {
+            seq: self.feedback_seq,
+            severity,
+            target: self.selected_feedback_target(),
+            motion,
+            slot: UiFeedbackSlot::TopStatusBar,
+            message: message.into(),
+            ttl_ms: match severity {
+                UiFeedbackSeverity::Error => 900,
+                UiFeedbackSeverity::Success => 850,
+                UiFeedbackSeverity::Busy => 1200,
+            },
+        });
+    }
+
+    fn clear_feedback(&mut self) {
+        self.interaction_feedback = None;
     }
 
     fn handle_command(
@@ -172,13 +217,18 @@ impl ElrsUiState {
         }
 
         match cmd {
-            ElrsCommandMsg::Back => "Back".to_string(),
+            ElrsCommandMsg::Back => {
+                self.clear_feedback();
+                "Back".to_string()
+            }
             ElrsCommandMsg::Refresh => self.reload_from_disk(),
             ElrsCommandMsg::SelectPrev => {
+                self.clear_feedback();
                 self.selected_idx = self.selected_idx.saturating_sub(1);
                 self.current_item_status()
             }
             ElrsCommandMsg::SelectNext => {
+                self.clear_feedback();
                 let max_idx = Self::SELECTABLE_PARAM_COUNT.saturating_sub(1);
                 self.selected_idx = self.selected_idx.saturating_add(1).min(max_idx);
                 self.current_item_status()
@@ -202,24 +252,34 @@ impl ElrsUiState {
         match cmd {
             ElrsCommandMsg::Back => {
                 self.editor = None;
-                "Bind phrase edit cancelled".to_string()
+                let message = "Bind phrase edit cancelled".to_string();
+                self.emit_feedback(
+                    UiFeedbackSeverity::Error,
+                    UiFeedbackMotion::ShakeX,
+                    message.clone(),
+                );
+                message
             }
             ElrsCommandMsg::SelectPrev => {
+                self.clear_feedback();
                 let editor = self.editor.as_mut().expect("editor checked");
                 editor.cycle_char(-1);
                 format!("Editing bind phrase: {}", editor.as_string())
             }
             ElrsCommandMsg::SelectNext => {
+                self.clear_feedback();
                 let editor = self.editor.as_mut().expect("editor checked");
                 editor.cycle_char(1);
                 format!("Editing bind phrase: {}", editor.as_string())
             }
             ElrsCommandMsg::ValueDec => {
+                self.clear_feedback();
                 let editor = self.editor.as_mut().expect("editor checked");
                 editor.move_cursor(-1);
                 format!("Cursor {}", editor.cursor.saturating_add(1))
             }
             ElrsCommandMsg::ValueInc => {
+                self.clear_feedback();
                 let editor = self.editor.as_mut().expect("editor checked");
                 editor.move_cursor(1);
                 format!("Cursor {}", editor.cursor.saturating_add(1))
@@ -232,7 +292,7 @@ impl ElrsUiState {
                 self.editor = None;
                 match self.persist() {
                     Ok(()) => {
-                        if self.config.rf_output_enabled && connected {
+                        let message = if self.config.rf_output_enabled && connected {
                             let status = protocol.request(ElrsOperation::SetBindPhrase(
                                 self.config.bind_phrase.clone(),
                             ));
@@ -244,12 +304,29 @@ impl ElrsUiState {
                             }
                         } else {
                             "Bind phrase saved locally".to_string()
-                        }
+                        };
+                        self.emit_feedback(
+                            UiFeedbackSeverity::Success,
+                            UiFeedbackMotion::Pulse,
+                            message.clone(),
+                        );
+                        message
                     }
-                    Err(err) => format!("Bind phrase save failed: {err}"),
+                    Err(err) => {
+                        let message = format!("Bind phrase save failed: {err}");
+                        self.emit_feedback(
+                            UiFeedbackSeverity::Error,
+                            UiFeedbackMotion::ShakeX,
+                            message.clone(),
+                        );
+                        message
+                    }
                 }
             }
-            ElrsCommandMsg::Refresh => "Editing bind phrase".to_string(),
+            ElrsCommandMsg::Refresh => {
+                self.clear_feedback();
+                "Editing bind phrase".to_string()
+            }
         }
     }
 
@@ -264,14 +341,28 @@ impl ElrsUiState {
                 self.config.rf_output_enabled = !self.config.rf_output_enabled;
                 match self.persist() {
                     Ok(()) => {
-                        if self.config.rf_output_enabled {
+                        let message = if self.config.rf_output_enabled {
                             "RF output enabled".to_string()
                         } else {
                             self.bind_waiting_for_link = false;
                             "RF output disabled".to_string()
-                        }
+                        };
+                        self.emit_feedback(
+                            UiFeedbackSeverity::Success,
+                            UiFeedbackMotion::Pulse,
+                            message.clone(),
+                        );
+                        message
                     }
-                    Err(err) => format!("RF output save failed: {err}"),
+                    Err(err) => {
+                        let message = format!("RF output save failed: {err}");
+                        self.emit_feedback(
+                            UiFeedbackSeverity::Error,
+                            UiFeedbackMotion::ShakeX,
+                            message.clone(),
+                        );
+                        message
+                    }
                 }
             }
             1 => {
@@ -281,13 +372,31 @@ impl ElrsUiState {
                     let status = protocol.request(ElrsOperation::SetWifiManual(false));
                     self.config.wifi_manual_on = false;
                     let _ = self.persist();
-                    status.message().to_string()
+                    let message = status.message().to_string();
+                    self.emit_feedback(
+                        UiFeedbackSeverity::Success,
+                        UiFeedbackMotion::Pulse,
+                        message.clone(),
+                    );
+                    message
                 } else {
                     // WiFi 未开启 → 尝试开启：需要 UART 连接才能发送参数命令
                     if !self.config.rf_output_enabled {
-                        "WiFi unavailable: enable RF output first".to_string()
+                        let message = "WiFi unavailable: enable RF output first".to_string();
+                        self.emit_feedback(
+                            UiFeedbackSeverity::Error,
+                            UiFeedbackMotion::ShakeX,
+                            message.clone(),
+                        );
+                        message
                     } else if !connected {
-                        "WiFi unavailable: UART offline".to_string()
+                        let message = "WiFi unavailable: UART offline".to_string();
+                        self.emit_feedback(
+                            UiFeedbackSeverity::Error,
+                            UiFeedbackMotion::ShakeX,
+                            message.clone(),
+                        );
+                        message
                     } else {
                         let status = protocol.request(ElrsOperation::SetWifiManual(true));
                         // 只有 Queued（命令已入队发送）才真正置 wifi_manual_on。
@@ -296,22 +405,68 @@ impl ElrsUiState {
                             self.config.wifi_manual_on = true;
                             let _ = self.persist();
                         }
-                        status.message().to_string()
+                        let message = status.message().to_string();
+                        match status {
+                            ElrsOperationStatus::Queued(_) | ElrsOperationStatus::Busy(_) => {
+                                self.emit_feedback(
+                                    UiFeedbackSeverity::Busy,
+                                    UiFeedbackMotion::Pulse,
+                                    message.clone(),
+                                );
+                            }
+                            ElrsOperationStatus::Unsupported(_) => {
+                                self.emit_feedback(
+                                    UiFeedbackSeverity::Error,
+                                    UiFeedbackMotion::ShakeX,
+                                    message.clone(),
+                                );
+                            }
+                        }
+                        message
                     }
                 }
             }
             2 => {
                 if !self.config.rf_output_enabled {
-                    "Bind unavailable: enable RF output first".to_string()
+                    let message = "Bind unavailable: enable RF output first".to_string();
+                    self.emit_feedback(
+                        UiFeedbackSeverity::Error,
+                        UiFeedbackMotion::ShakeX,
+                        message.clone(),
+                    );
+                    message
                 } else if !connected {
-                    "Bind unavailable: UART offline".to_string()
+                    let message = "Bind unavailable: UART offline".to_string();
+                    self.emit_feedback(
+                        UiFeedbackSeverity::Error,
+                        UiFeedbackMotion::ShakeX,
+                        message.clone(),
+                    );
+                    message
                 } else {
                     let status = protocol.request(ElrsOperation::EnterBind);
                     self.bind_active = protocol.bind_active();
                     if self.bind_active {
                         self.bind_waiting_for_link = true;
                     }
-                    status.message().to_string()
+                    let message = status.message().to_string();
+                    match status {
+                        ElrsOperationStatus::Queued(_) | ElrsOperationStatus::Busy(_) => {
+                            self.emit_feedback(
+                                UiFeedbackSeverity::Busy,
+                                UiFeedbackMotion::Pulse,
+                                message.clone(),
+                            );
+                        }
+                        ElrsOperationStatus::Unsupported(_) => {
+                            self.emit_feedback(
+                                UiFeedbackSeverity::Error,
+                                UiFeedbackMotion::ShakeX,
+                                message.clone(),
+                            );
+                        }
+                    }
+                    message
                 }
             }
             3 => {
@@ -319,20 +474,47 @@ impl ElrsUiState {
                 let status = protocol.request(ElrsOperation::SetTxPower(self.config.tx_power_mw));
                 match self.persist() {
                     Ok(()) => {
-                        if matches!(status, ElrsOperationStatus::Unsupported(_)) {
+                        let message = if matches!(status, ElrsOperationStatus::Unsupported(_)) {
                             status.message().to_string()
                         } else {
                             format!("TX power set to {}mW", self.config.tx_power_mw)
+                        };
+                        match status {
+                            ElrsOperationStatus::Unsupported(_) => self.emit_feedback(
+                                UiFeedbackSeverity::Error,
+                                UiFeedbackMotion::ShakeX,
+                                message.clone(),
+                            ),
+                            ElrsOperationStatus::Queued(_) | ElrsOperationStatus::Busy(_) => {
+                                self.emit_feedback(
+                                    UiFeedbackSeverity::Success,
+                                    UiFeedbackMotion::Pulse,
+                                    message.clone(),
+                                )
+                            }
                         }
+                        message
                     }
-                    Err(err) => format!("TX power save failed: {err}"),
+                    Err(err) => {
+                        let message = format!("TX power save failed: {err}");
+                        self.emit_feedback(
+                            UiFeedbackSeverity::Error,
+                            UiFeedbackMotion::ShakeX,
+                            message.clone(),
+                        );
+                        message
+                    }
                 }
             }
             4 => {
                 self.editor = Some(EditorState::new(&self.config.bind_phrase));
+                self.clear_feedback();
                 "Editing bind phrase".to_string()
             }
-            _ => self.current_item_status(),
+            _ => {
+                self.clear_feedback();
+                self.current_item_status()
+            }
         }
     }
 
@@ -341,9 +523,13 @@ impl ElrsUiState {
             0..=3 => self.adjust_selected(1, protocol, connected),
             4 => {
                 self.editor = Some(EditorState::new(&self.config.bind_phrase));
+                self.clear_feedback();
                 "Editing bind phrase".to_string()
             }
-            _ => self.current_item_status(),
+            _ => {
+                self.clear_feedback();
+                self.current_item_status()
+            }
         }
     }
 
@@ -388,9 +574,23 @@ impl ElrsUiState {
                 self.editor = None;
                 self.bind_active = false;
                 self.bind_waiting_for_link = false;
-                "ELRS config reloaded".to_string()
+                let message = "ELRS config reloaded".to_string();
+                self.emit_feedback(
+                    UiFeedbackSeverity::Success,
+                    UiFeedbackMotion::Pulse,
+                    message.clone(),
+                );
+                message
             }
-            Err(err) => format!("ELRS config reload failed: {err}"),
+            Err(err) => {
+                let message = format!("ELRS config reload failed: {err}");
+                self.emit_feedback(
+                    UiFeedbackSeverity::Error,
+                    UiFeedbackMotion::ShakeX,
+                    message.clone(),
+                );
+                message
+            }
         }
     }
 
@@ -1202,6 +1402,7 @@ fn build_elrs_state(
         status_text,
         wifi_running: ui_state.config.wifi_manual_on,
         selected_idx: ui_state.selected_idx,
+        interaction_feedback: ui_state.interaction_feedback.clone(),
         params: vec![
             crate::messages::ElrsParamEntry {
                 id: "rf_output".to_string(),
@@ -1366,7 +1567,10 @@ mod tests {
         LinkMonitorState, TelemetryStatusState, CRSF_CRC, CRSF_FRAME_BATTERY_ID,
         CRSF_FRAME_LINK_ID, CRSF_SYNC,
     };
-    use crate::elrs::ElrsProtocolRuntime;
+    use crate::{
+        elrs::ElrsProtocolRuntime,
+        messages::{UiFeedbackSeverity, UiFeedbackSlot, UiFeedbackTarget},
+    };
     use std::time::{Duration, Instant};
 
     fn build_frame(frame_type: u8, payload: &[u8]) -> Vec<u8> {
@@ -1487,6 +1691,46 @@ mod tests {
         assert_ne!(
             derive_elrs_model_id("quad_x"),
             derive_elrs_model_id("fixed_wing")
+        );
+    }
+
+    #[test]
+    fn test_wifi_unavailable_emits_error_feedback_for_wifi_field() {
+        let mut ui_state = ElrsUiState::load();
+        ui_state.selected_idx = 1;
+
+        let message =
+            ui_state.adjust_selected(1, &mut ElrsProtocolRuntime::default(), false);
+
+        assert_eq!(message, "WiFi unavailable: enable RF output first");
+        let feedback = ui_state
+            .interaction_feedback
+            .as_ref()
+            .expect("feedback should exist");
+        assert_eq!(feedback.severity, UiFeedbackSeverity::Error);
+        assert_eq!(feedback.slot, UiFeedbackSlot::TopStatusBar);
+        assert_eq!(
+            feedback.target,
+            UiFeedbackTarget::FieldId("wifi_manual".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rf_output_toggle_emits_success_feedback_for_top_status_bar() {
+        let mut ui_state = ElrsUiState::load();
+        ui_state.selected_idx = 0;
+
+        let _ = ui_state.adjust_selected(1, &mut ElrsProtocolRuntime::default(), false);
+
+        let feedback = ui_state
+            .interaction_feedback
+            .as_ref()
+            .expect("feedback should exist");
+        assert_eq!(feedback.severity, UiFeedbackSeverity::Success);
+        assert_eq!(feedback.slot, UiFeedbackSlot::TopStatusBar);
+        assert_eq!(
+            feedback.target,
+            UiFeedbackTarget::FieldId("rf_output".to_string())
         );
     }
 }

@@ -12,6 +12,7 @@ use crate::{
         InputStatusMsg, SystemConfigMsg, SystemStatusMsg,
     },
     mixer::MixerOutMsg,
+    ui::feedback::UiFeedbackController,
 };
 
 use super::{
@@ -170,6 +171,8 @@ impl UiPerfSampler {
 
 pub struct UiApp {
     frame: UiFrame,
+    feedback_controller: UiFeedbackController,
+    last_seen_elrs_feedback_seq: Option<u32>,
 }
 
 impl UiApp {
@@ -185,6 +188,8 @@ impl UiApp {
     pub fn new() -> Self {
         let mut app = Self {
             frame: UiFrame::default(),
+            feedback_controller: UiFeedbackController::default(),
+            last_seen_elrs_feedback_seq: None,
         };
         app.frame.debug.enabled = super::debug_overlay_enabled();
         app.reload_models();
@@ -412,6 +417,26 @@ impl UiApp {
         true
     }
 
+    fn sync_interaction_feedback(&mut self, now: std::time::Instant) -> bool {
+        if self.frame.page == UiPage::App(AppId::Scripts) {
+            if let Some(feedback) = self.frame.elrs.interaction_feedback.clone() {
+                if self.last_seen_elrs_feedback_seq != Some(feedback.seq) {
+                    self.feedback_controller.submit(feedback.clone(), now);
+                    self.last_seen_elrs_feedback_seq = Some(feedback.seq);
+                }
+            }
+        } else {
+            self.last_seen_elrs_feedback_seq = None;
+        }
+
+        let next_snapshot = if matches!(self.frame.page, UiPage::App(_)) {
+            self.feedback_controller.snapshot(now)
+        } else {
+            None
+        };
+        Self::update_field(&mut self.frame.interaction_feedback, next_snapshot)
+    }
+
     pub fn run(&mut self, backend: &mut dyn LvglBackend, fps: u32) {
         super::debug_log(&format!("UiApp::run start fps={fps}"));
         let mut status_rx = get_new_rx_of_message::<SystemStatusMsg>("system_status").unwrap();
@@ -504,6 +529,7 @@ impl UiApp {
             }
 
             let now = std::time::Instant::now();
+            dirty |= self.sync_interaction_feedback(now);
             if dirty {
                 active_until = now + UI_ACTIVE_ANIMATION_WINDOW;
             }

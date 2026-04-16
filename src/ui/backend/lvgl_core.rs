@@ -1,6 +1,10 @@
-use crate::ui::{
-    catalog::{app_at, app_spec, page, PAGE_SPECS},
-    model::{AppId, UiFrame, UiPage},
+use crate::{
+    messages::{UiFeedbackMotion, UiFeedbackSeverity, UiFeedbackSlot, UiFeedbackTarget},
+    ui::{
+        catalog::{app_at, app_spec, page, PAGE_SPECS},
+        feedback::UiFeedbackSnapshot,
+        model::{AppId, UiFrame, UiPage},
+    },
 };
 
 use super::{elrs_list_lines, signal_grade};
@@ -57,7 +61,9 @@ struct AppTemplateData {
     metric_progress: [u8; 2],
     list_title: String,
     list_lines: [String; 4],
+    list_row_ids: [Option<String>; 4],
     hint: String,
+    feedback: Option<UiFeedbackSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,6 +148,40 @@ pub(super) struct LvglUiCore {
 impl LvglUiCore {
     fn to_coord(v: i32) -> lvgl_sys::lv_coord_t {
         v.clamp(i16::MIN as i32, i16::MAX as i32) as lvgl_sys::lv_coord_t
+    }
+
+    fn color_make(r: u8, g: u8, b: u8) -> lvgl_sys::lv_color_t {
+        unsafe { lvgl_sys::_LV_COLOR_MAKE(r, g, b) }
+    }
+
+    fn feedback_row_offset(feedback: &UiFeedbackSnapshot) -> i32 {
+        match feedback.motion {
+            UiFeedbackMotion::ShakeX => match (feedback.elapsed_ms / 40) % 6 {
+                0 => 0,
+                1 => -10,
+                2 => 10,
+                3 => -7,
+                4 => 7,
+                _ => 0,
+            },
+            UiFeedbackMotion::Pulse | UiFeedbackMotion::None => 0,
+        }
+    }
+
+    fn feedback_accent(feedback: &UiFeedbackSnapshot) -> (u8, u8, u8) {
+        match feedback.severity {
+            UiFeedbackSeverity::Error => (224, 93, 93),
+            UiFeedbackSeverity::Success => (88, 184, 120),
+            UiFeedbackSeverity::Busy => (255, 196, 87),
+        }
+    }
+
+    fn feedback_hint_color(feedback: &UiFeedbackSnapshot) -> (u8, u8, u8) {
+        match feedback.severity {
+            UiFeedbackSeverity::Error => (255, 168, 168),
+            UiFeedbackSeverity::Success => (160, 232, 178),
+            UiFeedbackSeverity::Busy => (255, 221, 133),
+        }
     }
 
     pub(super) fn new(width: u32, height: u32) -> Self {
@@ -359,7 +399,9 @@ impl LvglUiCore {
                     format!("Backlight: {}%", frame.config.backlight_percent),
                     format!("Sound: {}%", frame.config.sound_percent),
                 ],
+                list_row_ids: [None, None, None, None],
                 hint: "UP/DOWN: Backlight   LEFT/RIGHT: Sound   Swipe right: Back".to_string(),
+                feedback: frame.interaction_feedback.clone(),
             },
             AppId::Control => {
                 let left_group =
@@ -448,8 +490,10 @@ impl LvglUiCore {
                             frame.input_frame.channel_value(7),
                         ),
                     ],
+                    list_row_ids: [None, None, None, None],
                     hint: "Use for unified input -> mixer chain validation   Swipe right: Back"
                         .to_string(),
+                    feedback: frame.interaction_feedback.clone(),
                 }
             }
             AppId::Models => {
@@ -506,9 +550,11 @@ impl LvglUiCore {
                         list_lines[2].clone(),
                         list_lines[3].clone(),
                     ],
+                    list_row_ids: [None, None, None, None],
                     hint:
                         "UP/DOWN: Focus Profile   ENTER: Apply   Files: ./models   Swipe right: Back"
                             .to_string(),
+                    feedback: frame.interaction_feedback.clone(),
                 }
             }
             AppId::Cloud => {
@@ -552,11 +598,27 @@ impl LvglUiCore {
                             signal_grade(frame.status.signal_strength_percent)
                         ),
                     ],
+                    list_row_ids: [None, None, None, None],
                     hint: "ENTER: Connect/Disconnect   Swipe right: Back".to_string(),
+                    feedback: frame.interaction_feedback.clone(),
                 }
             }
             AppId::Scripts => {
                 let list_lines = elrs_list_lines(frame);
+                let mut list_row_ids = [None, None, None, None];
+                if !frame.elrs.params.is_empty() {
+                    let selected = frame
+                        .elrs
+                        .selected_idx
+                        .min(frame.elrs.params.len().saturating_sub(1));
+                    let start = selected
+                        .saturating_sub(1)
+                        .min(frame.elrs.params.len().saturating_sub(4));
+                    for (slot, idx) in (start..(start + 4).min(frame.elrs.params.len())).enumerate()
+                    {
+                        list_row_ids[slot] = Some(frame.elrs.params[idx].id.clone());
+                    }
+                }
                 AppTemplateData {
                     accent: spec.accent,
                     badge: "ELRS".to_string(),
@@ -615,6 +677,7 @@ impl LvglUiCore {
                         format!("{} / {}", frame.elrs.device_name, frame.elrs.version)
                     },
                     list_lines,
+                    list_row_ids,
                     hint: if frame.elrs.editor_active {
                         "UP/DOWN: Char   LEFT/RIGHT: Move   ENTER: Save   Swipe right: Cancel"
                             .to_string()
@@ -622,6 +685,7 @@ impl LvglUiCore {
                         "UP/DOWN: Select   LEFT/RIGHT: Adjust   ENTER: Open/Apply   ]: Refresh   Swipe right: Back"
                             .to_string()
                     },
+                    feedback: frame.interaction_feedback.clone(),
                 }
             }
             _ => {
@@ -642,7 +706,9 @@ impl LvglUiCore {
                         "No data".to_string(),
                         "No data".to_string(),
                     ],
+                    list_row_ids: [None, None, None, None],
                     hint: "Swipe right: Back".to_string(),
+                    feedback: frame.interaction_feedback.clone(),
                 }
             }
         }
@@ -1763,6 +1829,13 @@ impl LvglUiCore {
             }
             formatted_text.push_str(text);
             let text = formatted_text.as_str();
+            let row_feedback = data.feedback.as_ref().filter(|feedback| match &feedback.target {
+                UiFeedbackTarget::SelectedListRow => is_selected,
+                UiFeedbackTarget::FieldId(field_id) => {
+                    data.list_row_ids[i].as_deref() == Some(field_id.as_str())
+                }
+                UiFeedbackTarget::Page => false,
+            });
 
             if text.is_empty() {
                 unsafe {
@@ -1770,6 +1843,7 @@ impl LvglUiCore {
                         ui.app_list_row_cards[i],
                         lvgl_sys::LV_OBJ_FLAG_HIDDEN,
                     );
+                    lvgl_sys::lv_obj_set_style_translate_x(ui.app_list_row_cards[i], 0, 0);
                 }
             } else {
                 unsafe {
@@ -1777,34 +1851,79 @@ impl LvglUiCore {
                         ui.app_list_row_cards[i],
                         lvgl_sys::LV_OBJ_FLAG_HIDDEN,
                     );
-                    if is_selected {
+                    let (border_r, border_g, border_b, bg_r, bg_g, bg_b) =
+                        if let Some(feedback) = row_feedback {
+                            let accent = Self::feedback_accent(feedback);
+                            (
+                                accent.0,
+                                accent.1,
+                                accent.2,
+                                accent.0 / 4,
+                                accent.1 / 4,
+                                accent.2 / 4,
+                            )
+                        } else if is_selected {
+                            (
+                                data.accent.0,
+                                data.accent.1,
+                                data.accent.2,
+                                data.accent.0 / 3,
+                                data.accent.1 / 3,
+                                data.accent.2 / 3,
+                            )
+                        } else {
+                            (34, 36, 42, 34, 36, 42)
+                        };
+                    lvgl_sys::lv_obj_set_style_translate_x(
+                        ui.app_list_row_cards[i],
+                        Self::to_coord(
+                            row_feedback.map(Self::feedback_row_offset).unwrap_or_default(),
+                        ),
+                        0,
+                    );
+                    if is_selected || row_feedback.is_some() {
                         lvgl_sys::lv_obj_set_style_border_color(
                             ui.app_list_row_cards[i],
-                            lvgl_sys::_LV_COLOR_MAKE(data.accent.0, data.accent.1, data.accent.2),
+                            lvgl_sys::_LV_COLOR_MAKE(border_r, border_g, border_b),
                             0,
                         );
                         lvgl_sys::lv_obj_set_style_bg_color(
                             ui.app_list_row_cards[i],
-                            lvgl_sys::_LV_COLOR_MAKE(
-                                data.accent.0 / 3,
-                                data.accent.1 / 3,
-                                data.accent.2 / 3,
-                            ),
+                            lvgl_sys::_LV_COLOR_MAKE(bg_r, bg_g, bg_b),
                             0,
                         );
                     } else {
                         lvgl_sys::lv_obj_set_style_border_color(
                             ui.app_list_row_cards[i],
-                            lvgl_sys::_LV_COLOR_MAKE(34, 36, 42),
+                            lvgl_sys::_LV_COLOR_MAKE(border_r, border_g, border_b),
                             0,
                         );
                         lvgl_sys::lv_obj_set_style_bg_color(
                             ui.app_list_row_cards[i],
-                            lvgl_sys::_LV_COLOR_MAKE(34, 36, 42),
+                            lvgl_sys::_LV_COLOR_MAKE(bg_r, bg_g, bg_b),
                             0,
                         );
                     }
                 }
+
+                let key_color = if let Some(feedback) = row_feedback {
+                    let accent = Self::feedback_accent(feedback);
+                    if text.contains(':') {
+                        Self::color_make(255, 255, 255)
+                    } else {
+                        Self::color_make(accent.0, accent.1, accent.2)
+                    }
+                } else if is_selected {
+                    Self::color_make(255, 255, 255)
+                } else {
+                    Self::color_make(180, 186, 196)
+                };
+                let val_color = if let Some(feedback) = row_feedback {
+                    let accent = Self::feedback_accent(feedback);
+                    Self::color_make(accent.0, accent.1, accent.2)
+                } else {
+                    Self::color_make(255, 255, 255)
+                };
 
                 if let Some(colon_idx) = text.find(':') {
                     let key = text[..colon_idx].trim();
@@ -1812,6 +1931,8 @@ impl LvglUiCore {
                     Self::set_label_text(ui.app_list_row_keys[i], key);
                     Self::set_label_text(ui.app_list_row_vals[i], val);
                     unsafe {
+                        lvgl_sys::lv_obj_set_style_text_color(ui.app_list_row_keys[i], key_color, 0);
+                        lvgl_sys::lv_obj_set_style_text_color(ui.app_list_row_vals[i], val_color, 0);
                         lvgl_sys::lv_obj_clear_flag(
                             ui.app_list_row_vals[i],
                             lvgl_sys::LV_OBJ_FLAG_HIDDEN,
@@ -1826,6 +1947,7 @@ impl LvglUiCore {
                 } else {
                     Self::set_label_text(ui.app_list_row_keys[i], text);
                     unsafe {
+                        lvgl_sys::lv_obj_set_style_text_color(ui.app_list_row_keys[i], key_color, 0);
                         lvgl_sys::lv_obj_add_flag(
                             ui.app_list_row_vals[i],
                             lvgl_sys::LV_OBJ_FLAG_HIDDEN,
@@ -1840,7 +1962,30 @@ impl LvglUiCore {
                 }
             }
         }
-        Self::set_label_text(ui.app_hint_label, &data.hint);
+        if let Some(feedback) = data
+            .feedback
+            .as_ref()
+            .filter(|feedback| feedback.slot == UiFeedbackSlot::AppHint)
+        {
+            let hint_color = Self::feedback_hint_color(feedback);
+            Self::set_label_text(ui.app_hint_label, &feedback.message);
+            unsafe {
+                lvgl_sys::lv_obj_set_style_text_color(
+                    ui.app_hint_label,
+                    Self::color_make(hint_color.0, hint_color.1, hint_color.2),
+                    0,
+                );
+            }
+        } else {
+            Self::set_label_text(ui.app_hint_label, &data.hint);
+            unsafe {
+                lvgl_sys::lv_obj_set_style_text_color(
+                    ui.app_hint_label,
+                    Self::color_make(170, 174, 182),
+                    0,
+                );
+            }
+        }
     }
 
     pub(super) fn sync_ui(&mut self, frame: &UiFrame) {
@@ -1871,16 +2016,49 @@ impl LvglUiCore {
         }
 
         if prev_frame
-            .map(|prev| prev.status != frame.status)
+            .map(|prev| {
+                prev.status != frame.status
+                    || prev
+                        .interaction_feedback
+                        .as_ref()
+                        .map(|feedback| (feedback.seq, feedback.slot))
+                        != frame
+                            .interaction_feedback
+                            .as_ref()
+                            .map(|feedback| (feedback.seq, feedback.slot))
+            })
             .unwrap_or(true)
         {
-            let status = format!(
-                "R {}%  A {}%  S {}%",
-                frame.status.remote_battery_percent,
-                frame.status.aircraft_battery_percent,
-                frame.status.signal_strength_percent,
-            );
-            Self::set_label_text(ui.status_label, &status);
+            if let Some(feedback) = frame
+                .interaction_feedback
+                .as_ref()
+                .filter(|feedback| feedback.slot == UiFeedbackSlot::TopStatusBar)
+            {
+                let color = Self::feedback_hint_color(feedback);
+                Self::set_label_text(ui.status_label, &feedback.message);
+                unsafe {
+                    lvgl_sys::lv_obj_set_style_text_color(
+                        ui.status_label,
+                        Self::color_make(color.0, color.1, color.2),
+                        0,
+                    );
+                }
+            } else {
+                let status = format!(
+                    "R {}%  A {}%  S {}%",
+                    frame.status.remote_battery_percent,
+                    frame.status.aircraft_battery_percent,
+                    frame.status.signal_strength_percent,
+                );
+                Self::set_label_text(ui.status_label, &status);
+                unsafe {
+                    lvgl_sys::lv_obj_set_style_text_color(
+                        ui.status_label,
+                        Self::color_make(180, 180, 185),
+                        0,
+                    );
+                }
+            }
 
             let secs = frame.status.unix_time_secs % 86400;
             let clock = format!(

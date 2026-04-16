@@ -1,6 +1,9 @@
 use crate::{
     config::store,
-    messages::ElrsCommandMsg,
+    messages::{
+        ElrsCommandMsg, UiFeedbackMotion, UiFeedbackSeverity, UiFeedbackSlot, UiFeedbackTarget,
+        UiInteractionFeedback,
+    },
     ui::{
         apps::{common::elrs_list_lines, AppSpec, UiAppContext, UiAppModule},
         input::UiInputEvent,
@@ -123,6 +126,48 @@ fn ensure_local_state(frame: &mut UiFrame) {
     );
 }
 
+fn local_feedback_target(selected_idx: usize) -> UiFeedbackTarget {
+    match selected_idx {
+        0 => UiFeedbackTarget::FieldId("rf_output".to_string()),
+        1 => UiFeedbackTarget::FieldId("wifi_manual".to_string()),
+        2 => UiFeedbackTarget::FieldId("bind".to_string()),
+        3 => UiFeedbackTarget::FieldId("tx_power".to_string()),
+        4 => UiFeedbackTarget::FieldId("bind_phrase".to_string()),
+        _ => UiFeedbackTarget::SelectedListRow,
+    }
+}
+
+fn set_local_feedback(
+    frame: &mut UiFrame,
+    severity: UiFeedbackSeverity,
+    motion: UiFeedbackMotion,
+    message: &str,
+) {
+    let next_seq = frame
+        .elrs
+        .interaction_feedback
+        .as_ref()
+        .map(|feedback| feedback.seq.wrapping_add(1))
+        .unwrap_or(1);
+    frame.elrs.interaction_feedback = Some(UiInteractionFeedback {
+        seq: next_seq,
+        severity,
+        target: local_feedback_target(frame.elrs.selected_idx),
+        motion,
+        slot: UiFeedbackSlot::TopStatusBar,
+        message: message.to_string(),
+        ttl_ms: match severity {
+            UiFeedbackSeverity::Error => 900,
+            UiFeedbackSeverity::Success => 850,
+            UiFeedbackSeverity::Busy => 1200,
+        },
+    });
+}
+
+fn clear_local_feedback(frame: &mut UiFrame) {
+    frame.elrs.interaction_feedback = None;
+}
+
 fn handle_local_event(frame: &mut UiFrame, event: UiInputEvent) -> bool {
     let mut cfg = load_local_config();
 
@@ -132,21 +177,31 @@ fn handle_local_event(frame: &mut UiFrame, event: UiInputEvent) -> bool {
                 frame.elrs.editor_active = false;
                 frame.elrs.can_leave = true;
                 frame.elrs.status_text = "Bind phrase edit cancelled".to_string();
+                set_local_feedback(
+                    frame,
+                    UiFeedbackSeverity::Error,
+                    UiFeedbackMotion::ShakeX,
+                    "Bind phrase edit cancelled",
+                );
                 true
             }
             UiInputEvent::Up => {
+                clear_local_feedback(frame);
                 cycle_editor_char(frame, -1);
                 true
             }
             UiInputEvent::Down => {
+                clear_local_feedback(frame);
                 cycle_editor_char(frame, 1);
                 true
             }
             UiInputEvent::Left => {
+                clear_local_feedback(frame);
                 move_editor_cursor(frame, -1);
                 true
             }
             UiInputEvent::Right => {
+                clear_local_feedback(frame);
                 move_editor_cursor(frame, 1);
                 true
             }
@@ -167,10 +222,12 @@ fn handle_local_event(frame: &mut UiFrame, event: UiInputEvent) -> bool {
     } else {
         match event {
             UiInputEvent::Up => {
+                clear_local_feedback(frame);
                 frame.elrs.selected_idx = frame.elrs.selected_idx.saturating_sub(1);
                 true
             }
             UiInputEvent::Down => {
+                clear_local_feedback(frame);
                 frame.elrs.selected_idx = frame.elrs.selected_idx.saturating_add(1).min(4);
                 true
             }
@@ -183,6 +240,7 @@ fn handle_local_event(frame: &mut UiFrame, event: UiInputEvent) -> bool {
                 true
             }
             UiInputEvent::PageNext => {
+                clear_local_feedback(frame);
                 let cfg = load_local_config();
                 apply_local_state(frame, &cfg, Some("ELRS config reloaded"));
                 true
@@ -194,38 +252,74 @@ fn handle_local_event(frame: &mut UiFrame, event: UiInputEvent) -> bool {
 }
 
 fn apply_local_adjust(frame: &mut UiFrame, cfg: &mut LocalElrsConfig, delta: isize) {
-    let status = match frame.elrs.selected_idx {
+    let (status, severity, motion) = match frame.elrs.selected_idx {
         0 => {
             cfg.rf_output_enabled = !cfg.rf_output_enabled;
             if save_local_config(cfg).is_ok() {
                 if cfg.rf_output_enabled {
-                    "RF output enabled"
+                    (
+                        "RF output enabled",
+                        UiFeedbackSeverity::Success,
+                        UiFeedbackMotion::Pulse,
+                    )
                 } else {
-                    "RF output disabled"
+                    (
+                        "RF output disabled",
+                        UiFeedbackSeverity::Success,
+                        UiFeedbackMotion::Pulse,
+                    )
                 }
             } else {
-                "RF output save failed"
+                (
+                    "RF output save failed",
+                    UiFeedbackSeverity::Error,
+                    UiFeedbackMotion::ShakeX,
+                )
             }
         }
         1 => {
             cfg.wifi_manual_on = !cfg.wifi_manual_on;
             if save_local_config(cfg).is_ok() {
                 if cfg.wifi_manual_on {
-                    "WiFi command armed"
+                    (
+                        "WiFi command armed",
+                        UiFeedbackSeverity::Success,
+                        UiFeedbackMotion::Pulse,
+                    )
                 } else {
-                    "WiFi command cleared"
+                    (
+                        "WiFi command cleared",
+                        UiFeedbackSeverity::Success,
+                        UiFeedbackMotion::Pulse,
+                    )
                 }
             } else {
-                "WiFi config save failed"
+                (
+                    "WiFi config save failed",
+                    UiFeedbackSeverity::Error,
+                    UiFeedbackMotion::ShakeX,
+                )
             }
         }
-        2 => "Bind feedback requires rf_link_service",
+        2 => (
+            "Bind feedback requires rf_link_service",
+            UiFeedbackSeverity::Error,
+            UiFeedbackMotion::ShakeX,
+        ),
         3 => {
             cfg.tx_power_mw = shift_power_level(cfg.tx_power_mw, delta);
             if save_local_config(cfg).is_ok() {
-                "TX power updated"
+                (
+                    "TX power updated",
+                    UiFeedbackSeverity::Success,
+                    UiFeedbackMotion::Pulse,
+                )
             } else {
-                "TX power save failed"
+                (
+                    "TX power save failed",
+                    UiFeedbackSeverity::Error,
+                    UiFeedbackMotion::ShakeX,
+                )
             }
         }
         4 => {
@@ -238,11 +332,16 @@ fn apply_local_adjust(frame: &mut UiFrame, cfg: &mut LocalElrsConfig, delta: isi
                 cfg.bind_phrase.clone()
             };
             frame.elrs.editor_cursor = 0;
-            "Editing bind phrase"
+            clear_local_feedback(frame);
+            return apply_local_state(frame, cfg, Some("Editing bind phrase"));
         }
-        _ => "ELRS",
+        _ => {
+            clear_local_feedback(frame);
+            return apply_local_state(frame, cfg, Some("ELRS"));
+        }
     };
 
+    set_local_feedback(frame, severity, motion, status);
     apply_local_state(frame, cfg, Some(status));
 }
 
@@ -425,4 +524,57 @@ fn cycle_editor_char(frame: &mut UiFrame, delta: isize) {
         (current_idx as isize + delta).rem_euclid(LOCAL_EDITOR_CHARSET.len() as isize) as usize;
     bytes[cursor] = LOCAL_EDITOR_CHARSET[next_idx];
     frame.elrs.editor_buffer = String::from_utf8_lossy(&bytes).to_string();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{local_feedback_target, set_local_feedback};
+    use crate::{
+        messages::{UiFeedbackMotion, UiFeedbackSeverity, UiFeedbackSlot, UiFeedbackTarget},
+        ui::model::UiFrame,
+    };
+
+    #[test]
+    fn test_local_feedback_target_for_wifi_maps_to_wifi_field() {
+        assert_eq!(
+            local_feedback_target(1),
+            UiFeedbackTarget::FieldId("wifi_manual".to_string())
+        );
+    }
+
+    #[test]
+    fn test_set_local_feedback_assigns_top_status_feedback_and_increments_seq() {
+        let mut frame = UiFrame::default();
+        frame.elrs.selected_idx = 3;
+
+        set_local_feedback(
+            &mut frame,
+            UiFeedbackSeverity::Success,
+            UiFeedbackMotion::Pulse,
+            "TX power updated",
+        );
+        let first = frame
+            .elrs
+            .interaction_feedback
+            .clone()
+            .expect("first feedback");
+        set_local_feedback(
+            &mut frame,
+            UiFeedbackSeverity::Error,
+            UiFeedbackMotion::ShakeX,
+            "TX power save failed",
+        );
+        let second = frame
+            .elrs
+            .interaction_feedback
+            .clone()
+            .expect("second feedback");
+
+        assert_eq!(first.slot, UiFeedbackSlot::TopStatusBar);
+        assert_eq!(
+            first.target,
+            UiFeedbackTarget::FieldId("tx_power".to_string())
+        );
+        assert!(second.seq > first.seq);
+    }
 }

@@ -76,6 +76,44 @@ pub struct ElrsFeedbackMsg {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiFeedbackSeverity {
+    Error,
+    Success,
+    Busy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UiFeedbackTarget {
+    SelectedListRow,
+    FieldId(String),
+    Page,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiFeedbackMotion {
+    None,
+    ShakeX,
+    Pulse,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiFeedbackSlot {
+    TopStatusBar,
+    AppHint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiInteractionFeedback {
+    pub seq: u32,
+    pub severity: UiFeedbackSeverity,
+    pub target: UiFeedbackTarget,
+    pub motion: UiFeedbackMotion,
+    pub slot: UiFeedbackSlot,
+    pub message: String,
+    pub ttl_ms: u32,
+}
+
 pub fn publish_input_frame(
     frame_tx: &rpos::channel::Sender<InputFrameMsg>,
     legacy_adc_tx: Option<&rpos::channel::Sender<AdcRawMsg>>,
@@ -179,6 +217,7 @@ pub struct ElrsStateMsg {
     pub status_text: String,
     pub wifi_running: bool,
     pub selected_idx: usize,
+    pub interaction_feedback: Option<UiInteractionFeedback>,
     pub params: Vec<ElrsParamEntry>,
 }
 
@@ -204,6 +243,7 @@ impl Default for ElrsStateMsg {
             status_text: "ELRS service not started".to_string(),
             wifi_running: false,
             selected_idx: 0,
+            interaction_feedback: None,
             params: vec![
                 ElrsParamEntry {
                     id: "rf_output".to_string(),

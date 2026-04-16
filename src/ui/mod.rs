@@ -2,6 +2,7 @@ pub mod app;
 pub mod apps;
 pub mod backend;
 pub mod catalog;
+pub mod feedback;
 pub mod input;
 pub mod model;
 
